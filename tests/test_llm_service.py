@@ -2,20 +2,40 @@
 
 from __future__ import annotations
 
-from collections.abc import Generator, Iterator
+import json
+from collections.abc import AsyncIterator, Generator, Iterator
 from contextlib import contextmanager
-from typing import get_args
+from typing import Any, get_args
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
+from anthropic.types import InputJSONDelta, SignatureDelta, TextDelta, ThinkingDelta
 from any_llm.exceptions import ProviderError
+from any_llm.types.messages import (
+    ContentBlockDeltaEvent,
+    ContentBlockStartEvent,
+    ContentBlockStopEvent,
+    MessageDelta,
+    MessageDeltaEvent,
+    MessageDeltaUsage,
+    MessageResponse,
+    MessageStartEvent,
+    MessageStopEvent,
+    MessageUsage,
+    TextBlock,
+    ThinkingBlock,
+    ToolUseBlock,
+)
 from pydantic import ValidationError
 
+from backend.app.agent.llm_parsing import get_response_text, parse_tool_calls
 from backend.app.config import Settings
 from backend.app.services.llm_service import (
     LLMTarget,
     UserLLMOverride,
     _cache_control,
+    amessages_streamed,
     apply_history_cache_breakpoint,
     apply_in_turn_cache_breakpoint,
     apply_tool_caching,
@@ -655,3 +675,407 @@ def test_prompt_cache_setting_rejects_the_removed_always_value() -> None:
     # error the checker would flag before pydantic ever rejected it.
     with pytest.raises(ValidationError):
         Settings.model_validate({"llm_prompt_cache": "always"})
+
+
+class TestStreamedMessages:
+    """``amessages_streamed`` must return what the unstreamed call would.
+
+    The reason compaction streams is a proxy read timeout, not a consumer
+    for the chunks, so the accumulated result has to be indistinguishable
+    from the blocking response or every caller downstream changes meaning.
+    """
+
+    @staticmethod
+    def _shell(input_tokens: int = 0, output_tokens: int = 0) -> MessageResponse:
+        return MessageResponse(
+            id="msg_1",
+            type="message",
+            role="assistant",
+            model="claude-opus-5",
+            content=[],
+            stop_reason=None,
+            usage=MessageUsage(input_tokens=input_tokens, output_tokens=output_tokens),
+        )
+
+    @staticmethod
+    async def _run(events: list[object]) -> MessageResponse:
+        async def stream() -> AsyncIterator[object]:
+            for event in events:
+                yield event
+
+        with patch(
+            "backend.app.services.llm_service.amessages", return_value=stream()
+        ) as mock_call:
+            result = await amessages_streamed(model="m", messages=[], max_tokens=16)
+        assert mock_call.call_args.kwargs["stream"] is True
+        return result
+
+    async def test_native_stop_event_message_is_used_verbatim(self) -> None:
+        """A native Messages provider accumulates for us; take its answer."""
+        final = self._shell(input_tokens=11, output_tokens=7).model_copy(
+            update={
+                "content": [TextBlock(type="text", text="done")],
+                "stop_reason": "end_turn",
+            }
+        )
+        result = await self._run(
+            [
+                MessageStartEvent(type="message_start", message=self._shell()),
+                MessageStopEvent(type="message_stop", message=final),
+            ]
+        )
+        assert result is final
+
+    async def test_bridge_stream_rebuilds_text_and_usage(self) -> None:
+        """The OpenAI-dialect bridge sends no final message, so rebuild one."""
+        result = await self._run(
+            [
+                MessageStartEvent(type="message_start", message=self._shell(input_tokens=11)),
+                ContentBlockStartEvent(
+                    type="content_block_start",
+                    index=0,
+                    content_block=TextBlock(type="text", text=""),
+                ),
+                ContentBlockDeltaEvent(
+                    type="content_block_delta",
+                    index=0,
+                    delta=TextDelta(type="text_delta", text='{"a":'),
+                ),
+                ContentBlockDeltaEvent(
+                    type="content_block_delta",
+                    index=0,
+                    delta=TextDelta(type="text_delta", text="1}"),
+                ),
+                ContentBlockStopEvent(type="content_block_stop", index=0),
+                MessageDeltaEvent(
+                    type="message_delta",
+                    delta=MessageDelta(stop_reason="end_turn"),
+                    usage=MessageDeltaUsage(output_tokens=7),
+                ),
+                MessageStopEvent(type="message_stop"),
+            ]
+        )
+        assert get_response_text(result) == '{"a":1}'
+        assert result.stop_reason == "end_turn"
+        # message_start carries the input count and message_delta the output
+        # count, so a merge that drops either one under-reports the bill.
+        assert result.usage.input_tokens == 11
+        assert result.usage.output_tokens == 7
+
+    async def test_truncation_stop_reason_survives_accumulation(self) -> None:
+        """``max_tokens`` must reach the caller, which is how a cut-off
+        compaction is told apart from a short one."""
+        result = await self._run(
+            [
+                MessageStartEvent(type="message_start", message=self._shell()),
+                MessageDeltaEvent(
+                    type="message_delta",
+                    delta=MessageDelta(stop_reason="max_tokens"),
+                    usage=MessageDeltaUsage(output_tokens=16),
+                ),
+                MessageStopEvent(type="message_stop"),
+            ]
+        )
+        assert result.stop_reason == "max_tokens"
+
+    async def test_thinking_block_keeps_its_signature(self) -> None:
+        """Compaction may request thinking; an unsigned block is rejected on
+        any later turn that replays it."""
+        result = await self._run(
+            [
+                MessageStartEvent(type="message_start", message=self._shell()),
+                ContentBlockStartEvent(
+                    type="content_block_start",
+                    index=0,
+                    content_block=ThinkingBlock(type="thinking", thinking="", signature=""),
+                ),
+                ContentBlockDeltaEvent(
+                    type="content_block_delta",
+                    index=0,
+                    delta=ThinkingDelta(type="thinking_delta", thinking="weighing "),
+                ),
+                ContentBlockDeltaEvent(
+                    type="content_block_delta",
+                    index=0,
+                    delta=ThinkingDelta(type="thinking_delta", thinking="options"),
+                ),
+                ContentBlockDeltaEvent(
+                    type="content_block_delta",
+                    index=0,
+                    delta=SignatureDelta(type="signature_delta", signature="sig-abc"),
+                ),
+                MessageStopEvent(type="message_stop"),
+            ]
+        )
+        block = result.content[0]
+        assert isinstance(block, ThinkingBlock)
+        assert block.thinking == "weighing options"
+        assert block.signature == "sig-abc"
+
+    async def test_tool_input_json_is_joined_before_parsing(self) -> None:
+        """Each ``input_json_delta`` is a fragment; only the concatenation is
+        valid JSON, so parsing per-delta would lose the arguments."""
+        result = await self._run(
+            [
+                MessageStartEvent(type="message_start", message=self._shell()),
+                ContentBlockStartEvent(
+                    type="content_block_start",
+                    index=0,
+                    content_block=ToolUseBlock(type="tool_use", id="t1", name="lookup", input={}),
+                ),
+                ContentBlockDeltaEvent(
+                    type="content_block_delta",
+                    index=0,
+                    delta=InputJSONDelta(type="input_json_delta", partial_json='{"q": "a'),
+                ),
+                ContentBlockDeltaEvent(
+                    type="content_block_delta",
+                    index=0,
+                    delta=InputJSONDelta(type="input_json_delta", partial_json='cme"}'),
+                ),
+                MessageStopEvent(type="message_stop"),
+            ]
+        )
+        block = result.content[0]
+        assert isinstance(block, ToolUseBlock)
+        assert block.input == {"q": "acme"}
+
+    async def test_blocks_are_ordered_by_index_not_arrival(self) -> None:
+        """Deltas for two open blocks interleave, so ordering has to come
+        from the index rather than from when a block finished."""
+        result = await self._run(
+            [
+                MessageStartEvent(type="message_start", message=self._shell()),
+                ContentBlockStartEvent(
+                    type="content_block_start",
+                    index=0,
+                    content_block=TextBlock(type="text", text=""),
+                ),
+                ContentBlockStartEvent(
+                    type="content_block_start",
+                    index=1,
+                    content_block=TextBlock(type="text", text=""),
+                ),
+                ContentBlockDeltaEvent(
+                    type="content_block_delta",
+                    index=1,
+                    delta=TextDelta(type="text_delta", text="second"),
+                ),
+                ContentBlockDeltaEvent(
+                    type="content_block_delta",
+                    index=0,
+                    delta=TextDelta(type="text_delta", text="first "),
+                ),
+                MessageStopEvent(type="message_stop"),
+            ]
+        )
+        assert get_response_text(result) == "first second"
+
+    async def test_stream_cut_after_start_raises_instead_of_looking_clean(self) -> None:
+        """A stream that just stops has no ``stop_reason`` and still carries
+        the pre-generation usage, so returning it would report a truncated
+        compaction as a successful one that found nothing worth saving."""
+        with pytest.raises(ProviderError, match="signalled completion"):
+            await self._run(
+                [
+                    MessageStartEvent(
+                        type="message_start", message=self._shell(input_tokens=18961)
+                    ),
+                    ContentBlockStartEvent(
+                        type="content_block_start",
+                        index=0,
+                        content_block=TextBlock(type="text", text=""),
+                    ),
+                    ContentBlockDeltaEvent(
+                        type="content_block_delta",
+                        index=0,
+                        delta=TextDelta(type="text_delta", text='{"memory_upda'),
+                    ),
+                ]
+            )
+
+    async def test_stream_that_ends_with_nothing_raises(self) -> None:
+        """A connection cut before ``message_start`` leaves nothing to return,
+        and returning an empty message would look like a successful compaction
+        that found no facts."""
+        with pytest.raises(ProviderError):
+            await self._run([])
+
+
+class TestStreamedMessagesOverTheWire:
+    """The same call, driven through real any-llm provider code over SSE.
+
+    ``TestStreamedMessages`` mocks ``amessages`` itself, so it pins the
+    accumulator against hand-built events. These drive the actual provider
+    implementations, which is the only way to catch a mismatch between the
+    events any-llm really emits and the ones the accumulator expects.
+    """
+
+    @staticmethod
+    def _transport(body: bytes, seen: dict[str, Any]) -> httpx.MockTransport:
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["path"] = request.url.path
+            seen["payload"] = json.loads(request.content)
+            return httpx.Response(200, content=body, headers={"content-type": "text/event-stream"})
+
+        return httpx.MockTransport(handler)
+
+    async def test_anthropic_dialect_streams_and_preserves_usage(self) -> None:
+        """The native path, which is what a gateway speaking /v1/messages hits."""
+        events = [
+            (
+                "message_start",
+                {
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg_1",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-opus-5",
+                        "content": [],
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": {"input_tokens": 18961, "output_tokens": 0},
+                    },
+                },
+            ),
+            (
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                },
+            ),
+            (
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": '{"memory_update": "'},
+                },
+            ),
+            (
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": 'a fact"}'},
+                },
+            ),
+            ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            (
+                "message_delta",
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": {"output_tokens": 13610},
+                },
+            ),
+            ("message_stop", {"type": "message_stop"}),
+        ]
+        body = "".join(f"event: {n}\ndata: {json.dumps(d)}\n\n" for n, d in events).encode()
+        seen: dict[str, Any] = {}
+        result = await amessages_streamed(
+            provider="anthropic",
+            model="claude-opus-5",
+            messages=[{"role": "user", "content": "compact"}],
+            max_tokens=16000,
+            api_key="sk-test",
+            client_args={"http_client": httpx.AsyncClient(transport=self._transport(body, seen))},
+        )
+        # Without this the proxy sees silence and the whole change is moot.
+        assert seen["payload"]["stream"] is True
+        assert seen["path"] == "/v1/messages"
+        assert get_response_text(result) == '{"memory_update": "a fact"}'
+        assert result.stop_reason == "end_turn"
+        assert result.usage.input_tokens == 18961
+        assert result.usage.output_tokens == 13610
+
+    async def test_openai_dialect_rebuilds_a_tool_call_from_fragments(self) -> None:
+        """The bridge path, which is the hand-rolled half of the accumulator.
+
+        Heartbeat streams with tools, and a tool call arrives as JSON split
+        across chunks at arbitrary boundaries. Parsing any fragment alone
+        fails, so a heartbeat would silently decide to do nothing.
+        """
+        base = {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o"}
+        chunks: list[dict[str, Any]] = [
+            {
+                **base,
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": None,
+                        "delta": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "send_message", "arguments": ""},
+                                }
+                            ],
+                        },
+                    }
+                ],
+            },
+            {
+                **base,
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": None,
+                        "delta": {
+                            "tool_calls": [{"index": 0, "function": {"arguments": '{"text": "ru'}}]
+                        },
+                    }
+                ],
+            },
+            {
+                **base,
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "tool_calls",
+                        "delta": {
+                            "tool_calls": [{"index": 0, "function": {"arguments": 'nning late"}'}}]
+                        },
+                    }
+                ],
+            },
+            {
+                **base,
+                "choices": [],
+                "usage": {"prompt_tokens": 4321, "completion_tokens": 12000, "total_tokens": 16321},
+            },
+        ]
+        body = ("".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + "data: [DONE]\n\n").encode()
+        seen: dict[str, Any] = {}
+        result = await amessages_streamed(
+            provider="openai",
+            model="gpt-4o",
+            messages=[{"role": "user", "content": "status?"}],
+            max_tokens=12000,
+            api_key="sk-test",
+            tools=[
+                {
+                    "name": "send_message",
+                    "description": "send",
+                    "input_schema": {"type": "object", "properties": {}},
+                }
+            ],
+            client_args={"http_client": httpx.AsyncClient(transport=self._transport(body, seen))},
+        )
+        assert seen["payload"]["stream"] is True
+        assert seen["path"] == "/v1/chat/completions"
+        assert result.stop_reason == "tool_use"
+        calls = parse_tool_calls(result)
+        assert [(c.name, c.arguments) for c in calls] == [
+            ("send_message", {"text": "running late"})
+        ]
+        # message_start carries the input count, the trailing usage-only chunk
+        # the output count. A merge that takes one clobbers the other.
+        assert result.usage.input_tokens == 4321
+        assert result.usage.output_tokens == 12000
