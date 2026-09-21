@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Iterable
+from typing import TypeVar, cast, get_args
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -44,6 +45,7 @@ from backend.app.config_store import MASK
 from backend.app.database import AsyncSessionLocal
 from backend.app.enums import CacheControlMode, PricingMode, ReasoningMode
 from backend.app.models import LLMEndpoint, LLMEvalRun, Subscription
+from backend.app.query_helpers import fetch_all
 from backend.app.schemas.llm import LLMEndpointItem
 from backend.app.services.llm_service import (
     LLMTarget,
@@ -104,7 +106,7 @@ async def _load_endpoints() -> dict[str, LLMEndpoint]:
         generation = _cache_generation
         db = AsyncSessionLocal()
         try:
-            rows = (await db.execute(select(LLMEndpoint))).scalars().all()
+            rows = await fetch_all(db, select(LLMEndpoint))
         finally:
             await db.close()
         loaded = {row.name: row for row in rows}
@@ -170,6 +172,25 @@ async def upsert_endpoint(
     return row
 
 
+_ModeT = TypeVar("_ModeT", bound=str)
+
+
+def _mode_or_auto(endpoint: str, field: str, value: str, allowed: tuple[_ModeT, ...]) -> _ModeT:
+    """Return *value* if it is one of *allowed*, else ``auto``.
+
+    These columns are plain ``String(16)``, so nothing at the database level
+    stops a hand-written UPDATE from putting something outside the set in one.
+    Reporting it verbatim would fail ``LLMEndpointItem`` validation and 500 the
+    entire endpoint list over one bad row, which is a worse failure than
+    showing the default. The agent path already degrades this way; see
+    ``_reasoning_style_for``.
+    """
+    if value in allowed:
+        return cast("_ModeT", value)
+    logger.warning("Endpoint %r has unknown %s %r; reporting %s", endpoint, field, value, _AUTO)
+    return cast("_ModeT", _AUTO)
+
+
 def endpoint_item(row: LLMEndpoint) -> LLMEndpointItem:
     """Serialize an endpoint. The stored key is reported as a boolean only."""
     return LLMEndpointItem(
@@ -177,9 +198,11 @@ def endpoint_item(row: LLMEndpoint) -> LLMEndpointItem:
         dialect=row.dialect,
         base_url=row.base_url,
         api_key_set=bool(row.api_key),
-        cache_control=row.cache_control,
-        reasoning=row.reasoning,
-        pricing=row.pricing,
+        cache_control=_mode_or_auto(
+            row.name, "cache_control", row.cache_control, get_args(CacheControlMode)
+        ),
+        reasoning=_mode_or_auto(row.name, "reasoning", row.reasoning, get_args(ReasoningMode)),
+        pricing=_mode_or_auto(row.name, "pricing", row.pricing, get_args(PricingMode)),
         notes=row.notes,
     )
 
