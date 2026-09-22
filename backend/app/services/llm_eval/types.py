@@ -52,7 +52,7 @@ class IncumbentSource(StrEnum):
     lookups and scores the first one that would need a live tool, so
     ``sampling`` walks the recorded calls by that same rule
     (``metrics.replayable_lookup``, bounded by
-    ``execution.MAX_REPLAY_READ_ROUNDS``): leading lookups are skipped and
+    ``metrics.MAX_REPLAY_READ_ROUNDS``): leading lookups are skipped and
     the next recorded call is the incumbent's decision. Any other reading
     compares two different rounds of the same turn.
 

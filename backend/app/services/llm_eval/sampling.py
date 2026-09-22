@@ -52,7 +52,7 @@ from backend.app.config import settings
 from backend.app.enums import MessageDirection
 from backend.app.models import User
 from backend.app.services.llm_eval import metrics
-from backend.app.services.llm_eval.execution import MAX_REPLAY_READ_ROUNDS
+from backend.app.services.llm_eval.metrics import MAX_REPLAY_READ_ROUNDS
 from backend.app.services.llm_eval.types import RecordedToolResult, ReplaySample, ToolCall
 
 logger = logging.getLogger(__name__)
@@ -372,8 +372,13 @@ class HistoricDecision:
     One thing the transcript cannot give back. ``tool_interactions_json``
     holds one flat, ordered list per outbound row, so a turn that recorded
     three calls could have asked for all three at once or for one at a time
-    across three rounds. ``flattened`` says the scored decision sits in such
-    a list, which is counted and surfaced rather than assumed away.
+    across three rounds. ``flattened`` says the reading dropped calls the
+    scored decision might have been made alongside: calls left *after* the
+    scored one in the same list. Leading lookups are excluded, because those
+    are carried on ``lookups`` and shown to the judge on both sides, so the
+    turn is read the same either way. Counted and surfaced rather than
+    assumed away, and narrow enough that a plain lookup-then-write turn, the
+    commonest multi-call shape there is, does not raise it.
     """
 
     available: bool
@@ -411,6 +416,12 @@ def _recorded_entry_count(raw: str) -> int:
 
 
 _UNAVAILABLE = HistoricDecision(available=False, calls=(), flattened=False)
+
+# What a sample carries when the run will call the incumbent live and the
+# recorded decision was never reconstructed. Distinct from ``_UNAVAILABLE``,
+# which is a claim about the transcript: this one says nothing was asked of
+# it. Nothing in ``IncumbentSource.REPLAY`` reads these fields.
+_UNRECONSTRUCTED = HistoricDecision(available=True, calls=(), flattened=False)
 
 
 def _recorded_calls(answered: list[StoredMessage]) -> list[RecordedToolResult] | None:
@@ -500,10 +511,13 @@ def _historic_first_decision(
     return HistoricDecision(
         available=True,
         calls=(ToolCall(name=first.name, arguments=first.arguments),),
-        # The scored call shares a flat list with others, so whether the
-        # decision was this call alone or this call and its neighbours in one
-        # round is not recoverable.
-        flattened=len(recorded) > 1,
+        # Unscored calls follow the scored one in the same flat list, so
+        # whether the decision was this call alone or this call and its
+        # neighbours in one round is not recoverable. A dropped *leading*
+        # lookup is not that: it is carried in ``lookups`` and shown on both
+        # sides, so a turn whose only unscored calls are skipped lookups was
+        # read faithfully however production batched them.
+        flattened=len(remaining) > 1,
         lookups=tuple(lookups),
     )
 
@@ -524,7 +538,9 @@ def _message_context(row: StoredMessage) -> str:
     return row.processed_context or row.body
 
 
-def select_samples(fixture: ReplayFixture, limit: int) -> list[ReplaySample]:
+def select_samples(
+    fixture: ReplayFixture, limit: int, *, reconstruct_incumbent: bool = True
+) -> list[ReplaySample]:
     """Pick the most recent *limit* turns, oldest first.
 
     A turn is a batch, not a row. Production answers rapid-fire messages once,
@@ -540,6 +556,13 @@ def select_samples(fixture: ReplayFixture, limit: int) -> list[ReplaySample]:
     a placeholder with no body and no processed context, and replaying one
     would ask both models to respond to an empty string. A batch that ends in
     one is replayed at its last row with text.
+
+    *reconstruct_incumbent* is False for a run that will call the incumbent
+    live. ``_historic_first_decision`` is then never consulted, so a run in
+    ``IncumbentSource.REPLAY`` no longer walks every turn's recorded calls
+    and logs an unparseable-interactions warning about a decision it will
+    not use. The ``historic_*`` fields keep their defaults, which is what
+    every reader of them already treats as "the transcript said nothing".
     """
     samples: list[ReplaySample] = []
     rows = fixture.rows
@@ -555,7 +578,11 @@ def select_samples(fixture: ReplayFixture, limit: int) -> list[ReplaySample]:
             last_index, message_context = texts[-1]
             row = rows[last_index]
             reply, tool_names = _historic_response(rows, last_index)
-            decision = _historic_first_decision(rows, last_index, fixture.tools_by_name)
+            decision = (
+                _historic_first_decision(rows, last_index, fixture.tools_by_name)
+                if reconstruct_incumbent
+                else _UNRECONSTRUCTED
+            )
             samples.append(
                 ReplaySample(
                     seq=row.seq,

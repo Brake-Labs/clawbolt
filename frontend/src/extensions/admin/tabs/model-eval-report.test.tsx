@@ -532,8 +532,10 @@ describe('ModelEvalReportPage', () => {
     );
     renderReport();
 
+    // 40, not 38: the two turns whose decision could not be read back were
+    // calls this run did not make either.
     expect(
-      await screen.findByText(/38 provider call\(s\) this run did not pay for/),
+      await screen.findByText(/40 provider call\(s\) this run did not pay for/),
     ).toBeInTheDocument();
     expect(screen.getByText(/2 turn\(s\) had no incumbent decision to read/)).toBeInTheDocument();
   });

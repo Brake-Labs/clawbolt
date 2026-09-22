@@ -679,7 +679,11 @@ async def execute_run(run_id: int, *, concurrency: int) -> None:
     # The run knows its sample count, so the transcript read is bounded to the
     # tail it can reach rather than decrypting the user's whole history.
     fixture = await build_fixture(user, sample_limit=run.requested_samples)
-    samples = select_samples(fixture, run.requested_samples)
+    samples = select_samples(
+        fixture,
+        run.requested_samples,
+        reconstruct_incumbent=incumbent_source(run) is IncumbentSource.HISTORIC,
+    )
     if not samples:
         # Not an ``error``: the report renders that in a red banner, and a
         # run that completed normally against an empty history did not fail.

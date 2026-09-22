@@ -335,7 +335,11 @@ function IncumbentSourceNote({ summary }: { summary: EvalSummary }) {
   return (
     <p className="text-xs text-muted-foreground">
       {source === 'historic'
-        ? `Incumbent read from the recorded turns on ${historic} turn(s), never called. That is ${historic} provider call(s) this run did not pay for.`
+        ? // The saving is every turn the incumbent was not called on, which
+          // includes the ones whose decision could not be read back: a replay
+          // run would have paid for those too. Counting only the readable ones
+          // understated the saving by exactly the turns the line below names.
+          `Incumbent read from the recorded turns on ${historic} turn(s), never called. That is ${historic + unavailable} provider call(s) this run did not pay for.`
         : `Incumbent replayed live on ${live} turn(s), at ${live} provider call(s) on top of the candidate's.`}
       {unavailable > 0
         ? ` ${unavailable} turn(s) had no incumbent decision to read and were left out of every comparison.`

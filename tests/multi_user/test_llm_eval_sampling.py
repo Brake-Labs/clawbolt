@@ -23,7 +23,7 @@ from backend.app.agent.session_db import reset_session_stores
 from backend.app.agent.tools.base import Tool, ToolResult, ToolTags
 from backend.app.config import settings
 from backend.app.models import ChatSession, Message, User
-from backend.app.services.llm_eval.execution import MAX_REPLAY_READ_ROUNDS
+from backend.app.services.llm_eval.metrics import MAX_REPLAY_READ_ROUNDS
 from backend.app.services.llm_eval.sampling import (
     ReplayFixture,
     _historic_first_decision,
@@ -629,8 +629,35 @@ def test_the_scored_decision_skips_the_lookups_the_replay_would_feed_back() -> N
     # What it had read by then, so the judge can be shown this side's
     # lookups exactly as it is shown the candidate's.
     assert [(item.name, item.result) for item in decision.lookups] == [("qb_find", "ok")]
-    # Two calls in one flat list: whether they were one round or two is not
-    # recoverable, and the run says so rather than assuming.
+    # Two calls in one flat list, but nothing was dropped: the lookup rides
+    # along on ``lookups`` and is shown to the judge on both sides, so the
+    # turn reads the same whichever way production batched it. Warning about
+    # it would fire on the commonest multi-call shape there is.
+    assert not decision.flattened
+
+
+def test_calls_left_after_the_scored_one_are_reported_as_flattened() -> None:
+    """Here the reading really does drop something.
+
+    The scored write shares its flat list with a second write nobody can
+    place in a round. If production asked for both at once, the incumbent's
+    decision was the pair and this run scores half of it, so the turn is
+    counted and the report says so.
+    """
+    rows = [
+        _row(1, "inbound", "invoice both Acme jobs", BASE_TIME),
+        _row(
+            2,
+            "outbound",
+            "sent both",
+            BASE_TIME + _dt.timedelta(seconds=9),
+            tools=_interactions(
+                ("qb_send", {"invoice_id": "1186"}), ("qb_send", {"invoice_id": "1187"})
+            ),
+        ),
+    ]
+    decision = _historic_first_decision(rows, 0, _TOOLS)
+    assert [(c.name, c.arguments) for c in decision.calls] == [("qb_send", {"invoice_id": "1186"})]
     assert decision.flattened
 
 
@@ -815,4 +842,32 @@ def test_select_samples_carries_the_decision_onto_the_sample() -> None:
         ("qb_send", {"invoice_id": "1186"})
     ]
     assert [item.name for item in sample.historic_decision_lookups] == ["qb_find"]
-    assert sample.historic_calls_flattened
+    assert not sample.historic_calls_flattened
+
+
+def test_a_replay_run_never_reconstructs_the_recorded_decision() -> None:
+    """It will call the incumbent, so walking the record is wasted work.
+
+    Worse than wasted: the walk logs a warning for every turn whose recorded
+    interactions will not parse, about a decision the run was never going to
+    read.
+    """
+    rows = [
+        _row(1, "inbound", "invoice Acme for the stalls", BASE_TIME),
+        _row(
+            2,
+            "outbound",
+            "sent it",
+            BASE_TIME + _dt.timedelta(seconds=9),
+            tools=_LOOKUP_THEN_WRITE,
+        ),
+    ]
+    fixture = ReplayFixture(user=User(id="u"), rows=rows)
+    fixture.tools_by_name = _TOOLS
+    sample = select_samples(fixture, 1, reconstruct_incumbent=False)[0]
+    assert sample.historic_first_calls == ()
+    assert sample.historic_decision_lookups == ()
+    assert not sample.historic_calls_flattened
+    # The turn's own calls are still read: they are context for the judge and
+    # evidence for the safety checks on a replayed run too.
+    assert sample.historic_tool_names == ["qb_find", "qb_send"]

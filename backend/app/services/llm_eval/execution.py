@@ -34,6 +34,7 @@ from backend.app.agent.messages import (
 from backend.app.agent.tools.base import Tool
 from backend.app.config import settings
 from backend.app.services.llm_eval import metrics
+from backend.app.services.llm_eval.metrics import MAX_REPLAY_READ_ROUNDS
 from backend.app.services.llm_eval.types import ModelCallResult, RecordedToolResult, ToolCall
 from backend.app.services.llm_service import (
     LLMTarget,
@@ -85,13 +86,6 @@ def _needs_truncation_retry(result: ModelCallResult, max_tokens: int) -> bool:
         and result.stop_reason == "max_tokens"
         and max_tokens < _MAX_TOKENS_CEILING
     )
-
-
-# Extra rounds a replay may spend on lookups before its decision is scored.
-# Production runs up to ``MAX_TOOL_ROUNDS``, but a lookup-then-act turn needs
-# one or two, and every round is another paid call on both sides. A model
-# still looking things up after this many is scored on the lookup it asked for.
-MAX_REPLAY_READ_ROUNDS = 3
 
 
 async def call_model(

@@ -172,6 +172,17 @@ CACHE_COLLAPSE_CANDIDATE_MAX = 0.10
 # a cost or efficiency claim read off these columns is meaningless.
 MAX_TOKEN_ACCOUNTING_DIVERGENCE = 1.15
 
+# Extra rounds a replay may spend on lookups before its decision is scored.
+# Production runs up to ``MAX_TOOL_ROUNDS``, but a lookup-then-act turn needs
+# one or two, and every round is another paid call on both sides. A model
+# still looking things up after this many is scored on the lookup it asked for.
+#
+# Scoring policy, so it lives here beside ``replayable_lookup``: the two are
+# one rule, and both sides of a run are walked by it. ``execution.call_model``
+# applies it to the candidate's rounds and
+# ``sampling._historic_first_decision`` to the recorded calls.
+MAX_REPLAY_READ_ROUNDS = 3
+
 
 def canonical_args(args: dict[str, Any]) -> str:
     """Stable string form of tool arguments, for equality comparison.
@@ -729,13 +740,15 @@ class RunAggregate:
     comparable, so they are in no rate's denominator.
     """
     turns_flattened_rounds: int = 0
-    """Turns whose recorded calls could not be split into rounds.
+    """Turns where reading the recorded calls as rounds dropped a call.
 
     ``tool_interactions_json`` holds one flat list per outbound row, so a
     turn that recorded several calls may have asked for them all at once.
     They are read as separate rounds (see ``sampling.HistoricDecision``),
     and on these turns that reading could understate what the incumbent
-    asked for in one breath.
+    asked for in one breath. Counted only where a call the scored decision
+    might have been made alongside was dropped, not on every multi-call
+    turn: a leading lookup is shown on both sides either way.
     """
     configuration_drift: str = ""
     """What is known about which model actually answered the sampled turns.
@@ -1256,11 +1269,11 @@ def _decide(agg: RunAggregate) -> None:
 
     if agg.turns_flattened_rounds:
         agg.warnings.append(
-            f"On {agg.turns_flattened_rounds} turn(s) the transcript records several tool "
-            f"calls in one flat list, so whether the incumbent asked for them in one round "
-            f"or several is not recoverable. They are read as separate rounds, the leading "
-            f"lookups skipped the way the replay skips them, which understates any turn "
-            f"where the incumbent in fact asked for more in one breath."
+            f"On {agg.turns_flattened_rounds} turn(s) the transcript records more calls "
+            f"after the incumbent's scored one in the same flat list, so whether it asked "
+            f"for them in one round or several is not recoverable. They are read as "
+            f"separate rounds, which understates any turn where the incumbent in fact "
+            f"asked for more in one breath."
         )
 
     unresolved = agg.safety_counts.get(str(SafetyFinding.UNRESOLVED_TOOL_NAME), 0)

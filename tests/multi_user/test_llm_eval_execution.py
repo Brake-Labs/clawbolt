@@ -17,7 +17,8 @@ from pydantic import BaseModel
 from backend.app.agent.core import AssembledPrompt
 from backend.app.agent.messages import SystemMessage, UserMessage
 from backend.app.agent.tools.base import Tool, ToolResult, ToolTags
-from backend.app.services.llm_eval.execution import MAX_REPLAY_READ_ROUNDS, call_model
+from backend.app.services.llm_eval.execution import call_model
+from backend.app.services.llm_eval.metrics import MAX_REPLAY_READ_ROUNDS
 from backend.app.services.llm_eval.types import RecordedToolResult
 from backend.app.services.llm_service import LLMTarget
 
