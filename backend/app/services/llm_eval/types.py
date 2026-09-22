@@ -231,6 +231,12 @@ class ModelCallResult:
     cache_read_input_tokens: int = 0
     latency_ms: float = 0.0
     error: str = ""
+    truncation_retries: int = 0
+    """Times this decision was re-asked at a larger budget after truncating.
+
+    Production retries a reply cut off at ``max_tokens`` with no tool call,
+    so the replay does too, and the usage above includes the spent attempts.
+    """
 
     @property
     def acted(self) -> bool:

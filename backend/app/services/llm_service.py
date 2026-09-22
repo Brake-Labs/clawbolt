@@ -64,6 +64,32 @@ def reasoning_effort_to_thinking(effort: str) -> dict[str, Any] | None:
     return None
 
 
+# Output tokens a thinking model is left for its reply once its budget is spent.
+# Anthropic rejects a request whose ``thinking.budget_tokens`` is not below
+# ``max_tokens``, and a gateway that maps the budget to a scalar effort counts
+# reasoning against ``max_tokens`` instead, so ``high`` (24576) under the
+# agent's default 8192 is a refusal on one path and a truncation on the other.
+THINKING_REPLY_ALLOWANCE = 4096
+
+
+def fit_max_tokens_to_reasoning(max_tokens: int, reasoning: dict[str, Any]) -> int:
+    """Raise *max_tokens* so a thinking budget in *reasoning* fits under it.
+
+    *reasoning* is what ``LLMTarget.reasoning_kwargs`` returned for the call.
+    Only an enabled ``thinking`` budget states a size; the scalar effort shape
+    and "auto" carry none and leave *max_tokens* alone. Raising rather than
+    shrinking the budget keeps the effort the operator chose meaning what it
+    says.
+    """
+    thinking = reasoning.get("thinking")
+    if not isinstance(thinking, dict) or thinking.get("type") != "enabled":
+        return max_tokens
+    budget = thinking.get("budget_tokens")
+    if not isinstance(budget, int) or budget < max_tokens:
+        return max_tokens
+    return budget + THINKING_REPLY_ALLOWANCE
+
+
 # Providers that run locally (no API key needed).
 _LOCAL_PROVIDERS = {"ollama", "llamafile", "llamacpp", "lmstudio", "vllm"}
 
