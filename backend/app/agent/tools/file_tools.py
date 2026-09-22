@@ -605,6 +605,30 @@ def create_file_tools(
                 content = f'No saved files matched "{query}".'
             else:
                 content = "No saved files found."
+            # ``drive.file`` only exposes files this app created in the
+            # connected Google account. After a reconnect under a different
+            # OAuth app or Google account, earlier saves are invisible, so an
+            # empty connection is not proof that nothing was ever saved.
+            if query.strip():
+                try:
+                    drive_is_empty = not await storage.search_files(query="", limit=1)
+                except Exception:
+                    logger.warning("Empty-Drive check failed after a search miss", exc_info=True)
+                    drive_is_empty = False
+            else:
+                drive_is_empty = True
+            if drive_is_empty:
+                return ToolResult(
+                    content=content + " This Drive connection sees no saved files at all.",
+                    is_error=True,
+                    error_kind=ToolErrorKind.NOT_FOUND,
+                    hint=(
+                        "If the user says they saved files before, those were likely"
+                        " saved under an earlier Drive connection and are hidden from"
+                        " this one. Do not tell the user they were never saved; ask"
+                        " them to resend what you need."
+                    ),
+                )
             return ToolResult(
                 content=content,
                 is_error=True,
