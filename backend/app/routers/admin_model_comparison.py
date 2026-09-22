@@ -33,6 +33,7 @@ import logging
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import ValidationError
 from sqlalchemy import desc, select
 from sqlalchemy import func as sa_func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -110,9 +111,26 @@ async def _effective_models(user_id: str, db: AsyncSession) -> tuple[str, str, s
 
 
 def _summary_of(run: ComparisonRun) -> ComparisonSummary | None:
+    """The run's frozen summary, or None when it cannot be read back.
+
+    Every field on ``ComparisonSummary`` is required, which is what keeps the
+    generated frontend types free of ``?? 0``. The cost is that a summary
+    written by an older shape of the code cannot be validated, and raising
+    here would 500 the whole listing rather than one row: an operator could
+    not then reach the console to delete the stranded run. ``summary`` is
+    already nullable on the wire and the console renders "This run has no
+    summary", so degrading to that is the honest answer.
+    """
     if not run.summary_json:
         return None
-    return ComparisonSummary.model_validate(run.summary_json)
+    try:
+        return ComparisonSummary.model_validate(run.summary_json)
+    except ValidationError:
+        logger.warning(
+            "Comparison run %s has a summary this build cannot read; serving it without one",
+            run.public_id,
+        )
+        return None
 
 
 def _run_item(

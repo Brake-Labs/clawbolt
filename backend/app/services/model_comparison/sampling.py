@@ -362,10 +362,9 @@ def select_samples(fixture: ReplayFixture, limit: int) -> list[ReplaySample]:
     A turn is a batch, not a row. Production answers rapid-fire messages once,
     after the last of them, with the earlier ones already in the history it
     loads, so that is the replay too: one sample per batch, at the batch's
-    last row. Replaying each row alone scored decisions production never
-    made, on a fraction of what the user had said, and the judge read that
-    fraction as the whole request. The earlier rows ride along as
-    ``batched_messages`` so the report and the judge see everything the user
+    last row. Replaying each row alone reported decisions production never
+    made, on a fraction of what the user had said. The earlier rows ride
+    along as ``batched_messages`` so the report shows everything the user
     sent.
 
     Blank inbound rows are skipped: rapid-fire attachment batching persists
