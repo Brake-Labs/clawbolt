@@ -265,8 +265,9 @@ Three invariants, each of which the feature is worthless without:
   above `MAX_NET_WORSE_BLOCKING` and with a significant sign test. Divergence
   never blocks; its caution fires above the incumbent's own divergence from
   itself plus `DIVERGENCE_MARGIN`. To calibrate a user, start a run whose
-  candidate is the incumbent (same endpoint, model and effort); later runs
-  for that user pick it up (`runner.divergence_noise_floor`). Bump
+  candidate is the incumbent (same endpoint, model and effort) over at least
+  `MIN_TURNS_FOR_VERDICT` turns; later runs for that user pick it up
+  (`runner.divergence_noise_floor`), and a shorter one is ignored. Bump
   `runner.HARNESS_VERSION` when the replay changes what it measures, so old
   calibrations stop applying.
 - **A failing provider stops the run.** `MAX_CONSECUTIVE_CALL_FAILURES`

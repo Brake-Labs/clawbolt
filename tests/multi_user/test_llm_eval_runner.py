@@ -838,7 +838,15 @@ async def test_the_judge_is_given_the_conversation_and_the_turns_clock(
 # ---------------------------------------------------------------------------
 
 
-def _calibration_run(db: Session, user_id: str, *, divergence: float, version: int) -> None:
+def _calibration_run(
+    db: Session,
+    user_id: str,
+    *,
+    divergence: float,
+    version: int,
+    turns: int = 100,
+    completed_at: datetime | None = None,
+) -> None:
     db.add(
         LLMEvalRun(
             user_id=user_id,
@@ -848,8 +856,12 @@ def _calibration_run(db: Session, user_id: str, *, divergence: float, version: i
             candidate_model="incumbent",
             requested_samples=100,
             status=str(RunStatus.COMPLETED),
-            completed_at=datetime.now(UTC),
-            summary_json={"harness_version": version, "divergence_rate": divergence},
+            completed_at=completed_at or datetime.now(UTC),
+            summary_json={
+                "harness_version": version,
+                "divergence_rate": divergence,
+                "turns_completed": turns,
+            },
         )
     )
     db.commit()
@@ -870,6 +882,44 @@ async def test_a_calibration_run_sets_the_divergence_noise_floor(
     assert run.summary_json["divergence_noise_floor"] == 0.38
     assert run.summary_json["divergence_threshold"] == 0.48
     assert run.summary_json["harness_version"] == HARNESS_VERSION
+
+
+async def test_a_calibration_run_too_short_for_a_verdict_is_ignored(
+    db_session: Session, test_user: User
+) -> None:
+    now = datetime.now(UTC)
+    _calibration_run(
+        db_session,
+        test_user.id,
+        divergence=0.38,
+        version=HARNESS_VERSION,
+        completed_at=now - timedelta(days=1),
+    )
+    _calibration_run(
+        db_session, test_user.id, divergence=0.0, version=HARNESS_VERSION, turns=3, completed_at=now
+    )
+    run_id = _make_run(db_session, test_user.id, samples=1)
+    a, b, c, d = _patched_run(samples=_samples(1), call_side_effect=lambda *a, **k: _result("ok"))
+    with a, b, c, d:
+        await execute_run(run_id, concurrency=1)
+
+    run = db_session.execute(select(LLMEvalRun).where(LLMEvalRun.id == run_id)).scalar_one()
+    assert run.summary_json is not None
+    assert run.summary_json["divergence_noise_floor"] == 0.38
+
+
+async def test_only_a_short_calibration_run_leaves_divergence_uncalibrated(
+    db_session: Session, test_user: User
+) -> None:
+    _calibration_run(db_session, test_user.id, divergence=0.1, version=HARNESS_VERSION, turns=3)
+    run_id = _make_run(db_session, test_user.id, samples=1)
+    a, b, c, d = _patched_run(samples=_samples(1), call_side_effect=lambda *a, **k: _result("ok"))
+    with a, b, c, d:
+        await execute_run(run_id, concurrency=1)
+
+    run = db_session.execute(select(LLMEvalRun).where(LLMEvalRun.id == run_id)).scalar_one()
+    assert run.summary_json is not None
+    assert run.summary_json["divergence_noise_floor"] is None
 
 
 async def test_a_self_comparison_run_says_it_is_the_calibration(

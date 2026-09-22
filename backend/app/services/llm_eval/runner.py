@@ -146,7 +146,10 @@ async def divergence_noise_floor(run: LLMEvalRun) -> float | None:
 
     Read from the newest completed calibration run (the incumbent as its own
     candidate, same endpoint and effort) for the same user, measured by this
-    harness version. ``metrics._decide`` cautions on divergence only above
+    harness version, over at least ``metrics.MIN_TURNS_FOR_VERDICT`` compared
+    turns: a handful of turns is a sample, not a floor, and a 3-turn run that
+    happened to agree with itself would otherwise set a floor of zero.
+    ``metrics._decide`` cautions on divergence only above
     this floor plus ``metrics.DIVERGENCE_MARGIN``; without one it uses the
     uncalibrated ceiling.
     """
@@ -179,7 +182,13 @@ async def divergence_noise_floor(run: LLMEvalRun) -> float | None:
     for calibration in candidates:
         summary = calibration.summary_json or {}
         rate = summary.get("divergence_rate")
-        if summary.get("harness_version") == HARNESS_VERSION and isinstance(rate, int | float):
+        completed = summary.get("turns_completed")
+        if (
+            summary.get("harness_version") == HARNESS_VERSION
+            and isinstance(rate, int | float)
+            and isinstance(completed, int)
+            and completed >= metrics.MIN_TURNS_FOR_VERDICT
+        ):
             return float(rate)
     return None
 
