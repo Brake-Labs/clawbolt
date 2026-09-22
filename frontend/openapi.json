@@ -5845,6 +5845,17 @@
             "type": "number",
             "title": "P Value",
             "default": 1.0
+          },
+          "comparable": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Comparable"
           }
         },
         "type": "object",
@@ -6542,6 +6553,17 @@
               }
             ],
             "title": "Silent Noop Blocking Rate"
+          },
+          "silent_noop_comparable": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Silent Noop Comparable"
           },
           "baseline": {
             "$ref": "#/components/schemas/AdminLLMEvalModelTotals"

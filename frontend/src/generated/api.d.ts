@@ -3318,6 +3318,8 @@ export interface components {
              * @default 1
              */
             p_value: number;
+            /** Comparable */
+            comparable?: boolean | null;
         };
         /**
          * AdminLLMEvalLookup
@@ -3744,6 +3746,8 @@ export interface components {
             silent_noop_rate: number;
             /** Silent Noop Blocking Rate */
             silent_noop_blocking_rate?: number | null;
+            /** Silent Noop Comparable */
+            silent_noop_comparable?: boolean | null;
             baseline?: components["schemas"]["AdminLLMEvalModelTotals"];
             candidate?: components["schemas"]["AdminLLMEvalModelTotals"];
             /**

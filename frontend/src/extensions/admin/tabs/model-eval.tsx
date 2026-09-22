@@ -433,10 +433,11 @@ export default function ModelEvalTab() {
           </select>
         </label>
         <p className="mt-2 text-xs text-muted-foreground">
-          Recorded turns compare the candidate against the first decision the agent actually made
-          at the time, under the prompt and tool schema of that day, and never call the incumbent.
-          Replay when the prompt or the tool set has changed since those turns, when the incumbent
-          has never run them, or to calibrate a model against itself.
+          Recorded turns weigh the candidate against what the agent did at the same point in the
+          turn, under the prompt and tool schema of that day, and never call the incumbent. Such a
+          run reports rather than decides: it can neither clear a candidate nor block one. Replay
+          when the prompt or the tool set has changed since those turns, when the incumbent has
+          never run them, or to calibrate a model against itself.
         </p>
 
         <div className="mt-4 flex flex-wrap items-center gap-4">

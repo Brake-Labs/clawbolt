@@ -1340,6 +1340,12 @@ export interface EvalSummary {
    * mean opposite things, so do not coalesce them.
    */
   silent_noop_blocking_rate: number | null;
+  /** False when the acting side of those no-ops is the recorded turn rather
+   * than a decision this run elicited, so the rate is reported and cannot
+   * block. null on older runs. */
+  silent_noop_comparable?: boolean | null;
+  /** The judge's verdicts reduced to a net preference. null on older runs. */
+  judge_preference?: EvalJudgePreference | null;
   baseline: EvalModelTotals;
   candidate: EvalModelTotals;
   recommendation: EvalRecommendation;
@@ -1357,6 +1363,18 @@ interface EvalSideComparison {
    * Every count above is then zero for want of a measurement, not for want
    * of a finding, so nothing may be read off them. */
   comparable?: boolean;
+}
+
+interface EvalJudgePreference {
+  better: number;
+  worse: number;
+  judged: number;
+  net_worse_rate: number;
+  p_value: number;
+  /** False when the incumbent side was never measured. The verdicts are
+   * real; what they cannot support is the claim a block makes, that the
+   * candidate is worse than the model it would replace. */
+  comparable?: boolean | null;
 }
 
 export interface EvalRun {

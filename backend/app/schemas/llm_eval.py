@@ -28,13 +28,9 @@ class AdminLLMEvalRunCreate(BaseModel):
     candidate_reasoning_effort: ReasoningEffort | Literal[""] = ""
     sample_count: int = Field(default=100, ge=1)
     judge_enabled: bool = True
-    # Where the incumbent's decisions come from. ``historic`` is the default
-    # and halves the run's provider bill: the incumbent already answered
-    # these turns once, in production, and its first decision is recorded.
-    # ``replay`` calls it live on every turn, which is worth paying for when
-    # the prompt or tool schema has moved since the turns happened, when the
-    # deployment has never run the incumbent on them, or to calibrate a
-    # model against itself.
+    # Where the incumbent's decisions come from, and what each mode does and
+    # does not measure: ``llm_eval.types.IncumbentSource``. ``historic`` is
+    # the default and halves the run's provider bill.
     incumbent_source: Literal["historic", "replay"] = "historic"
 
 
@@ -71,8 +67,8 @@ class AdminLLMEvalSideComparison(BaseModel):
     candidate_only: int = 0
     baseline_only: int = 0
     p_value: float = 1.0
-    # False when the incumbent side was never measured, which is the case in
-    # ``historic`` mode. Every count above is then zero for want of a
+    # False when the incumbent side was never measured (``incumbent_source``
+    # ``historic``): the counts above are then zero for want of a
     # measurement, not for want of a finding, and nothing may be read off
     # them. True on a run recorded before the modes existed, which replayed.
     comparable: bool = True
@@ -86,6 +82,10 @@ class AdminLLMEvalJudgePreference(BaseModel):
     judged: int = 0
     net_worse_rate: float = 0.0
     p_value: float = 1.0
+    # As on ``AdminLLMEvalSideComparison``: the counts are real, but with an
+    # unmeasured incumbent they cannot support a claim that the candidate is
+    # worse than the model it would replace. ``None`` on older runs.
+    comparable: bool | None = None
 
 
 class AdminLLMEvalSummary(BaseModel):
@@ -94,8 +94,8 @@ class AdminLLMEvalSummary(BaseModel):
     turns_total: int = 0
     turns_completed: int = 0
     turns_failed: int = 0
-    # Where the run took the incumbent's decisions, and where they actually
-    # came from, keyed by ``live``/``historic``/``unavailable``. Both are
+    # What the run asked for (``llm_eval.types.IncumbentSource``) and what it
+    # got per turn, keyed by ``live``/``historic``/``unavailable``. Both are
     # ``None`` on a run recorded before the modes existed, which replayed
     # every turn; a report must not read a missing count as a measured zero.
     incumbent_source: str | None = None
@@ -143,6 +143,11 @@ class AdminLLMEvalSummary(BaseModel):
     # opposite things here, and a report that read the default as zero told
     # the operator the judge had preferred no-ops it never saw.
     silent_noop_blocking_rate: float | None = None
+    # Whether "the candidate replied where the incumbent acted" is a claim
+    # about the incumbent model. It is not with an unmeasured incumbent,
+    # where the acting side is the recorded turn, so the rate is reported
+    # and cannot block. ``None`` on older runs.
+    silent_noop_comparable: bool | None = None
     baseline: AdminLLMEvalModelTotals = Field(default_factory=AdminLLMEvalModelTotals)
     candidate: AdminLLMEvalModelTotals = Field(default_factory=AdminLLMEvalModelTotals)
     recommendation: str = ""
@@ -176,10 +181,11 @@ class AdminLLMEvalRunItem(BaseModel):
     candidate_model: str
     candidate_reasoning_effort: str = ""
     judge_model: str
-    # Where this run takes the incumbent's decisions, how many sampled turns
-    # had none to read, and how many agent calls over the window those turns
-    # fall in ran on a model this run does not name. All three are counted as
-    # the run goes, so they are readable while it is still in flight.
+    # Where this run takes the incumbent's decisions
+    # (``llm_eval.types.IncumbentSource``), how many sampled turns had none
+    # to read, and how many agent calls over the window those turns fall in
+    # ran on a model this run does not name. All three are counted as the run
+    # goes, so they are readable while it is still in flight.
     incumbent_source: str = "replay"
     baseline_turns_unavailable: int = 0
     historic_other_config_calls: int = 0
@@ -304,11 +310,10 @@ class AdminLLMEvalTurn(BaseModel):
     historic_reply: str = ""
     historic_tool_names: list[str] = Field(default_factory=list)
     baseline: AdminLLMEvalDecision
-    # Where the incumbent's decision for this turn came from: a ``live``
-    # call, the ``historic`` transcript, or ``unavailable`` when there was
-    # none to read. Per turn rather than per run, because a historic run
-    # cannot reconstruct every turn. ``live`` on rows recorded before the
-    # modes existed.
+    # Where the incumbent's decision for this turn came from
+    # (``llm_eval.types.TurnSource``). Per turn rather than per run, because
+    # a historic run cannot reconstruct every turn. ``live`` on rows
+    # recorded before the modes existed.
     baseline_source: str = "live"
     candidate: AdminLLMEvalDecision
     agreement: str

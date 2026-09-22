@@ -340,6 +340,13 @@ function IncumbentSourceNote({ summary }: { summary: EvalSummary }) {
       {unavailable > 0
         ? ` ${unavailable} turn(s) had no incumbent decision to read and were left out of every comparison.`
         : ''}
+      {/* The blocking tests all weigh the candidate against the incumbent,
+          and here there is no incumbent measurement to weigh it against, so
+          they report rather than decide. Said once, under the tiles the
+          rates appear in. */}
+      {summary.silent_noop_comparable === false || summary.judge_preference?.comparable === false
+        ? ' Findings measured against a recording cannot block a switch on their own; a replay run is what settles them.'
+        : ''}
     </p>
   );
 }

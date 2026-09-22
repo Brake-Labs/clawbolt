@@ -583,4 +583,27 @@ describe('ModelEvalReportPage', () => {
     ).toBeInTheDocument();
     expect(screen.queryByText(/^Incumbent 0ms$/)).not.toBeInTheDocument();
   });
+
+  it('says the rates measured against a recording cannot block a switch', async () => {
+    // The blocking tests all weigh the candidate against the incumbent, and
+    // a historic run has no incumbent measurement to weigh it against. A
+    // reader who sees a rate over its ceiling has to be told that.
+    const api = await import('../admin-api');
+    vi.mocked(api.getEvalReport).mockResolvedValue(
+      report({
+        run: run({
+          summary: summary({
+            incumbent_source: 'historic',
+            incumbent_source_counts: { historic: 40 },
+            silent_noop_comparable: false,
+          }),
+        }),
+      }),
+    );
+    renderReport();
+
+    expect(
+      await screen.findByText(/cannot block a switch on their own/),
+    ).toBeInTheDocument();
+  });
 });
