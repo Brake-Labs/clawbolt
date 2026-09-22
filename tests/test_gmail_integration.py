@@ -1447,7 +1447,7 @@ async def test_open_attachment_guesses_mime_for_octet_stream(test_user: User) ->
         tool = _get_tool(
             create_gmail_tools(service, user_id=test_user.id), ToolName.GMAIL_OPEN_ATTACHMENT
         )
-        result = await tool.function("msg-1", "1")
+        result = await tool.function("msg-1", "1", "inspection.pdf")
     assert "flue liner cracked" in result.content
     assert await media_staging.get_mime_type(test_user.id, "gmail:msg-1/1") == "application/pdf"
 
@@ -1461,7 +1461,7 @@ async def test_open_image_attachment_is_usable_by_analyze_photo(test_user: User)
         tool = _get_tool(
             create_gmail_tools(service, user_id=test_user.id), ToolName.GMAIL_OPEN_ATTACHMENT
         )
-        result = await tool.function("msg-1", "0.1")
+        result = await tool.function("msg-1", "0.1", "logo.png")
 
     assert result.is_error is False, result.content
     assert not any("/attachments/" in c for c in calls)
@@ -1491,8 +1491,8 @@ async def test_reopening_attachment_reuses_handle(test_user: User) -> None:
         tool = _get_tool(
             create_gmail_tools(service, user_id=test_user.id), ToolName.GMAIL_OPEN_ATTACHMENT
         )
-        first = await tool.function("msg-1", "1")
-        second = await tool.function("msg-1", "inspection.pdf")
+        first = await tool.function("msg-1", "1", "inspection.pdf")
+        second = await tool.function("msg-1", "inspection.pdf", "inspection.pdf")
     handle = await media_staging.get_handle_for(test_user.id, "gmail:msg-1/1")
     assert handle is not None
     assert handle in first.content
@@ -1511,7 +1511,7 @@ async def test_open_attachment_rejects_declared_oversize_without_fetching(
         tool = _get_tool(
             create_gmail_tools(service, user_id=test_user.id), ToolName.GMAIL_OPEN_ATTACHMENT
         )
-        result = await tool.function("msg-1", "1")
+        result = await tool.function("msg-1", "1", "inspection.pdf")
     assert result.is_error is True
     assert result.error_kind == ToolErrorKind.VALIDATION
     assert "too large" in result.content
@@ -1533,7 +1533,7 @@ async def test_open_attachment_rejects_oversize_payload_when_size_understated(
         tool = _get_tool(
             create_gmail_tools(service, user_id=test_user.id), ToolName.GMAIL_OPEN_ATTACHMENT
         )
-        result = await tool.function("msg-1", "1")
+        result = await tool.function("msg-1", "1", "inspection.pdf")
     assert result.is_error is True
     assert result.error_kind == ToolErrorKind.VALIDATION
     assert await media_staging.get_handle_for(test_user.id, "gmail:msg-1/1") is None
@@ -1546,7 +1546,7 @@ async def test_open_attachment_unknown_id_lists_available(test_user: User) -> No
         tool = _get_tool(
             create_gmail_tools(service, user_id=test_user.id), ToolName.GMAIL_OPEN_ATTACHMENT
         )
-        result = await tool.function("msg-1", "9")
+        result = await tool.function("msg-1", "9", "inspection.pdf")
     assert result.is_error is True
     assert result.error_kind == ToolErrorKind.NOT_FOUND
     assert "inspection.pdf" in result.content
@@ -1557,10 +1557,33 @@ async def test_open_attachment_requires_ids() -> None:
     service = _make_service()
     with patch.object(service, "_request", new_callable=AsyncMock) as mock_req:
         tool = _get_tool(create_gmail_tools(service, user_id="u1"), ToolName.GMAIL_OPEN_ATTACHMENT)
-        result = await tool.function("msg-1", "  ")
+        result = await tool.function("msg-1", "  ", "inspection.pdf")
     assert result.is_error is True
     assert result.error_kind == ToolErrorKind.VALIDATION
     mock_req.assert_not_called()
+
+
+async def test_open_attachment_requires_filename() -> None:
+    """Without a filename the approval prompt could only show an opaque id."""
+    service = _make_service()
+    with patch.object(service, "_request", new_callable=AsyncMock) as mock_req:
+        tool = _get_tool(create_gmail_tools(service, user_id="u1"), ToolName.GMAIL_OPEN_ATTACHMENT)
+        result = await tool.function("msg-1", "1", " ")
+    assert result.is_error is True
+    assert result.error_kind == ToolErrorKind.VALIDATION
+    mock_req.assert_not_called()
+
+
+def test_open_attachment_approval_prompt_sanitizes_filename() -> None:
+    tool = _get_tool(create_gmail_tools(_make_service()), ToolName.GMAIL_OPEN_ATTACHMENT)
+    assert tool.approval_policy is not None
+    assert tool.approval_policy.description_builder is not None
+    described = tool.approval_policy.description_builder(
+        {"message_id": "msg-1", "attachment_id": "1", "filename": "a\nb\x1b" + "x" * 500}
+    )
+    assert "\n" not in described
+    assert "\x1b" not in described
+    assert len(described) < 200
 
 
 async def test_open_attachment_rejects_mismatched_filename(test_user: User) -> None:
@@ -1587,7 +1610,7 @@ async def test_open_attachment_http_404_maps_to_not_found(test_user: User) -> No
         tool = _get_tool(
             create_gmail_tools(service, user_id=test_user.id), ToolName.GMAIL_OPEN_ATTACHMENT
         )
-        result = await tool.function("gone", "1")
+        result = await tool.function("gone", "1", "inspection.pdf")
     assert result.error_kind == ToolErrorKind.NOT_FOUND
 
 

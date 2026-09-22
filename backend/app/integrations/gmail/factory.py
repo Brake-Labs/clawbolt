@@ -104,10 +104,9 @@ class GmailOpenAttachmentParams(BaseModel):
         description="The attachment_id listed under 'Attachments' by gmail_get_message.",
     )
     filename: str = Field(
-        default="",
         description=(
             "The attachment's filename as listed. Shown to the user in the "
-            "approval prompt; must match the attachment when given."
+            "approval prompt; must match the attachment."
         ),
     )
 
@@ -213,8 +212,14 @@ def _resolve_attachment_mime(a: GmailAttachmentInfo) -> str:
     return guessed or "application/octet-stream"
 
 
+_MAX_PROMPT_FILENAME_CHARS = 120
+
+
 def _describe_gmail_open_attachment(args: dict[str, object]) -> str:
-    label = args.get("filename") or args.get("attachment_id") or ""
+    # The filename comes from the email's sender. Strip control characters and
+    # cap it so it cannot reshape or flood the approval prompt.
+    raw = str(args.get("filename") or args.get("attachment_id") or "")
+    label = "".join(ch for ch in raw if ch.isprintable())[:_MAX_PROMPT_FILENAME_CHARS]
     return f"Open attachment {label} from Gmail message {args.get('message_id', '')}"
 
 
@@ -504,11 +509,11 @@ def create_gmail_tools(
         return ToolResult(content=_format_message(msg))
 
     async def gmail_open_attachment(
-        message_id: str, attachment_id: str, filename: str = ""
+        message_id: str, attachment_id: str, filename: str
     ) -> ToolResult:
-        if not message_id.strip() or not attachment_id.strip():
+        if not message_id.strip() or not attachment_id.strip() or not filename.strip():
             return ToolResult(
-                content="Both message_id and attachment_id are required.",
+                content="message_id, attachment_id, and filename are all required.",
                 is_error=True,
                 error_kind=ToolErrorKind.VALIDATION,
             )
@@ -543,7 +548,7 @@ def create_gmail_tools(
                 is_error=True,
                 error_kind=ToolErrorKind.NOT_FOUND,
             )
-        if filename.strip() and filename.strip().lower() != attachment.filename.lower():
+        if filename.strip().lower() != attachment.filename.lower():
             return ToolResult(
                 content=(
                     f"attachment_id {attachment_id!r} is {attachment.filename!r}, "
