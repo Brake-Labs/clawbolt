@@ -605,6 +605,18 @@ def create_file_tools(
                 content = f'No saved files matched "{query}".'
             else:
                 content = "No saved files found."
+            # Drive's ``drive.file`` scope only exposes files the current
+            # OAuth grant created. A connection that sees nothing at all is
+            # usually a reconnect (new OAuth client or another Google
+            # account), not proof that earlier saves never happened.
+            if not query.strip() or not await storage.search_files(query="", limit=1):
+                content += (
+                    " This Drive connection sees no saved files at all. Drive only"
+                    " shows files created by the current connection, so files saved"
+                    " under an earlier Drive connection still exist in the user's"
+                    " Drive but are hidden from you. Do not tell the user they were"
+                    " never saved; ask them to resend the files if you need them."
+                )
             return ToolResult(
                 content=content,
                 is_error=True,

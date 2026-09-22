@@ -1,5 +1,7 @@
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 from backend.app.agent.dto import slugify as _slugify
 from backend.app.agent.tools.file_tools import (
     DEFAULT_INBOX_FOLDER,
@@ -606,6 +608,50 @@ async def test_find_saved_files_matches_query_tokens(
     assert result.is_error is False
     assert "/Loeffler/documents/receipt_001.jpg" in result.content
     assert "/Acme/photos/photo_001.jpg" not in result.content
+
+
+@pytest.mark.parametrize("query", ["Acme deck", ""])
+async def test_find_saved_files_empty_drive_warns_files_may_be_hidden(
+    test_user: User,
+    query: str,
+) -> None:
+    """A connection that sees no files at all must not read as "never saved".
+
+    ``drive.file`` only exposes files the current OAuth grant created. After
+    a Drive reconnect (new OAuth client or another Google account) every
+    earlier file still exists in the user's Drive but is invisible, so a
+    miss is not evidence the file was never saved.
+    """
+    storage = MockStorageBackend()
+    tools = create_file_tools(test_user, storage)
+    find_saved = next(t for t in tools if t.name == ToolName.FIND_SAVED_FILES).function
+
+    result = await find_saved(query=query)
+
+    assert result.is_error is True
+    assert "earlier Drive connection" in result.content
+    assert "never saved" in result.content
+
+
+async def test_find_saved_files_miss_with_visible_files_keeps_plain_message(
+    test_user: User,
+) -> None:
+    """When other saved files are visible, a miss is a plain no-match."""
+    storage = MockStorageBackend()
+    await storage.upload_file(
+        b"other",
+        "/Acme/photos",
+        "photo_001.jpg",
+        mime_type="image/jpeg",
+        description="front porch progress photo",
+    )
+    tools = create_file_tools(test_user, storage)
+    find_saved = next(t for t in tools if t.name == ToolName.FIND_SAVED_FILES).function
+
+    result = await find_saved(query="Loeffler")
+
+    assert result.is_error is True
+    assert result.content == 'No saved files matched "Loeffler".'
 
 
 @patch("backend.app.agent.tools.file_tools.run_vision_on_media", new_callable=AsyncMock)
