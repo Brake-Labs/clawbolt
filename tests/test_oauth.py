@@ -1444,3 +1444,64 @@ async def test_refresh_sweep_continues_after_individual_failure(
     # google_calendar one succeeded.
     assert sorted(seen) == ["google_calendar", "quickbooks"]
     assert count == 1
+
+
+def _token_endpoint_error(status_code: int, error: str) -> httpx.HTTPStatusError:
+    """An HTTPStatusError shaped like a provider token endpoint's rejection."""
+    request = httpx.Request("POST", "https://example.com/token")
+    response = httpx.Response(status_code, json={"error": error}, request=request)
+    return httpx.HTTPStatusError("token refresh rejected", request=request, response=response)
+
+
+async def test_refresh_sweep_retires_a_token_after_permanent_failure(
+    oauth_svc: OAuthService, test_user: User
+) -> None:
+    """Regression: a rejected refresh was retried on every tick, forever.
+
+    The sweep must retire the token and tell the user, as the inline path
+    does, so the next tick has nothing left to fail on.
+    """
+    await _mark_user_active(test_user.id)
+    await oauth_svc.save_token(
+        test_user.id,
+        "gmail",
+        OAuthTokenData(access_token="at", refresh_token="rt", expires_at=time.time() + 60),
+    )
+
+    scheduler = OAuthRefreshScheduler(oauth_svc)
+    refresh = AsyncMock(side_effect=_token_endpoint_error(401, "invalid_client"))
+    with (
+        patch.object(oauth_svc, "refresh_token", refresh),
+        patch.object(oauth_svc, "_notify_reauth_needed", new_callable=AsyncMock) as notify,
+    ):
+        assert await scheduler.sweep() == 0
+        assert await oauth_svc.load_token_uncached(test_user.id, "gmail") is None
+        notify.assert_awaited_once_with(test_user.id, "gmail")
+
+        await scheduler.sweep()
+    assert refresh.await_count == 1
+
+
+async def test_refresh_sweep_keeps_a_token_after_transient_failure(
+    oauth_svc: OAuthService, test_user: User
+) -> None:
+    """A provider 5xx is not the user's problem: keep the token and retry."""
+    await _mark_user_active(test_user.id)
+    await oauth_svc.save_token(
+        test_user.id,
+        "gmail",
+        OAuthTokenData(access_token="at", refresh_token="rt", expires_at=time.time() + 60),
+    )
+
+    scheduler = OAuthRefreshScheduler(oauth_svc)
+    refresh = AsyncMock(side_effect=_token_endpoint_error(503, "temporarily_unavailable"))
+    with (
+        patch.object(oauth_svc, "refresh_token", refresh),
+        patch.object(oauth_svc, "_notify_reauth_needed", new_callable=AsyncMock) as notify,
+    ):
+        await scheduler.sweep()
+        await scheduler.sweep()
+
+    assert await oauth_svc.load_token_uncached(test_user.id, "gmail") is not None
+    notify.assert_not_awaited()
+    assert refresh.await_count == 2
