@@ -905,3 +905,46 @@ def test_a_run_with_the_judge_off_says_so_rather_than_looking_broken(
 
     response = admin_client.get(f"{BASE}/runs/{run.public_id}")
     assert response.json()["turns"][0]["judge_skip_reason"] == "judge_disabled"
+
+
+def test_report_shows_the_lookups_each_side_made_before_deciding(
+    admin_client: TestClient, consenting_user: User, db_session: Session
+) -> None:
+    run = _make_run(db_session, consenting_user.id)
+    db_session.add_all(
+        [
+            LLMEvalTurnResult(
+                run_id=run.id,
+                message_seq=1,
+                user_message="note the job at 12 Oak St",
+                agreement=str(AgreementClass.IDENTICAL),
+                candidate_replayed_lookups=json.dumps(
+                    [
+                        {
+                            "name": "search",
+                            "arguments": {"q": "12 Oak St"},
+                            "result": "work order 71002",
+                            "is_error": False,
+                        }
+                    ]
+                ),
+            ),
+            # Recorded before replays continued past a first decision.
+            LLMEvalTurnResult(
+                run_id=run.id,
+                message_seq=2,
+                user_message="an older turn",
+                agreement=str(AgreementClass.IDENTICAL),
+            ),
+        ]
+    )
+    db_session.commit()
+
+    response = admin_client.get(f"{BASE}/runs/{run.public_id}")
+    assert response.status_code == 200
+    by_seq = {t["message_seq"]: t for t in response.json()["turns"]}
+    (lookup,) = by_seq[1]["candidate"]["replayed_lookups"]
+    assert lookup["name"] == "search"
+    assert lookup["result"] == "work order 71002"
+    assert by_seq[1]["baseline"]["replayed_lookups"] == []
+    assert by_seq[2]["candidate"]["replayed_lookups"] == []

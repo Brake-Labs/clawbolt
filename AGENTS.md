@@ -220,9 +220,14 @@ owns the job lifecycle.
 
 Three invariants, each of which the feature is worthless without:
 
-- **A replay never executes a tool.** It stops at the model's first decision
-  for a turn. Executing would text real customers and mutate real job records
-  on every evaluation.
+- **A replay never executes a tool.** Executing would text real customers and
+  mutate real job records on every evaluation. A replay continues past a
+  lookup only when every call in the response is read-only
+  (`metrics.is_mutating_call`) and matches a call the live turn made; it then
+  feeds back the result that turn recorded, for at most
+  `MAX_REPLAY_READ_ROUNDS` extra rounds (`execution.call_model`). Anything
+  else, a write included, is the decision scored. Feeding a recorded result is
+  not execution; calling a tool to get a fresh one would be.
 - **Prompts are built by `ClawboltAgent.assemble_prompt`,** the same method the
   live loop calls. A second assembly implementation would score prompts no user
   ever received. If you change how the agent assembles a turn, the evaluator

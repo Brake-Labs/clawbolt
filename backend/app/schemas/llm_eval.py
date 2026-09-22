@@ -188,11 +188,25 @@ class AdminLLMEvalToolCall(BaseModel):
     arguments: dict[str, Any] = Field(default_factory=dict)
 
 
+class AdminLLMEvalLookup(BaseModel):
+    """A lookup the replay fed back from the live turn before the decision."""
+
+    name: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    result: str = ""
+    is_error: bool = False
+
+
 class AdminLLMEvalDecision(BaseModel):
     """One model's decision for one replayed turn."""
 
     text: str = ""
     tool_calls: list[AdminLLMEvalToolCall] = Field(default_factory=list)
+    # Read-only calls the replay answered from the live turn's recorded
+    # results before ``tool_calls``/``text`` above, oldest first. Empty on a
+    # turn decided in one round, and on every run recorded before replays
+    # continued past a first decision.
+    replayed_lookups: list[AdminLLMEvalLookup] = Field(default_factory=list)
     stop_reason: str = ""
     input_tokens: int = 0
     output_tokens: int = 0

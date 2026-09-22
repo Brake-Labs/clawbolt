@@ -8,14 +8,17 @@ cannot fit under ``max_tokens`` is scored as a provider refusal.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import AsyncMock, patch
 
 from any_llm.types.messages import MessageResponse, MessageUsage, TextBlock, ToolUseBlock
+from pydantic import BaseModel
 
 from backend.app.agent.core import AssembledPrompt
 from backend.app.agent.messages import SystemMessage, UserMessage
-from backend.app.services.llm_eval.execution import call_model
+from backend.app.agent.tools.base import Tool, ToolResult, ToolTags
+from backend.app.services.llm_eval.execution import MAX_REPLAY_READ_ROUNDS, call_model
+from backend.app.services.llm_eval.types import RecordedToolResult
 from backend.app.services.llm_service import LLMTarget
 
 TARGET = LLMTarget(provider="anthropic", model="m")
@@ -31,7 +34,10 @@ def _prompt() -> AssembledPrompt:
 
 
 def _response(
-    *, text: str = "", tool: dict[str, Any] | None = None, stop: str = "end_turn"
+    *,
+    text: str = "",
+    tool: dict[str, Any] | None = None,
+    stop: Literal["end_turn", "max_tokens", "tool_use"] = "end_turn",
 ) -> MessageResponse:
     content: list[Any] = []
     if text:
@@ -102,7 +108,7 @@ async def test_a_thinking_budget_always_fits_under_max_tokens() -> None:
     for effort, budget in (("high", 24576), ("xhigh", 32768)):
         mock = AsyncMock(return_value=_response(text="ok"))
         await _call(mock, effort=effort)
-        kwargs = mock.await_args.kwargs
+        kwargs = mock.await_args_list[-1].kwargs
         assert kwargs["thinking"]["budget_tokens"] == budget
         assert kwargs["max_tokens"] > budget
 
@@ -110,4 +116,122 @@ async def test_a_thinking_budget_always_fits_under_max_tokens() -> None:
 async def test_a_budget_that_already_fits_is_left_alone() -> None:
     mock = AsyncMock(return_value=_response(text="ok"))
     await _call(mock, effort="low")
-    assert mock.await_args.kwargs["max_tokens"] == 8192
+    assert mock.await_args_list[-1].kwargs["max_tokens"] == 8192
+
+
+# ---------------------------------------------------------------------------
+# Continuing through lookups the live turn made
+# ---------------------------------------------------------------------------
+
+
+class _SearchParams(BaseModel):
+    query: str
+    limit: int = 10
+
+
+class _NoteParams(BaseModel):
+    work_order_id: str
+    body: str
+
+
+async def _never(**_kwargs: object) -> ToolResult:  # pragma: no cover - never invoked
+    raise AssertionError("a replay must never execute a tool")
+
+
+TOOLS = {
+    "search": Tool(
+        name="search",
+        description="search",
+        function=_never,
+        params_model=_SearchParams,
+        tags={ToolTags.READ_ONLY},
+    ),
+    "add_note": Tool(
+        name="add_note", description="add_note", function=_never, params_model=_NoteParams
+    ),
+}
+
+RECORDED = (
+    RecordedToolResult(
+        name="search", arguments={"query": "12 Oak St"}, result="work order 71002 at 12 Oak St"
+    ),
+    RecordedToolResult(
+        name="add_note", arguments={"work_order_id": "71002", "body": "done"}, result="ok"
+    ),
+)
+
+SEARCH = {"name": "search", "input": {"query": "12 Oak St", "limit": 10}}
+NOTE = {"name": "add_note", "input": {"work_order_id": "71002", "body": "done"}}
+
+
+async def _replay(mock: AsyncMock, recorded: tuple[RecordedToolResult, ...] = RECORDED) -> Any:
+    with patch("backend.app.services.llm_eval.execution.amessages", mock):
+        return await call_model(
+            _prompt(),
+            None,
+            target=TARGET,
+            reasoning_effort="",
+            tools_by_name=TOOLS,
+            recorded=recorded,
+        )
+
+
+async def test_a_lookup_the_live_turn_made_is_answered_and_the_decision_scored() -> None:
+    """Regression: only the first call was scored.
+
+    A model that looked the work order up first, as production did, was
+    scored on the search and lost to a model that guessed the ID and wrote.
+    """
+    mock = AsyncMock(side_effect=[_response(tool=SEARCH), _response(tool=NOTE)])
+    result = await _replay(mock)
+
+    assert [c.name for c in result.tool_calls] == ["add_note"]
+    assert [lookup.name for lookup in result.replayed_lookups] == ["search"]
+    assert result.replayed_lookups[0].result == "work order 71002 at 12 Oak St"
+    # Usage covers both rounds.
+    assert result.input_tokens == 200
+
+    second_round = mock.await_args_list[1].kwargs["messages"]
+    fed = second_round[-1]["content"][0]
+    assert fed["type"] == "tool_result"
+    assert fed["content"] == "work order 71002 at 12 Oak St"
+    assert second_round[-2]["content"][-1]["name"] == "search"
+
+
+async def test_a_default_spelled_out_still_matches_the_recorded_call() -> None:
+    mock = AsyncMock(side_effect=[_response(tool=SEARCH), _response(text="Found it.")])
+    result = await _replay(mock)
+    assert mock.await_count == 2
+    assert result.text == "Found it."
+
+
+async def test_a_lookup_the_live_turn_did_not_make_ends_the_replay() -> None:
+    """Answering it would need a live call, and a replay never makes one."""
+    other = {"name": "search", "input": {"query": "14 Elm St"}}
+    mock = AsyncMock(return_value=_response(tool=other))
+    result = await _replay(mock)
+    assert mock.await_count == 1
+    assert result.tool_calls[0].arguments == {"query": "14 Elm St"}
+    assert result.replayed_lookups == []
+
+
+async def test_a_write_is_never_answered_even_when_the_live_turn_made_it() -> None:
+    mock = AsyncMock(return_value=_response(tool=NOTE))
+    result = await _replay(mock)
+    assert mock.await_count == 1
+    assert [c.name for c in result.tool_calls] == ["add_note"]
+
+
+async def test_the_replay_gives_up_after_its_round_budget() -> None:
+    mock = AsyncMock(return_value=_response(tool=SEARCH))
+    result = await _replay(mock)
+    assert mock.await_count == MAX_REPLAY_READ_ROUNDS + 1
+    assert [c.name for c in result.tool_calls] == ["search"]
+    assert len(result.replayed_lookups) == MAX_REPLAY_READ_ROUNDS
+
+
+async def test_without_a_tool_set_the_replay_is_single_round() -> None:
+    mock = AsyncMock(return_value=_response(tool=SEARCH))
+    with patch("backend.app.services.llm_eval.execution.amessages", mock):
+        await call_model(_prompt(), None, target=TARGET, reasoning_effort="", recorded=RECORDED)
+    assert mock.await_count == 1

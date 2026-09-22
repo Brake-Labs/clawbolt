@@ -5,9 +5,11 @@ different model, would it still do the right thing? It answers it by replaying
 the user's own recent turns through both the incumbent and the candidate model
 and comparing the two decisions.
 
-Nothing here executes a tool. A replay stops at the model's first decision for
-a turn, which is the thing a model swap actually changes and the only thing
-that can be compared without re-running the user's real side effects.
+Nothing here executes a tool. A replay continues through a lookup only when
+the live turn made that same lookup, by feeding back the result it recorded,
+and stops at the first decision that would need a live tool. That decision is
+the thing a model swap actually changes and the only thing that can be
+compared without re-running the user's real side effects.
 """
 
 from __future__ import annotations
@@ -191,6 +193,22 @@ class RunTargets:
 
 
 @dataclass(frozen=True)
+class RecordedToolResult:
+    """A tool call and the result it returned.
+
+    On a ``ReplaySample`` these are what the live turn called and got back,
+    read from the stored ``tool_interactions_json``. On a ``ModelCallResult``
+    they are the lookups a replay fed back to the model before its scored
+    decision. Replaying a recorded result is not execution: nothing is called.
+    """
+
+    name: str
+    arguments: dict[str, Any]
+    result: str
+    is_error: bool = False
+
+
+@dataclass(frozen=True)
 class ReplaySample:
     """One historic inbound turn, selected for replay.
 
@@ -205,6 +223,12 @@ class ReplaySample:
     message_context: str
     historic_reply: str = ""
     historic_tool_names: list[str] = field(default_factory=list)
+    historic_tool_results: tuple[RecordedToolResult, ...] = ()
+    """Every tool call the live turn made, with the result it returned.
+
+    What lets a replay continue past a lookup: a read-only call that matches
+    one of these gets its recorded result back instead of a live call.
+    """
     batched_messages: tuple[str, ...] = ()
     """Earlier messages of the batch this turn closes, oldest first.
 
@@ -227,6 +251,9 @@ class ToolCall:
 
     name: str
     arguments: dict[str, Any]
+    # The provider's ``tool_use`` id, needed to pair a replayed result with
+    # its call. Not part of what the call *is*, so equality ignores it.
+    id: str = field(default="", compare=False)
 
 
 @dataclass
@@ -245,6 +272,13 @@ class ModelCallResult:
     cache_read_input_tokens: int = 0
     latency_ms: float = 0.0
     error: str = ""
+    replayed_lookups: list[RecordedToolResult] = field(default_factory=list)
+    """Lookups fed back from the live turn before this decision, in order.
+
+    The scored decision (``text``, ``tool_calls``) is what the model did
+    after them, and the usage above covers every round. Empty when the model
+    decided on its first round.
+    """
     truncation_retries: int = 0
     """Times this decision was re-asked at a larger budget after truncating.
 

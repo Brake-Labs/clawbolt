@@ -44,6 +44,7 @@ from backend.app.models import LLMEvalRun, LLMEvalTurnResult, Subscription, User
 from backend.app.query_helpers import count_rows, fetch_all, iso_or_none
 from backend.app.schemas.llm_eval import (
     AdminLLMEvalDecision,
+    AdminLLMEvalLookup,
     AdminLLMEvalReportResponse,
     AdminLLMEvalRunCreate,
     AdminLLMEvalRunItem,
@@ -167,6 +168,27 @@ def _tool_calls(raw: str) -> list[AdminLLMEvalToolCall]:
     ]
 
 
+# A recorded tool result can be a whole document. The drill-down needs enough
+# to see what the model read, not the payload.
+_MAX_LOOKUP_RESULT_CHARS = 2000
+
+
+def _lookups(raw: str) -> list[AdminLLMEvalLookup]:
+    entries = _load_json(raw, [])
+    if not isinstance(entries, list):
+        return []
+    return [
+        AdminLLMEvalLookup(
+            name=str(entry.get("name", "")),
+            arguments=redact_pii_recursive(entry.get("arguments") or {}),
+            result=redact_pii(str(entry.get("result", ""))[:_MAX_LOOKUP_RESULT_CHARS]),
+            is_error=bool(entry.get("is_error", False)),
+        )
+        for entry in entries
+        if isinstance(entry, dict)
+    ]
+
+
 def _blocking_findings(turn: LLMEvalTurnResult) -> bool:
     """Whether this turn carries a finding that disqualifies a switch.
 
@@ -217,6 +239,7 @@ def _turn_item(turn: LLMEvalTurnResult, *, run_has_judge: bool = True) -> AdminL
         baseline=AdminLLMEvalDecision(
             text=redact_pii(turn.baseline_text),
             tool_calls=_tool_calls(turn.baseline_tool_calls),
+            replayed_lookups=_lookups(turn.baseline_replayed_lookups),
             stop_reason=turn.baseline_stop_reason,
             input_tokens=turn.baseline_input_tokens,
             output_tokens=turn.baseline_output_tokens,
@@ -228,6 +251,7 @@ def _turn_item(turn: LLMEvalTurnResult, *, run_has_judge: bool = True) -> AdminL
         candidate=AdminLLMEvalDecision(
             text=redact_pii(turn.candidate_text),
             tool_calls=_tool_calls(turn.candidate_tool_calls),
+            replayed_lookups=_lookups(turn.candidate_replayed_lookups),
             stop_reason=turn.candidate_stop_reason,
             input_tokens=turn.candidate_input_tokens,
             output_tokens=turn.candidate_output_tokens,

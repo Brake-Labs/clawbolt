@@ -29,7 +29,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from backend.app.agent.approval import get_approval_store
-from backend.app.agent.context import _stored_messages_to_agent_messages
+from backend.app.agent.context import (
+    _parse_tool_interactions,
+    _stored_messages_to_agent_messages,
+)
 from backend.app.agent.core import AssembledPrompt, ClawboltAgent
 from backend.app.agent.dto import StoredMessage
 from backend.app.agent.messages import AgentMessage, AssistantMessage
@@ -47,7 +50,7 @@ from backend.app.bus import OutboundMessage
 from backend.app.config import settings
 from backend.app.enums import MessageDirection
 from backend.app.models import User
-from backend.app.services.llm_eval.types import ReplaySample
+from backend.app.services.llm_eval.types import RecordedToolResult, ReplaySample
 
 logger = logging.getLogger(__name__)
 
@@ -295,6 +298,18 @@ def _historic_response(rows: list[StoredMessage], start: int) -> tuple[str, list
     """
     reply_parts: list[str] = []
     tool_names: list[str] = []
+    for row in _response_rows(rows, start):
+        for msg in _stored_messages_to_agent_messages([row]):
+            if isinstance(msg, AssistantMessage):
+                tool_names.extend(tc.name for tc in msg.tool_calls)
+        text = row.llm_reply_text or row.body
+        if text:
+            reply_parts.append(text)
+    return "\n\n".join(reply_parts), tool_names
+
+
+def _response_rows(rows: list[StoredMessage], start: int) -> list[StoredMessage]:
+    """The outbound rows that answered the turn whose batch begins at *start*."""
     index = start + 1
     # Advance past the remainder of the inbound batch this row belongs to.
     while (
@@ -303,16 +318,31 @@ def _historic_response(rows: list[StoredMessage], start: int) -> tuple[str, list
         and _same_batch(rows[index - 1], rows[index])
     ):
         index += 1
+    answered: list[StoredMessage] = []
     for row in rows[index:]:
         if row.direction == MessageDirection.INBOUND:
             break
-        for msg in _stored_messages_to_agent_messages([row]):
-            if isinstance(msg, AssistantMessage):
-                tool_names.extend(tc.name for tc in msg.tool_calls)
-        text = row.llm_reply_text or row.body
-        if text:
-            reply_parts.append(text)
-    return "\n\n".join(reply_parts), tool_names
+        answered.append(row)
+    return answered
+
+
+def _historic_tool_results(rows: list[StoredMessage], start: int) -> tuple[RecordedToolResult, ...]:
+    """Every tool call the live turn made, with the result it got back.
+
+    Read through the same parser the history rebuild uses, so a malformed
+    ``tool_interactions_json`` yields no results here exactly as it yields no
+    tool calls in the prompt.
+    """
+    return tuple(
+        RecordedToolResult(
+            name=interaction.name,
+            arguments=interaction.args,
+            result=interaction.result,
+            is_error=interaction.is_error,
+        )
+        for row in _response_rows(rows, start)
+        for interaction in _parse_tool_interactions(row.tool_interactions_json)
+    )
 
 
 def _batch_end(rows: list[StoredMessage], start: int) -> int:
@@ -369,6 +399,7 @@ def select_samples(fixture: ReplayFixture, limit: int) -> list[ReplaySample]:
                     message_context=message_context,
                     historic_reply=reply,
                     historic_tool_names=tool_names,
+                    historic_tool_results=_historic_tool_results(rows, last_index),
                     batched_messages=tuple(text for _, text in texts[:-1]),
                 )
             )
@@ -383,7 +414,7 @@ def _history_for(fixture: ReplayFixture, sample: ReplaySample) -> list[AgentMess
     return _stored_messages_to_agent_messages(window, tz_name=fixture.tz_name)
 
 
-def _sample_clock(sample: ReplaySample) -> datetime | None:
+def sample_clock(sample: ReplaySample) -> datetime | None:
     """The wall time to stamp on *sample*'s replayed turn, or None for now.
 
     Falls back to None (wall time) on an unparseable timestamp rather than
@@ -422,5 +453,5 @@ async def assemble_for_sample(fixture: ReplayFixture, sample: ReplaySample) -> A
         sample.message_context,
         _history_for(fixture, sample),
         deterministic_trim=True,
-        now=_sample_clock(sample),
+        now=sample_clock(sample),
     )

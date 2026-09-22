@@ -120,6 +120,19 @@ def canonical_args(args: dict[str, Any]) -> str:
         return repr(sorted(args.items()))
 
 
+def normalized_args(tool: Tool, args: dict[str, Any]) -> str:
+    """Canonical arguments after the params model fills in its defaults.
+
+    Two calls that differ only in whether an optional argument was spelled
+    out at its default value are the same call. Falls back to the raw
+    arguments when they do not validate.
+    """
+    try:
+        return canonical_args(tool.params_model.model_validate(args).model_dump(mode="json"))
+    except ValidationError:
+        return canonical_args(args)
+
+
 def _args_are_valid(tool: Tool, args: dict[str, Any]) -> tuple[bool, str]:
     """Whether *args* would survive the agent's own validation of *tool*.
 

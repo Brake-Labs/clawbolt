@@ -25,12 +25,12 @@ from backend.app.services.llm_eval.sampling import (
     ReplayFixture,
     _historic_response,
     _history_for,
-    _sample_clock,
     assemble_for_sample,
     build_fixture,
+    sample_clock,
     select_samples,
 )
-from backend.app.services.llm_eval.types import ReplaySample
+from backend.app.services.llm_eval.types import RecordedToolResult, ReplaySample
 
 BASE_TIME = _dt.datetime(2026, 5, 1, 12, 0, tzinfo=_dt.UTC)
 
@@ -394,6 +394,10 @@ async def test_a_rapid_fire_batch_is_replayed_once_at_its_last_row(
     assert sample.user_text == "rebuild the stalls\n\nadd 5000 for the staircase\n\nbuild and send"
     assert sample.historic_tool_names == ["qb_update"]
     assert sample.historic_reply == "sent"
+    # Recorded with its result, so a replay can answer a matching lookup.
+    assert sample.historic_tool_results == (
+        RecordedToolResult(name="qb_update", arguments={"estimate_id": "635"}, result="ok"),
+    )
 
     # The earlier rows reach the model the way production shows them: as
     # history in front of the last row, not folded into the current turn.
@@ -475,22 +479,22 @@ async def test_replayed_turn_is_stamped_with_its_own_time_not_now(
     assert _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%d") not in turn_text
 
 
-def test_sample_clock_parses_the_stored_timestamp() -> None:
+def testsample_clock_parses_the_stored_timestamp() -> None:
     sample = ReplaySample(
         seq=1, timestamp="2026-08-30T16:48:00+00:00", message_context="this past week"
     )
-    assert _sample_clock(sample) == _dt.datetime(2026, 8, 30, 16, 48, tzinfo=_dt.UTC)
+    assert sample_clock(sample) == _dt.datetime(2026, 8, 30, 16, 48, tzinfo=_dt.UTC)
 
 
-def test_sample_clock_falls_back_to_wall_time_on_a_corrupt_timestamp() -> None:
+def testsample_clock_falls_back_to_wall_time_on_a_corrupt_timestamp() -> None:
     """A wrong clock is worse than the honest current one."""
     sample = ReplaySample(seq=1, timestamp="not a timestamp", message_context="hi")
-    assert _sample_clock(sample) is None
+    assert sample_clock(sample) is None
 
 
-def test_sample_clock_assumes_utc_for_a_naive_timestamp() -> None:
+def testsample_clock_assumes_utc_for_a_naive_timestamp() -> None:
     sample = ReplaySample(seq=1, timestamp="2026-08-30T16:48:00", message_context="hi")
-    clock = _sample_clock(sample)
+    clock = sample_clock(sample)
     assert clock is not None
     assert clock.tzinfo is not None
 

@@ -19,6 +19,8 @@ from pydantic import BaseModel
 from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
 
+from backend.app.agent.core import AssembledPrompt
+from backend.app.agent.messages import SystemMessage, UserMessage
 from backend.app.agent.tools.base import Tool, ToolResult
 from backend.app.models import LLMEvalRun, LLMEvalTurnResult, User
 from backend.app.services.llm_eval.runner import (
@@ -32,6 +34,7 @@ from backend.app.services.llm_eval.types import (
     JudgeVerdict,
     ModelCallResult,
     Recommendation,
+    RecordedToolResult,
     ReplaySample,
     RunStatus,
     SafetyFinding,
@@ -81,6 +84,20 @@ def _samples(count: int) -> list[ReplaySample]:
     ]
 
 
+def _assembled() -> AssembledPrompt:
+    """A real assembled prompt: the judge renders its history into context."""
+    return AssembledPrompt(
+        messages=[
+            SystemMessage(content="system"),
+            UserMessage(content="earlier ask"),
+            UserMessage(content="current ask"),
+        ],
+        stable_system="system",
+        dynamic_context="",
+        system_prompt="system",
+    )
+
+
 def _patched_run(
     *,
     samples: list[ReplaySample],
@@ -101,7 +118,7 @@ def _patched_run(
         ),
         patch(
             "backend.app.services.llm_eval.runner.assemble_for_sample",
-            AsyncMock(return_value=object()),
+            AsyncMock(return_value=_assembled()),
         ),
         patch(
             "backend.app.services.llm_eval.runner.call_model",
@@ -694,3 +711,80 @@ async def test_the_summary_records_why_each_turn_went_unjudged(
     summary = run.summary_json
     assert summary is not None
     assert summary["judge_skip_counts"] == {str(JudgeSkipReason.IDENTICAL): 2}
+
+
+# ---------------------------------------------------------------------------
+# Lookups replayed from the live turn, and the judge's context
+# ---------------------------------------------------------------------------
+
+
+async def test_each_side_is_offered_the_live_turns_recorded_lookups(
+    db_session: Session, test_user: User
+) -> None:
+    """The replay can only continue past a lookup the live turn made."""
+    run_id = _make_run(db_session, test_user.id, samples=1)
+    recorded = (RecordedToolResult(name="lookup", arguments={"q": "a"}, result="id 42"),)
+    samples = [
+        ReplaySample(
+            seq=1,
+            timestamp="2026-05-01T12:00:00+00:00",
+            message_context="note it on the job",
+            historic_tool_names=["lookup"],
+            historic_tool_results=recorded,
+        )
+    ]
+    seen: list[Any] = []
+
+    async def record(*_args: object, **kwargs: Any) -> ModelCallResult:
+        seen.append(kwargs["recorded"])
+        result = _result(tools=[ToolCall(name="lookup", arguments={"q": "b"})])
+        result.replayed_lookups = list(recorded)
+        return result
+
+    a, b, c, d = _patched_run(
+        samples=samples, call_side_effect=record, tools_by_name={"lookup": _lookup_tool()}
+    )
+    with a, b, c, d:
+        await execute_run(run_id, concurrency=1)
+
+    assert seen == [recorded, recorded]
+    row = db_session.execute(
+        select(LLMEvalTurnResult).where(LLMEvalTurnResult.run_id == run_id)
+    ).scalar_one()
+    stored = json.loads(row.candidate_replayed_lookups)
+    assert stored == [
+        {"name": "lookup", "arguments": {"q": "a"}, "result": "id 42", "is_error": False}
+    ]
+
+
+async def test_the_judge_is_given_the_conversation_and_the_turns_clock(
+    db_session: Session, test_user: User
+) -> None:
+    """Regression: the judge saw only the user's latest message.
+
+    It called correct answers made up when the fact came from an earlier
+    turn, and resolved relative dates against no date at all.
+    """
+    run_id = _make_run(db_session, test_user.id, samples=1, judge=True)
+    baseline = _result(tools=[ToolCall(name="lookup", arguments={"q": "a"})])
+    candidate = _result(text="done")
+    calls = iter([baseline, candidate])
+    judge = AsyncMock(return_value=(JudgeVerdict.EQUIVALENT, ""))
+    patches = _patched_run(
+        samples=_samples(1),
+        call_side_effect=lambda *a, **k: next(calls),
+        tools_by_name={"lookup": _lookup_tool()},
+    )
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patches[3],
+        patch("backend.app.services.llm_eval.runner.judge_turn", judge),
+    ):
+        await execute_run(run_id, concurrency=1)
+
+    context = judge.await_args_list[-1].kwargs["context"]
+    assert "earlier ask" in context.transcript
+    assert "current ask" not in context.transcript
+    assert "2026-05-01" in context.current_time

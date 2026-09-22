@@ -27,17 +27,19 @@ from typing import cast
 from sqlalchemy import CursorResult, func, select, update
 from sqlalchemy.exc import IntegrityError
 
+from backend.app.agent.system_prompt import build_time_user_context
 from backend.app.config import settings
 from backend.app.database import db_session_async
 from backend.app.models import LLMEvalRun, LLMEvalTurnResult, User
 from backend.app.services.llm_endpoints import resolve_target
 from backend.app.services.llm_eval import metrics
 from backend.app.services.llm_eval.execution import call_model
-from backend.app.services.llm_eval.judge import judge_turn
+from backend.app.services.llm_eval.judge import build_judge_context, judge_turn
 from backend.app.services.llm_eval.sampling import (
     ReplayFixture,
     assemble_for_sample,
     build_fixture,
+    sample_clock,
     select_samples,
 )
 from backend.app.services.llm_eval.types import (
@@ -46,6 +48,7 @@ from backend.app.services.llm_eval.types import (
     JudgeVerdict,
     ModelCallResult,
     Recommendation,
+    RecordedToolResult,
     ReplaySample,
     RunStatus,
     RunTargets,
@@ -171,6 +174,27 @@ def _serialize_calls(calls: list[ToolCall]) -> str:
     )
 
 
+def _serialize_lookups(lookups: list[RecordedToolResult]) -> str:
+    """The lookups a side replayed before its decision, results included.
+
+    Results are kept so the drill-down can show what the model read before
+    it decided. They are the live turn's own recorded results, already in
+    the user's history, and the column is encrypted like the rest.
+    """
+    return json.dumps(
+        [
+            {
+                "name": item.name,
+                "arguments": item.arguments,
+                "result": item.result,
+                "is_error": item.is_error,
+            }
+            for item in lookups
+        ],
+        default=str,
+    )
+
+
 def _turn_row(run_id: int, comparison: TurnComparison) -> LLMEvalTurnResult:
     sample = comparison.sample
     base = comparison.baseline
@@ -184,6 +208,7 @@ def _turn_row(run_id: int, comparison: TurnComparison) -> LLMEvalTurnResult:
         historic_tool_names=json.dumps(sample.historic_tool_names),
         baseline_text=base.text,
         baseline_tool_calls=_serialize_calls(base.tool_calls),
+        baseline_replayed_lookups=_serialize_lookups(base.replayed_lookups),
         baseline_stop_reason=base.stop_reason or "",
         baseline_input_tokens=base.input_tokens,
         baseline_output_tokens=base.output_tokens,
@@ -193,6 +218,7 @@ def _turn_row(run_id: int, comparison: TurnComparison) -> LLMEvalTurnResult:
         baseline_error=base.error,
         candidate_text=cand.text,
         candidate_tool_calls=_serialize_calls(cand.tool_calls),
+        candidate_replayed_lookups=_serialize_lookups(cand.replayed_lookups),
         candidate_stop_reason=cand.stop_reason or "",
         candidate_input_tokens=cand.input_tokens,
         candidate_output_tokens=cand.output_tokens,
@@ -225,18 +251,24 @@ async def _compare_turn(
     """Replay one turn through both models and score the result."""
     assembled = await assemble_for_sample(fixture, sample)
 
+    # Both sides may continue through lookups the live turn also made, fed
+    # the recorded results; nothing is executed. See ``call_model``.
     baseline, candidate = await asyncio.gather(
         call_model(
             assembled,
             fixture.tool_schemas,
             target=targets.baseline,
             reasoning_effort=targets.baseline_reasoning_effort,
+            tools_by_name=fixture.tools_by_name,
+            recorded=sample.historic_tool_results,
         ),
         call_model(
             assembled,
             fixture.tool_schemas,
             target=targets.candidate,
             reasoning_effort=targets.candidate_reasoning_effort,
+            tools_by_name=fixture.tools_by_name,
+            recorded=sample.historic_tool_results,
         ),
     )
 
@@ -294,7 +326,12 @@ async def _compare_turn(
     )
     comparison.judge_skip_reason = skip_reason
     if skip_reason is None:
-        verdict, rationale = await judge_turn(sample, baseline, candidate, target=targets.judge)
+        context = build_judge_context(
+            assembled, build_time_user_context(fixture.user, sample_clock(sample))
+        )
+        verdict, rationale = await judge_turn(
+            sample, baseline, candidate, target=targets.judge, context=context
+        )
         comparison.judge_verdict = verdict
         comparison.judge_rationale = rationale
 
