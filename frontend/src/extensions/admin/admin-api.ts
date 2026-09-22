@@ -1340,9 +1340,9 @@ export interface EvalSummary {
    * mean opposite things, so do not coalesce them.
    */
   silent_noop_blocking_rate: number | null;
-  /** False when the acting side of those no-ops is the recorded turn rather
-   * than a decision this run elicited, so the rate is reported and cannot
-   * block. null on older runs. */
+  /** False when this run's sample is too confounded for those no-ops to
+   * block, so the rate is reported and the verdict withholds it. An
+   * unmeasured incumbent alone does not make it false. null on older runs. */
   silent_noop_comparable?: boolean | null;
   /** The judge's verdicts reduced to a net preference. null on older runs. */
   judge_preference?: EvalJudgePreference | null;
@@ -1351,6 +1351,9 @@ export interface EvalSummary {
   recommendation: EvalRecommendation;
   reasons: string[];
   warnings: string[];
+  /** Blocking findings the run saw and could not adjudicate. Non-empty means
+   * the verdict is inconclusive and `reasons` explains each one. */
+  blocking_withheld?: string[] | null;
 }
 
 interface EvalSideComparison {

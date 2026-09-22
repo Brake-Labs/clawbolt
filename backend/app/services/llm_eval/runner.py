@@ -1006,11 +1006,14 @@ def _summary_payload(aggregate: metrics.RunAggregate) -> dict:
         ),
         "silent_noop_rate": round(aggregate.silent_noop_rate, 4),
         "silent_noop_blocking_rate": round(aggregate.silent_noop_blocking_rate, 4),
-        # Whether "the candidate replied where the incumbent acted" is a
-        # claim about the incumbent model. It is not in historic mode, where
-        # the acting side is the recorded turn, so the rate is reported and
-        # cannot block. Same reading as ``safety_comparison.comparable``.
-        "silent_noop_comparable": aggregate.incumbent_measured,
+        # Whether "the candidate replied where the incumbent acted" can block
+        # this run. It compares two decisions that were really made, so
+        # historic mode does not rule it out on its own; a sample too
+        # confounded to read does (``RunAggregate.blocking_comparable``).
+        "silent_noop_comparable": aggregate.blocking_comparable,
+        # Blocking findings this run saw and could not adjudicate. Non-empty
+        # means the verdict is ``inconclusive`` and these are why.
+        "blocking_withheld": aggregate.blocking_withheld,
         "baseline": _model_totals_payload(aggregate.baseline),
         "candidate": _model_totals_payload(aggregate.candidate),
         "recommendation": str(aggregate.recommendation),

@@ -1514,18 +1514,9 @@ async def test_an_identical_candidate_on_lookup_then_reply_turns_is_not_a_no_op(
     assert run.recommendation != Recommendation.DO_NOT_SWITCH
 
 
-async def test_historic_mode_cannot_reach_a_blocking_verdict(
-    db_session: Session, test_user: User
-) -> None:
-    """Defence in depth: no reading of the recorded side may block a switch.
-
-    Every turn here is a silent no-op the judge did not excuse, which in
-    replay mode is a firm ``do_not_switch``. The incumbent side is a turn
-    production recorded rather than a decision this run elicited, so the
-    same evidence is a caution that names what is missing.
-    """
-    turns = MIN_TURNS_FOR_VERDICT + 2
-    samples = [
+def _silent_noop_samples(turns: int) -> list[ReplaySample]:
+    """Turns production answered with a lookup, end to end."""
+    return [
         ReplaySample(
             seq=seq,
             timestamp="2026-05-01T12:00:00+00:00",
@@ -1536,8 +1527,63 @@ async def test_historic_mode_cannot_reach_a_blocking_verdict(
         )
         for seq in range(1, turns + 1)
     ]
+
+
+async def test_historic_mode_rejects_a_candidate_it_really_did_compare(
+    db_session: Session, test_user: User
+) -> None:
+    """The default mode has to be able to say no.
+
+    Every turn here is a silent no-op the judge did not excuse. Both sides
+    of that are real decisions taken at the same point in the turn, so the
+    evidence is as good as a replayed run's, and gating the block on the
+    mode left ``do_not_switch`` unreachable by default.
+    """
+    turns = MIN_TURNS_FOR_VERDICT + 2
     run_id = _make_run(
         db_session, test_user.id, samples=turns, incumbent_source=IncumbentSource.HISTORIC
+    )
+    a, b, c, d = _patched_run(
+        samples=_silent_noop_samples(turns),
+        call_side_effect=lambda *a, **k: _result(text="Here is what I think."),
+        tools_by_name={"lookup": _lookup_tool()},
+    )
+    with a, b, c, d:
+        await execute_run(run_id, concurrency=1)
+
+    run = db_session.execute(select(LLMEvalRun).where(LLMEvalRun.id == run_id)).scalar_one()
+    summary = run.summary_json
+    assert summary is not None
+    assert summary["silent_noop_blocking_rate"] == 1.0
+    assert summary["silent_noop_comparable"] is True
+    assert summary["blocking_withheld"] == []
+    assert run.recommendation == Recommendation.DO_NOT_SWITCH
+    assert any("where acting was the better call" in reason for reason in summary["reasons"])
+
+
+async def test_a_withheld_block_lands_on_inconclusive_not_on_an_endorsement(
+    db_session: Session, test_user: User
+) -> None:
+    """Over the confounder ceiling, the run has no answer.
+
+    A third of this sample had no reconstructable incumbent decision, so the
+    turns the no-op rate was measured on may not represent the turns it was
+    drawn from. The evidence still belongs in the reasons; what it must not
+    do is arrive under a verdict that reads as permission to switch.
+    """
+    turns = MIN_TURNS_FOR_VERDICT + 2
+    samples = _silent_noop_samples(turns)
+    samples += [
+        ReplaySample(
+            seq=seq,
+            timestamp="2026-05-01T12:00:00+00:00",
+            message_context=f"ask {seq}",
+            historic_decision_available=False,
+        )
+        for seq in range(turns + 1, turns + 12)
+    ]
+    run_id = _make_run(
+        db_session, test_user.id, samples=len(samples), incumbent_source=IncumbentSource.HISTORIC
     )
     a, b, c, d = _patched_run(
         samples=samples,
@@ -1550,11 +1596,11 @@ async def test_historic_mode_cannot_reach_a_blocking_verdict(
     run = db_session.execute(select(LLMEvalRun).where(LLMEvalRun.id == run_id)).scalar_one()
     summary = run.summary_json
     assert summary is not None
-    assert summary["silent_noop_blocking_rate"] == 1.0
+    assert summary["turns_incumbent_unavailable"] == 11
     assert summary["silent_noop_comparable"] is False
-    assert summary["judge_preference"]["comparable"] is False
-    assert run.recommendation == Recommendation.SWITCH_WITH_MONITORING
-    assert any("cannot block a switch" in reason for reason in summary["reasons"])
+    assert summary["blocking_withheld"]
+    assert run.recommendation == Recommendation.INCONCLUSIVE
+    assert any("where acting was the better call" in reason for reason in summary["reasons"])
 
 
 async def test_a_judged_unsafe_flag_is_never_filed_against_an_unmeasured_incumbent(

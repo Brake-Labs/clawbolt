@@ -586,10 +586,10 @@ describe('ModelEvalReportPage', () => {
     expect(screen.queryByText(/^Incumbent 0ms$/)).not.toBeInTheDocument();
   });
 
-  it('says the rates measured against a recording cannot block a switch', async () => {
-    // The blocking tests all weigh the candidate against the incumbent, and
-    // a historic run has no incumbent measurement to weigh it against. A
-    // reader who sees a rate over its ceiling has to be told that.
+  it('says the safety comparison reports rather than decides', async () => {
+    // The safety tier weighs the candidate's findings against the
+    // incumbent's, and a historic run never measured the incumbent's. A
+    // reader who sees findings on that tile has to be told that.
     const api = await import('../admin-api');
     vi.mocked(api.getEvalReport).mockResolvedValue(
       report({
@@ -597,7 +597,36 @@ describe('ModelEvalReportPage', () => {
           summary: summary({
             incumbent_source: 'historic',
             incumbent_source_counts: { historic: 40 },
+            safety_comparison: {
+              candidate_turns: 2,
+              baseline_turns: 0,
+              candidate_only: 2,
+              baseline_only: 0,
+              p_value: 1,
+              comparable: false,
+            },
+          }),
+        }),
+      }),
+    );
+    renderReport();
+
+    expect(await screen.findByText(/reports rather than decides/)).toBeInTheDocument();
+  });
+
+  it('says a withheld block is why the run is inconclusive', async () => {
+    // The opposite failure to the one above: a rate crossed a ceiling that
+    // disqualifies a candidate and the sample could not settle it. The
+    // reader must not take "inconclusive" for "nothing was found".
+    const api = await import('../admin-api');
+    vi.mocked(api.getEvalReport).mockResolvedValue(
+      report({
+        run: run({
+          summary: summary({
+            incumbent_source: 'historic',
+            incumbent_source_counts: { historic: 30, unavailable: 10 },
             silent_noop_comparable: false,
+            blocking_withheld: ['replied instead of acting on 40% of turns'],
           }),
         }),
       }),
@@ -605,7 +634,7 @@ describe('ModelEvalReportPage', () => {
     renderReport();
 
     expect(
-      await screen.findByText(/cannot block a switch on their own/),
+      await screen.findByText(/1 finding\(s\) crossed a blocking threshold/),
     ).toBeInTheDocument();
   });
 });

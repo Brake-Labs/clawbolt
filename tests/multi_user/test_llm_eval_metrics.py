@@ -41,6 +41,7 @@ from backend.app.services.llm_eval.types import (
     Side,
     ToolCall,
     TurnComparison,
+    TurnSource,
 )
 from backend.app.services.llm_service import LLMTarget
 
@@ -741,10 +742,13 @@ def test_matched_token_totals_are_not_flagged() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _noop_turn(seq: int, verdict: JudgeVerdict) -> TurnComparison:
+def _noop_turn(seq: int, verdict: JudgeVerdict, *, flattened: bool = False) -> TurnComparison:
     return TurnComparison(
         sample=ReplaySample(
-            seq=seq, timestamp="2026-05-01T12:00:00+00:00", message_context="Correction!"
+            seq=seq,
+            timestamp="2026-05-01T12:00:00+00:00",
+            message_context="Correction!",
+            historic_calls_flattened=flattened,
         ),
         baseline=_call(ToolCall(name="lookup", arguments={"query": "x"})),
         candidate=_call(text="What's the correction?"),
@@ -790,30 +794,31 @@ def test_silent_noops_the_judge_scored_against_the_candidate_still_block() -> No
 
 
 # ---------------------------------------------------------------------------
-# Historic mode blocks nothing it cannot compare fairly
+# Historic mode blocks what it can compare, and withholds the rest
 # ---------------------------------------------------------------------------
 
 
-def test_historic_mode_cannot_block_on_silent_no_ops() -> None:
-    """The acting side is a recorded turn, not a decision this run elicited.
+def test_historic_mode_blocks_on_silent_no_ops() -> None:
+    """Both sides of a no-op are real decisions taken at the same point.
 
-    Defence in depth behind the reconstruction: even a reading that lined the
-    two sides up wrongly must not be able to produce ``do_not_switch``, since
-    "the candidate is worse than the model it replaces" is a claim about a
-    model this run never asked. The rate is still computed and still shown.
+    The candidate answered in prose on turns production acted on, and the
+    judge did not excuse it. That happened, whether or not the incumbent was
+    asked the same question again today, so the default mode rejects the
+    candidate rather than filing the evidence under a verdict that reads as
+    permission to switch.
     """
     comparisons = [_noop_turn(i, JudgeVerdict.CANDIDATE_WORSE) for i in range(1, 7)]
     comparisons += [_identical_turn(i) for i in range(7, 21)]
 
     agg = metrics.aggregate(comparisons, incumbent_source=IncumbentSource.HISTORIC)
     assert agg.silent_noop_blocking_rate > metrics.MAX_SILENT_NOOP_RATE
-    assert agg.recommendation != Recommendation.DO_NOT_SWITCH
-    assert any("cannot block a switch" in r for r in agg.reasons)
+    assert agg.recommendation is Recommendation.DO_NOT_SWITCH
     assert any("where acting was the better call" in r for r in agg.reasons)
+    assert agg.blocking_withheld == []
 
 
-def test_historic_mode_cannot_block_on_the_judges_preference() -> None:
-    """Same rule for the quality tier, and the payload says the claim is out."""
+def test_historic_mode_blocks_on_the_judges_preference() -> None:
+    """Same rule for the quality tier, and the payload says the claim stands."""
     comparisons = [_comparison(i, verdict=JudgeVerdict.CANDIDATE_WORSE) for i in range(20)]
     comparisons += [_comparison(i, verdict=JudgeVerdict.EQUIVALENT) for i in range(20, 40)]
 
@@ -822,9 +827,109 @@ def test_historic_mode_cannot_block_on_the_judges_preference() -> None:
     assert metrics.judge_preference(replayed).payload()["comparable"] is True
 
     agg = metrics.aggregate(comparisons, incumbent_source=IncumbentSource.HISTORIC)
-    assert agg.recommendation != Recommendation.DO_NOT_SWITCH
+    assert agg.recommendation is Recommendation.DO_NOT_SWITCH
     assert any("judge preferred the recorded turn" in r for r in agg.reasons)
-    assert metrics.judge_preference(agg).payload()["comparable"] is False
+    assert metrics.judge_preference(agg).payload()["comparable"] is True
+
+
+def _unavailable_turn(seq: int) -> TurnComparison:
+    """A sampled turn whose recorded decision could not be read back."""
+    return TurnComparison(
+        sample=ReplaySample(seq=seq, timestamp="2026-05-01T12:00:00+00:00", message_context="hi"),
+        baseline=_call(),
+        candidate=_call(text="sure"),
+        baseline_source=TurnSource.UNAVAILABLE,
+        agreement=AgreementClass.NOT_COMPARED,
+    )
+
+
+def test_a_confounded_sample_withholds_the_block_and_answers_inconclusive() -> None:
+    """Over the ceiling the run has no answer, which is not an approval.
+
+    A fifth of the sample unreadable means the turns the rate was measured on
+    may not represent the turns it was drawn from. The finding is still worth
+    reading, so it stays in the reasons; what it must not do is arrive under
+    a verdict an operator can act on as permission.
+    """
+    comparisons = [_noop_turn(i, JudgeVerdict.CANDIDATE_WORSE) for i in range(1, 7)]
+    comparisons += [_identical_turn(i) for i in range(7, 21)]
+    comparisons += [_unavailable_turn(i) for i in range(21, 31)]
+
+    agg = metrics.aggregate(comparisons, incumbent_source=IncumbentSource.HISTORIC)
+    assert agg.turns_incumbent_unavailable == 10
+    assert not agg.blocking_comparable
+    assert agg.recommendation is Recommendation.INCONCLUSIVE
+    assert agg.blocking_withheld
+    assert any("where acting was the better call" in r for r in agg.reasons)
+    assert any("had no incumbent decision to read" in r for r in agg.reasons)
+
+
+def test_a_flattened_sample_withholds_the_block_too() -> None:
+    """The other confounder, counted the same way.
+
+    On these turns the incumbent may have asked for the scored call and its
+    neighbours in one breath, so what the run compared the candidate with is
+    a fraction of the decision.
+    """
+    comparisons = [_noop_turn(i, JudgeVerdict.CANDIDATE_WORSE, flattened=True) for i in range(1, 7)]
+    comparisons += [_identical_turn(i) for i in range(7, 21)]
+
+    agg = metrics.aggregate(comparisons, incumbent_source=IncumbentSource.HISTORIC)
+    assert agg.turns_flattened_rounds == 6
+    assert agg.recommendation is Recommendation.INCONCLUSIVE
+    assert agg.blocking_withheld
+
+
+def test_a_replayed_run_is_never_held_to_the_confounder_ceiling() -> None:
+    """Those confounders are readings of the record, and a replay reads none."""
+    comparisons = [_noop_turn(i, JudgeVerdict.CANDIDATE_WORSE) for i in range(1, 7)]
+    comparisons += [_identical_turn(i) for i in range(7, 21)]
+    comparisons += [_unavailable_turn(i) for i in range(21, 31)]
+
+    agg = metrics.aggregate(comparisons)
+    assert agg.blocking_comparable
+    assert agg.recommendation is Recommendation.DO_NOT_SWITCH
+
+
+def test_historic_mode_still_cannot_block_on_the_safety_comparison() -> None:
+    """The one tier whose test would read an unmeasured side as a clean zero.
+
+    Nothing was checked on the incumbent's side, so its zero findings are an
+    absence of measurement. The sign test against it would block a candidate
+    at parity, which is the reading this mode must never produce.
+    """
+    comparisons = [
+        _comparison(i, safety=[_finding(Side.CANDIDATE, SafetyFinding.UNREQUESTED_MUTATION)])
+        for i in range(20)
+    ]
+    comparisons += [_comparison(i) for i in range(20, 40)]
+
+    replayed = metrics.aggregate(comparisons)
+    assert replayed.recommendation is Recommendation.DO_NOT_SWITCH
+
+    agg = metrics.aggregate(comparisons, incumbent_source=IncumbentSource.HISTORIC)
+    assert agg.recommendation is not Recommendation.DO_NOT_SWITCH
+    assert agg.blocking_withheld == []
+    assert any("not measured here" in r for r in agg.reasons)
+
+
+def test_a_fabricated_id_is_surfaced_even_with_no_incumbent_to_compare() -> None:
+    """A candidate inventing record ids is never silently passed over.
+
+    The caution sat below the safety tier's early return, so in this mode it
+    was the one finding the run could produce and then say nothing at all
+    about: the sign test needs an incumbent, and the caution that stands in
+    for it was unreachable.
+    """
+    comparisons = [
+        _comparison(i, safety=[_finding(Side.CANDIDATE, SafetyFinding.FABRICATED_ID)])
+        for i in range(4)
+    ]
+    comparisons += [_comparison(i) for i in range(4, 40)]
+
+    agg = metrics.aggregate(comparisons, incumbent_source=IncumbentSource.HISTORIC)
+    assert agg.fabricated_ids.candidate_turns == 4
+    assert any("wrote to a record ID it was never shown on 4" in r for r in agg.reasons)
 
 
 # ---------------------------------------------------------------------------

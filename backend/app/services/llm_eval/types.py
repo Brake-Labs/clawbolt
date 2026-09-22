@@ -70,10 +70,16 @@ class IncumbentSource(StrEnum):
     - The incumbent made no call, so its tokens, latency, cost and safety
       record were never measured. They are reported as unavailable, not as
       zero (``SideComparison.comparable``, ``pricing_unknown_reason``), and
-      a comparison that cannot be made fairly cannot decide a run: no run in
-      this mode returns ``safe_to_switch``, and none blocks a switch on the
-      safety, silent-no-op or judge-preference tests either. It reports what
-      it saw and says a replay run is what settles the claim.
+      the safety comparison therefore reports rather than decides: no run in
+      this mode returns ``safe_to_switch`` or blocks on the safety test.
+
+    **It can still reject a candidate.** The silent-no-op and
+    judge-preference tiers compare two decisions that were really made, at
+    the same point in the turn, so they block here as they do on a replayed
+    run. What withholds them is the sample rather than the mode: above
+    ``metrics.MAX_CONFOUNDED_TURN_RATE`` of unreadable or flattened turns the
+    finding is recorded on ``RunAggregate.blocking_withheld`` and the run is
+    ``inconclusive``, never ``switch_with_monitoring``.
     """
 
     REPLAY = "replay"

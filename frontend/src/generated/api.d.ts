@@ -3759,6 +3759,8 @@ export interface components {
             reasons?: string[];
             /** Warnings */
             warnings?: string[];
+            /** Blocking Withheld */
+            blocking_withheld?: string[];
         };
         /** AdminLLMEvalToolCall */
         AdminLLMEvalToolCall: {

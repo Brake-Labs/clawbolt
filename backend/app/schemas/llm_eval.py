@@ -143,16 +143,22 @@ class AdminLLMEvalSummary(BaseModel):
     # opposite things here, and a report that read the default as zero told
     # the operator the judge had preferred no-ops it never saw.
     silent_noop_blocking_rate: float | None = None
-    # Whether "the candidate replied where the incumbent acted" is a claim
-    # about the incumbent model. It is not with an unmeasured incumbent,
-    # where the acting side is the recorded turn, so the rate is reported
-    # and cannot block. ``None`` on older runs.
+    # Whether "the candidate replied where the incumbent acted" can block
+    # this run. The two sides really were compared, so an unmeasured
+    # incumbent does not rule it out; a sample too confounded to read does
+    # (``llm_eval.metrics.RunAggregate.blocking_comparable``). ``None`` on
+    # older runs.
     silent_noop_comparable: bool | None = None
     baseline: AdminLLMEvalModelTotals = Field(default_factory=AdminLLMEvalModelTotals)
     candidate: AdminLLMEvalModelTotals = Field(default_factory=AdminLLMEvalModelTotals)
     recommendation: str = ""
     reasons: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    # Findings that met a blocking threshold on a sample too confounded to
+    # adjudicate them. Non-empty means ``recommendation`` is ``inconclusive``
+    # and ``reasons`` says why, rather than the run reading as permission to
+    # switch. Empty on every run recorded before this was counted.
+    blocking_withheld: list[str] = Field(default_factory=list)
 
 
 class AdminLLMEvalRunItem(BaseModel):

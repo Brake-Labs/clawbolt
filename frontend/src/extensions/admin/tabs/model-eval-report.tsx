@@ -344,12 +344,18 @@ function IncumbentSourceNote({ summary }: { summary: EvalSummary }) {
       {unavailable > 0
         ? ` ${unavailable} turn(s) had no incumbent decision to read and were left out of every comparison.`
         : ''}
-      {/* The blocking tests all weigh the candidate against the incumbent,
-          and here there is no incumbent measurement to weigh it against, so
-          they report rather than decide. Said once, under the tiles the
-          rates appear in. */}
-      {summary.silent_noop_comparable === false || summary.judge_preference?.comparable === false
-        ? ' Findings measured against a recording cannot block a switch on their own; a replay run is what settles them.'
+      {/* Two different claims, and conflating them is what let a
+          disqualified candidate read as approved. The safety tier has no
+          incumbent measurement to weigh the candidate against, so it reports
+          rather than decides, on every historic run. The rate tiers do
+          compare two real decisions, and only withhold a block when this
+          run's own sample was too confounded to read. Said once, under the
+          tiles the rates appear in. */}
+      {summary.safety_comparison?.comparable === false
+        ? ' The incumbent was never checked for safety findings, so that comparison reports rather than decides; a replay run is what settles it.'
+        : ''}
+      {summary.blocking_withheld?.length
+        ? ` ${summary.blocking_withheld.length} finding(s) crossed a blocking threshold on a sample too confounded to adjudicate, so this run is inconclusive rather than an endorsement. The reasons above say which.`
         : ''}
     </p>
   );

@@ -221,10 +221,10 @@ against the incumbent's. The admin console drives it;
 **Where the incumbent's side comes from is chosen per run**
 (`types.IncumbentSource`, frozen onto `llm_eval_runs.incumbent_source`). Its
 docstring is where the mode is explained: what `historic` measures, the four
-things it cannot control, and why a run in it neither clears a candidate nor
-blocks one. Everything else that touches the mode points there. `historic`,
-the default, never calls the incumbent and halves the bill; `replay` calls it
-live on every turn. Choose `replay` when the prompt or tool schema has changed
+things it cannot control, why no run in it clears a candidate outright, and
+what it can still reject one on. Everything else that touches the mode points
+there. `historic`, the default, never calls the incumbent and halves the bill;
+`replay` calls it live on every turn. Choose `replay` when the prompt or tool schema has changed
 since the turns happened, when the incumbent has never run them, or to
 calibrate a model against itself; `divergence_noise_floor` ignores a historic
 run for that reason.

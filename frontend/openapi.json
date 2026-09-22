@@ -6589,6 +6589,13 @@
             },
             "type": "array",
             "title": "Warnings"
+          },
+          "blocking_withheld": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Blocking Withheld"
           }
         },
         "type": "object",
