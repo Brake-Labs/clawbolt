@@ -8,7 +8,7 @@ manage everything over chat without needing the web UI.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -112,6 +112,23 @@ class ManageIntegrationParams(BaseModel):
     )
 
 
+def _is_status_call(args: dict[str, Any]) -> bool:
+    """``status`` lists integrations; every other action changes something."""
+    return args.get("action") == "status"
+
+
+def _missing_target_message(action: object) -> str:
+    return f"The '{action}' action requires a target. Specify a tool group name."
+
+
+def _manage_integration_precheck(args: dict[str, Any]) -> str | None:
+    """The refusal ``manage_integration`` applies before touching anything."""
+    action = args.get("action")
+    if action != "status" and args.get("target") is None:
+        return _missing_target_message(action)
+    return None
+
+
 def create_integration_tools(ctx: ToolContext) -> list[Tool]:
     """Create the manage_integration tool scoped to the current user."""
     from backend.app.agent.tools.registry import default_registry, ensure_tool_modules_imported
@@ -130,7 +147,7 @@ def create_integration_tools(ctx: ToolContext) -> list[Tool]:
 
         if target is None:
             return ToolResult(
-                content=f"The '{action}' action requires a target. Specify a tool group name.",
+                content=_missing_target_message(action),
                 is_error=True,
                 error_kind=ToolErrorKind.VALIDATION,
             )
@@ -180,6 +197,9 @@ def create_integration_tools(ctx: ToolContext) -> list[Tool]:
             # ``tool_configs`` row and the OAuth token store. Two of these
             # in the same turn must serialize to avoid lost updates.
             concurrency_group="user_integrations",
+            # Untagged because most actions write, but ``status`` only reads.
+            read_only_when=_is_status_call,
+            precheck=_manage_integration_precheck,
         ),
     ]
 

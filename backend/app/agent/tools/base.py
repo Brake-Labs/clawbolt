@@ -36,7 +36,7 @@ class ToolTags(StrEnum):
 
     The model-swap evaluator is the consumer: it flags a candidate that
     reaches for a mutating tool neither the incumbent nor the live turn
-    called. See ``llm_eval.metrics._is_mutating``.
+    called. See ``llm_eval.metrics.is_mutating_call``.
     """
 
 
@@ -94,6 +94,28 @@ class Tool:
     tags: set[ToolTags] = field(default_factory=set)
     usage_hint: str = ""
     approval_policy: ApprovalPolicy | None = None
+    read_only_when: Callable[[dict[str, Any]], bool] | None = None
+    """Per-call read/write classification for a tool whose actions differ.
+
+    ``ToolTags.READ_ONLY`` classifies a whole tool, which is wrong for a
+    multi-action tool such as ``manage_integration``, where ``status`` only
+    reads and ``disable`` writes. Leave the tag off such a tool (untagged
+    still means mutating) and set this to a predicate over the call's
+    arguments that answers True for the actions that only read. The
+    model-swap evaluator consults it through ``llm_eval.metrics.is_mutating_call``.
+    Never consulted for execution: it describes a call, it does not gate one.
+    """
+    precheck: Callable[[dict[str, Any]], str | None] | None = None
+    """The tool's own argument checks that run before any side effect.
+
+    Returns an error message for arguments the tool would reject without
+    doing anything, or None when the call would proceed. Checks that live in
+    the tool body rather than the params model (an empty ``media_url``, a
+    missing ``target``) are invisible to schema validation, so without this
+    the evaluator reports a call the tool refuses as if it had written
+    something. The tool function must call the same check, so the two cannot
+    drift; see ``send_media_reply`` for the pattern.
+    """
     concurrency_group: str | ConcurrencyGroupResolver | None = None
     """Serialization key for parallel tool execution.
 
