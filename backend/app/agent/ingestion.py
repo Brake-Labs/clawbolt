@@ -418,6 +418,7 @@ async def _dispatch_to_pipeline(
         nonlocal user, session, pipeline_error, timed_out
         async with user_locks.acquire(user_id):
             interrupt_task.cancel()
+            long_wait_warning.cancel()
             if fold_entry is not None:
                 # From here on this dispatch is the running turn and must
                 # not be claimed by its own drain.
@@ -468,8 +469,21 @@ async def _dispatch_to_pipeline(
             except Exception as exc:
                 pipeline_error = exc
 
+    def _warn_long_lock_wait() -> None:
+        # The wait has no bound of its own, so this is the only signal
+        # that a lock holder has outlived its turn timeout.
+        logger.warning(
+            "Message seq %d for user %s has waited over %.0fs for the per-user lock",
+            message.seq,
+            user_id,
+            settings.agent_processing_timeout_seconds,
+        )
+
     folded = False
     interrupt_task = asyncio.create_task(_interrupt_stale_approval())
+    long_wait_warning = asyncio.get_running_loop().call_later(
+        settings.agent_processing_timeout_seconds, _warn_long_lock_wait
+    )
     try:
         if fold_entry is None:
             await _run_locked()
@@ -478,6 +492,7 @@ async def _dispatch_to_pipeline(
             folded = not await run_unless_folded(_run_locked(), fold_entry.consumed)
     finally:
         interrupt_task.cancel()
+        long_wait_warning.cancel()
         if fold_entry is not None:
             midturn_inbox.unregister(fold_entry)
 

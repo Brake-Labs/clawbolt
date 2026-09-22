@@ -492,6 +492,37 @@ class TestProcessingTimeoutScope:
         assert ran.is_set()
         assert _drain_replies() == []
 
+    async def test_long_lock_wait_logs_a_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A wait past the turn timeout is logged, since nothing else bounds it."""
+        user_id = "timeout-scope-long-wait"
+        user = User(id=user_id, channel_identifier="123", phone="")
+        session = SessionState(session_id="sess-1", user_id=user_id)
+        message = StoredMessage(direction="inbound", body="queued", seq=2)
+        _drain_replies()
+
+        with (
+            patch(
+                "backend.app.agent.ingestion.handle_inbound_message",
+                new_callable=AsyncMock,
+            ),
+            patch("backend.app.agent.ingestion.settings") as mock_settings,
+            caplog.at_level("WARNING", logger="backend.app.agent.ingestion"),
+        ):
+            mock_settings.agent_processing_timeout_seconds = 0.1
+            async with user_locks.acquire(user_id):
+                dispatch = asyncio.create_task(
+                    _dispatch_to_pipeline(
+                        user=user, session=session, message=message, media_urls=[], channel=""
+                    )
+                )
+                await asyncio.sleep(0.3)
+                assert "waited over" in caplog.text
+                assert not dispatch.done()
+            await asyncio.wait_for(dispatch, timeout=2)
+
+        assert caplog.text.count("waited over") == 1
+        assert _drain_replies() == []
+
     async def test_turn_longer_than_timeout_after_wait_still_times_out(self) -> None:
         """Once the turn starts, it is bounded by the timeout and the fallback is sent."""
         user_id = "timeout-scope-slow"
