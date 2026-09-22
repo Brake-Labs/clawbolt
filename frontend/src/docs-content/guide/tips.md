@@ -65,6 +65,17 @@ Clawbolt: Filed to your 123 Main CompanyCam project, tagged "kitchen" and "demo"
 
 If you don't say anything, your assistant decides based on context.
 
+## Add to a message while your assistant is working
+
+On iMessage, SMS, and Telegram, anything you send while your assistant is still working on your last message joins that request. You get one reply that covers everything, not a separate answer for each message. That includes a caption that arrives a few seconds after its photo.
+
+```
+You: [photo]
+You: These are the 2 you weren't sure about, plus one you missed
+
+Clawbolt: Thanks, that makes 8 fixtures in total.
+```
+
 ## Customize your assistant's personality
 
 Tell your assistant how you want it to communicate and it will adjust:
