@@ -206,6 +206,69 @@ class OAuthConfig:
         return bool(self.client_id and self.client_secret)
 
 
+# Key in ``OAuthTokenData.extra`` (persisted as ``oauth_tokens.extra_json``)
+# holding the email of the Google account a connection was granted by.
+# Captured once at connect time; absent on tokens stored before it existed,
+# which every reader must render as "unknown", not as an error.
+ACCOUNT_EMAIL_KEY = "account_email"
+
+# Google endpoints that return the account email under scopes each Google
+# integration already requests, so identifying the account needs no extra
+# scope and no consent-screen change:
+# - Gmail ``users.getProfile`` (gmail.readonly) returns ``emailAddress``.
+# - Calendar's primary calendar (calendar.readonly) has the account email as
+#   its id.
+# - Drive ``about.get`` with ``fields=user`` is allowed under drive.file.
+# ``openid email`` would also work but adds a scope to every consent screen.
+_GOOGLE_ACCOUNT_IDENTITY_ENDPOINTS: dict[str, tuple[str, dict[str, str], tuple[str, ...]]] = {
+    "gmail": (
+        "https://gmail.googleapis.com/gmail/v1/users/me/profile",
+        {},
+        ("emailAddress",),
+    ),
+    "google_calendar": (
+        "https://www.googleapis.com/calendar/v3/users/me/calendarList/primary",
+        {"fields": "id"},
+        ("id",),
+    ),
+    "google_drive": (
+        "https://www.googleapis.com/drive/v3/about",
+        {"fields": "user(emailAddress)"},
+        ("user", "emailAddress"),
+    ),
+}
+
+# Integrations whose connections record the granting account's email.
+ACCOUNT_TRACKED_INTEGRATIONS = frozenset(_GOOGLE_ACCOUNT_IDENTITY_ENDPOINTS)
+
+# Called after a successful connect or reconnect with the user id and the
+# freshly stored token. Registered per integration by the integration itself
+# (``register_post_connect_hook``) so this module never imports integrations.
+PostConnectHook = Callable[[str, "OAuthTokenData"], Awaitable[None]]
+
+# Both run inside the OAuth callback request, before the user is redirected,
+# so each is bounded well under typical proxy timeouts.
+_ACCOUNT_LOOKUP_TIMEOUT_S = 10.0
+_POST_CONNECT_HOOK_TIMEOUT_S = 20.0
+
+
+def parse_extra_json(raw: str) -> dict[str, Any]:
+    """Decode an ``oauth_tokens.extra_json`` value, tolerating empty or corrupt rows."""
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def account_email_from_extra(extra: dict[str, Any]) -> str:
+    """The recorded account email in a token's extra data, or "" when unknown."""
+    value = extra.get(ACCOUNT_EMAIL_KEY, "")
+    return value if isinstance(value, str) else ""
+
+
 @dataclass
 class _PendingState:
     """In-memory record for a pending OAuth authorization."""
@@ -229,6 +292,11 @@ class OAuthTokenData:
     scopes: list[str] = field(default_factory=list)
     realm_id: str = ""  # QuickBooks company ID
     extra: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def account_email(self) -> str:
+        """Email of the account that granted this token, or "" when unknown."""
+        return account_email_from_extra(self.extra)
 
     def is_expired(self) -> bool:
         if self.expires_at <= 0:
@@ -297,6 +365,19 @@ class OAuthService:
         # In-memory TTL cache for load_token. Keyed by (user_id, integration);
         # value is (token_data_or_none, monotonic_expires_at).
         self._token_cache: dict[tuple[str, str], tuple[OAuthTokenData | None, float]] = {}
+        self._post_connect_hooks: dict[str, list[PostConnectHook]] = {}
+
+    def register_post_connect_hook(self, integration: str, hook: PostConnectHook) -> None:
+        """Run *hook* after every successful connect or reconnect of *integration*.
+
+        Hooks are best-effort: a failure is logged and never fails the
+        connect, because the token is already stored by the time they run.
+        Registering the same function twice is a no-op, so a module that
+        registers at import time stays idempotent across reloads.
+        """
+        hooks = self._post_connect_hooks.setdefault(integration, [])
+        if hook not in hooks:
+            hooks.append(hook)
 
     def _get_http(self) -> httpx.AsyncClient:
         if self._http is None or self._http.is_closed:
@@ -381,8 +462,69 @@ class OAuthService:
         if realm_id:
             token_data.realm_id = realm_id
 
+        account_email = await self._fetch_account_email(
+            pending.integration, token_data.access_token
+        )
+        if account_email:
+            token_data.extra[ACCOUNT_EMAIL_KEY] = account_email
+
         await self.save_token(pending.user_id, pending.integration, token_data)
+        await self._run_post_connect_hooks(pending.user_id, pending.integration, token_data)
         return token_data
+
+    async def _fetch_account_email(self, integration: str, access_token: str) -> str:
+        """Best-effort lookup of the account email a Google token belongs to.
+
+        Returns "" for non-Google integrations and on any failure: a missing
+        account label must never fail the connect. The email itself is PII,
+        so neither it nor the response body is logged.
+        """
+        endpoint = _GOOGLE_ACCOUNT_IDENTITY_ENDPOINTS.get(integration)
+        if endpoint is None or not access_token:
+            return ""
+        url, params, path = endpoint
+        try:
+            resp = await self._get_http().get(
+                url,
+                params=params,
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=_ACCOUNT_LOOKUP_TIMEOUT_S,
+            )
+            resp.raise_for_status()
+            value: Any = resp.json()
+            for key in path:
+                value = value.get(key) if isinstance(value, dict) else None
+        except Exception as exc:
+            logger.warning(
+                "Could not identify the connected account: integration=%s error=%s",
+                integration,
+                type(exc).__name__,
+            )
+            return ""
+        if not isinstance(value, str) or "@" not in value:
+            logger.warning(
+                "Connected-account lookup returned no email: integration=%s", integration
+            )
+            return ""
+        return value.strip().lower()
+
+    async def _run_post_connect_hooks(
+        self, user_id: str, integration: str, token: OAuthTokenData
+    ) -> None:
+        for hook in self._post_connect_hooks.get(integration, []):
+            try:
+                await asyncio.wait_for(hook(user_id, token), _POST_CONNECT_HOOK_TIMEOUT_S)
+            except Exception:
+                logger.exception(
+                    "Post-connect hook failed, connect still succeeded: user=%s integration=%s",
+                    user_id,
+                    integration,
+                )
+
+    async def get_account_email(self, user_id: str, integration: str) -> str:
+        """Return the account email recorded for a connection, or "" if unknown."""
+        token = await self.load_token(user_id, integration)
+        return token.account_email if token is not None else ""
 
     async def _exchange_code(
         self,
@@ -516,10 +658,7 @@ class OAuthService:
             except json.JSONDecodeError:
                 scopes = []
 
-            try:
-                extra = json.loads(row.extra_json) if row.extra_json else {}
-            except json.JSONDecodeError:
-                extra = {}
+            extra = parse_extra_json(row.extra_json)
 
             token = OAuthTokenData(
                 access_token=row.access_token,

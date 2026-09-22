@@ -18,7 +18,12 @@ from backend.app.agent.tools.names import ToolName
 from backend.app.config import settings
 from backend.app.integrations.appfolio_vendor import auth as appfolio_auth
 from backend.app.integrations.servicetitan import auth as servicetitan_auth
-from backend.app.services.oauth import get_oauth_config, list_oauth_integrations, oauth_service
+from backend.app.services.oauth import (
+    ACCOUNT_TRACKED_INTEGRATIONS,
+    get_oauth_config,
+    list_oauth_integrations,
+    oauth_service,
+)
 
 if TYPE_CHECKING:
     from backend.app.agent.tools.registry import ToolContext, ToolRegistry
@@ -241,6 +246,13 @@ async def _handle_status(
                 if config is not None and config.is_configured:
                     connected = await oauth_service.is_connected(user_id, oauth_name)
                     status_parts.append("connected" if connected else "not connected")
+                    if connected and oauth_name in ACCOUNT_TRACKED_INTEGRATIONS:
+                        account = await oauth_service.get_account_email(user_id, oauth_name)
+                        status_parts.append(
+                            f"Google account: {account}"
+                            if account
+                            else "Google account: unknown (connected before it was recorded)"
+                        )
                 else:
                     status_parts.append("not configured by admin")
             elif name in _WEB_CONNECT_INTEGRATIONS:

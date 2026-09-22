@@ -3808,6 +3808,29 @@ export interface components {
             /** Providers */
             providers: components["schemas"]["AdminLLMProvider"][];
         };
+        /**
+         * AdminOAuthConnectionEntry
+         * @description One stored OAuth connection and the account it was granted by.
+         *
+         *     ``account_email`` is masked like a channel identifier: enough to
+         *     recognize the account, not the raw address. ``matches_sign_in`` answers
+         *     the usual support question (did they connect a different Google account
+         *     than the one they sign in with) without unmasking. Both are None when the
+         *     connection predates account recording or the integration does not
+         *     record one.
+         */
+        AdminOAuthConnectionEntry: {
+            /** Integration */
+            integration: string;
+            /** Account Email */
+            account_email: string | null;
+            /** Matches Sign In */
+            matches_sign_in: boolean | null;
+            /** Connected At */
+            connected_at: string | null;
+            /** Updated At */
+            updated_at: string | null;
+        };
         /** AdminStatsResponse */
         AdminStatsResponse: {
             /**
@@ -3904,6 +3927,8 @@ export interface components {
             tool_configs: components["schemas"]["AdminToolConfigEntry"][];
             /** Channel Routes */
             channel_routes: components["schemas"]["AdminChannelRouteEntry"][];
+            /** Oauth Connections */
+            oauth_connections: components["schemas"]["AdminOAuthConnectionEntry"][];
             permissions: components["schemas"]["AdminUserPermissions"];
         };
         /**
@@ -4798,6 +4823,8 @@ export interface components {
             configured: boolean;
             /** Connected */
             connected: boolean;
+            /** Account Email */
+            account_email?: string | null;
         };
         /** OAuthStatusResponse */
         OAuthStatusResponse: {

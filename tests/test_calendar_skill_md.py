@@ -49,3 +49,10 @@ def test_skill_md_requires_list_before_claiming_absence() -> None:
         "The guard should state that an unlisted event is 'unknown, not "
         "absent' so the agent lists events before claiming it does not exist."
     )
+
+
+def test_skill_md_forbids_guessing_the_owning_account() -> None:
+    """Regression: after a reconnect, the agent guessed which Google account
+    owned the unreachable calendars and sent the user to the wrong one."""
+    lowered = SKILL_MD_PATH.read_text().lower()
+    assert "never guess which account owns the calendar" in lowered

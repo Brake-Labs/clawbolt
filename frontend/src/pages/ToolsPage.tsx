@@ -180,6 +180,11 @@ export default function ToolsPage() {
                         {tool.description && (
                           <p className="text-xs text-muted-foreground mt-1">{tool.description}</p>
                         )}
+                        {needsOAuth && isConnected && oauthMap[oauthIntegration]?.account_email && (
+                          <p className="text-xs text-muted-foreground mt-1 truncate">
+                            Connected as {oauthMap[oauthIntegration]?.account_email}
+                          </p>
+                        )}
                       </div>
                     </div>
                     <div className="flex items-center gap-3 shrink-0">

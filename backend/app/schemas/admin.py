@@ -55,6 +55,24 @@ class AdminChannelRouteEntry(BaseModel):
     last_inbound_at: str | None
 
 
+class AdminOAuthConnectionEntry(BaseModel):
+    """One stored OAuth connection and the account it was granted by.
+
+    ``account_email`` is masked like a channel identifier: enough to
+    recognize the account, not the raw address. ``matches_sign_in`` answers
+    the usual support question (did they connect a different Google account
+    than the one they sign in with) without unmasking. Both are None when the
+    connection predates account recording or the integration does not
+    record one.
+    """
+
+    integration: str
+    account_email: str | None
+    matches_sign_in: bool | None
+    connected_at: str | None
+    updated_at: str | None
+
+
 class AdminUserPermissionEntry(BaseModel):
     """One tool-level permission override (always, ask, or deny)."""
 
@@ -121,6 +139,7 @@ class AdminUserDetailResponse(BaseModel):
     # Integrations / configuration
     tool_configs: list[AdminToolConfigEntry]
     channel_routes: list[AdminChannelRouteEntry]
+    oauth_connections: list[AdminOAuthConnectionEntry]
     # Per-user tool / resource approval levels (OSS approval store).
     permissions: AdminUserPermissions
 

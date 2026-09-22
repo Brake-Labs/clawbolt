@@ -57,6 +57,10 @@ Before creating an event, check for existing events in the same time range:
 
 When `calendar_list_calendars` returns more than one row, check the target calendar's `access_role` before mutating. Read-only roles (`reader`, `freeBusyReader`) reject create, update, and delete. Pass `calendar_id` explicitly on `calendar_create_event`, `calendar_update_event`, and `calendar_delete_event` rather than letting the tool default.
 
+## Calendars the connected account cannot see
+
+Saved calendars belong to the Google account that picked them. When a result says a saved calendar is not visible to the connected account, the tool names that account (or says it is unknown). Never guess which account owns the calendar, and never tell the user to switch to a specific other account. Tell them to reconnect Google Calendar with the account that owns it, or re-pick calendars on the Integrations page.
+
 ## Common Workflows
 
 ### Schedule a new job

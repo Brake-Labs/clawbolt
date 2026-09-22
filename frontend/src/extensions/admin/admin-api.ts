@@ -71,6 +71,8 @@ export type AdminToolConfigEntry = components['schemas']['AdminToolConfigEntry']
 
 export type AdminChannelRouteEntry = components['schemas']['AdminChannelRouteEntry'];
 
+export type AdminOAuthConnectionEntry = components['schemas']['AdminOAuthConnectionEntry'];
+
 export type AdminUserPermissionEntry = components['schemas']['AdminUserPermissionEntry'];
 
 export type AdminUserResourcePermissionEntry = components['schemas']['AdminUserResourcePermissionEntry'];
@@ -96,6 +98,7 @@ export interface AdminUserDetail {
   // Integrations / configuration
   tool_configs: AdminToolConfigEntry[];
   channel_routes: AdminChannelRouteEntry[];
+  oauth_connections: AdminOAuthConnectionEntry[];
   permissions: AdminUserPermissions;
 }
 

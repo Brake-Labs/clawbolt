@@ -180,6 +180,7 @@ vi.mock('./admin-api', () => ({
     heartbeat_frequency: '30m',
     tool_configs: [],
     channel_routes: [],
+    oauth_connections: [],
     permissions: { tools: [], resources: [] },
   }),
   activateUser: vi.fn().mockResolvedValue(undefined),

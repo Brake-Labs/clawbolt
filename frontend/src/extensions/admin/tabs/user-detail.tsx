@@ -14,6 +14,7 @@ import {
   deleteUser,
   resetUserQuota,
   type AdminChannelRouteEntry,
+  type AdminOAuthConnectionEntry,
   type AdminToolConfigEntry,
   type AdminUser,
   type AdminUserDetail,
@@ -1281,6 +1282,64 @@ function ChannelRoutesSection({ items }: { items: AdminChannelRouteEntry[] }) {
   );
 }
 
+// Which account each OAuth connection was granted by. The backend masks the
+// email; ``matches_sign_in`` answers "did they connect a different Google
+// account than the one they sign in with" without unmasking it.
+function OAuthConnectionsSection({ items }: { items: AdminOAuthConnectionEntry[] }) {
+  return (
+    <section
+      id="profile-connections"
+      className="bg-card border border-border rounded-[--radius-md] p-4"
+    >
+      <header className="flex items-center gap-2">
+        <h3 className="text-sm font-semibold">Connected accounts</h3>
+        <span className="text-[10px] text-muted-foreground">{items.length} connected</span>
+      </header>
+      {items.length === 0 ? (
+        <p className="mt-2 text-xs text-muted-foreground italic">No OAuth connections.</p>
+      ) : (
+        <div className="mt-2 overflow-x-auto">
+          <table className="w-full text-xs border border-border rounded-[--radius-sm] overflow-hidden">
+            <caption className="sr-only">OAuth connections for this user</caption>
+            <thead className="bg-panel">
+              <tr className="text-left text-[10px] uppercase tracking-wide text-muted-foreground">
+                <th scope="col" className="px-2 py-1.5 font-medium">Integration</th>
+                <th scope="col" className="px-2 py-1.5 font-medium">Account</th>
+                <th scope="col" className="px-2 py-1.5 font-medium">Token updated</th>
+              </tr>
+            </thead>
+            <tbody>
+              {items.map((c) => (
+                <tr key={c.integration} className="border-t border-border min-h-[36px]">
+                  <td className="px-2 py-1.5 font-medium">{c.integration}</td>
+                  <td className="px-2 py-1.5">
+                    {c.account_email ? (
+                      <span className="flex flex-wrap items-center gap-1">
+                        <span className="font-mono break-all">{c.account_email}</span>
+                        {c.matches_sign_in === true && <Pill tone="success">sign-in account</Pill>}
+                        {c.matches_sign_in === false && <Pill>not the sign-in account</Pill>}
+                      </span>
+                    ) : (
+                      <span className="text-muted-foreground italic">unknown</span>
+                    )}
+                  </td>
+                  <td className="px-2 py-1.5">
+                    {c.updated_at ? (
+                      <span title={formatAbsolute(c.updated_at)}>{formatRelative(c.updated_at)}</span>
+                    ) : (
+                      <span className="text-muted-foreground italic">unknown</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function UserProfile({ detail, user }: { detail: AdminUserDetail; user: AdminUser }) {
   // The Profile tab now layers two surfaces:
   //   1. Always-visible configuration: channel routes, tool configs,
@@ -1296,6 +1355,7 @@ function UserProfile({ detail, user }: { detail: AdminUserDetail; user: AdminUse
   return (
     <div className="space-y-4">
       <ChannelRoutesSection items={detail.channel_routes} />
+      <OAuthConnectionsSection items={detail.oauth_connections} />
       <ToolConfigsSection items={detail.tool_configs} />
       <PermissionsSection permissions={detail.permissions} />
       <section

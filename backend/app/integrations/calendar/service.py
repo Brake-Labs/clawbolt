@@ -31,6 +31,38 @@ GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 # Refresh 5 minutes before expiry.
 _REFRESH_BUFFER_SECONDS = 300
 
+# calendarList page size. Google defaults to 100 and caps it at 250.
+_CALENDAR_LIST_PAGE_SIZE = 250
+
+# Upper bound on calendarList pages followed in one listing (5000 calendars),
+# which keeps a misbehaving pagination loop finite. Hitting it raises rather
+# than returning a truncated list, because the reconnect resync deletes saved
+# calendars missing from the listing.
+_MAX_CALENDAR_LIST_PAGES = 20
+
+
+class CalendarListTruncatedError(Exception):
+    """calendarList still had pages left after ``_MAX_CALENDAR_LIST_PAGES``."""
+
+
+class CalendarNotVisibleError(Exception):
+    """The calendar id is not visible to the connected Google account.
+
+    Raised where Google reports this inside a successful response (freeBusy)
+    rather than as an HTTP 404, so callers can treat both the same way.
+    """
+
+    def __init__(self, calendar_id: str) -> None:
+        super().__init__("Calendar not visible to the connected account")
+        self.calendar_id = calendar_id
+
+
+class CalendarAvailabilityError(Exception):
+    """freeBusy reported a per-calendar error other than notFound.
+
+    The busy list is empty in that case too, so it must not read as free.
+    """
+
 
 def _encode_cal_id(calendar_id: str) -> str:
     """URL-encode a calendar ID for use in API paths.
@@ -135,19 +167,40 @@ class GoogleCalendarService:
 
     # -- Public API -----------------------------------------------------------
 
-    async def list_calendars(self) -> list[CalendarInfo]:
-        """List calendars visible to the authenticated user."""
-        data = await self._request("GET", "/users/me/calendarList")
-        items = (data or {}).get("items", [])
-        return [
-            CalendarInfo(
-                id=item.get("id", ""),
-                summary=item.get("summary", ""),
-                primary=item.get("primary", False),
-                access_role=item.get("accessRole", ""),
+    async def list_calendars(self, *, show_hidden: bool = False) -> list[CalendarInfo]:
+        """List calendars visible to the authenticated user.
+
+        Follows ``nextPageToken`` so an account with more calendars than one
+        page holds is listed in full: callers that compare saved config
+        against this list (the reconnect resync) would otherwise treat the
+        calendars on later pages as unreachable. *show_hidden* includes
+        calendars the user hid in Google Calendar's sidebar, which are still
+        readable and writable through the API. Raises
+        ``CalendarListTruncatedError`` rather than return a partial list.
+        """
+        calendars: list[CalendarInfo] = []
+        page_token = ""
+        for _ in range(_MAX_CALENDAR_LIST_PAGES):
+            params: dict[str, str] = {"maxResults": str(_CALENDAR_LIST_PAGE_SIZE)}
+            if show_hidden:
+                params["showHidden"] = "true"
+            if page_token:
+                params["pageToken"] = page_token
+            data = await self._request("GET", "/users/me/calendarList", params=params)
+            body = data or {}
+            calendars.extend(
+                CalendarInfo(
+                    id=item.get("id", ""),
+                    summary=item.get("summary", ""),
+                    primary=item.get("primary", False),
+                    access_role=item.get("accessRole", ""),
+                )
+                for item in body.get("items", [])
             )
-            for item in items
-        ]
+            page_token = body.get("nextPageToken", "")
+            if not isinstance(page_token, str) or not page_token:
+                return calendars
+        raise CalendarListTruncatedError(f"calendarList exceeded {_MAX_CALENDAR_LIST_PAGES} pages")
 
     async def list_events(
         self,
@@ -240,6 +293,20 @@ class GoogleCalendarService:
         # requested one).
         busy_list: list[dict[str, str]] = []
         for cal_data in calendars.values():
+            # freeBusy answers 200 even when the calendar is not visible to
+            # this account, and reports it per calendar as
+            # ``errors: [{"reason": "notFound"}]`` with an empty busy list.
+            # Reading that as "free" would tell the user an unreachable
+            # calendar has no conflicts.
+            errors = cal_data.get("errors") or []
+            if any(isinstance(e, dict) and e.get("reason") == "notFound" for e in errors):
+                raise CalendarNotVisibleError(calendar_id)
+            # Any other reason (internalError, or one Google adds later) also
+            # comes with no busy data.
+            if errors:
+                raise CalendarAvailabilityError(
+                    "Google could not report free/busy for this calendar right now"
+                )
             busy_list.extend(cal_data.get("busy", []))
         return [
             BusySlot(
