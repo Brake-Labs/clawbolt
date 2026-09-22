@@ -1471,8 +1471,15 @@ class ClawboltAgent:
         conversation_history: list[AgentMessage] | None = None,
         system_prompt_override: str | None = None,
         max_tokens: int | None = None,
+        *,
+        wrap_up_on_max_rounds: bool = True,
     ) -> AgentResponse:
-        """Process a message through the agent loop."""
+        """Process a message through the agent loop.
+
+        *wrap_up_on_max_rounds* is False for turns the user did not start
+        (heartbeats), where running out of rounds must stay silent rather
+        than send an unprompted "ran out of steps" message.
+        """
         agent_start_time = time.monotonic()
         logger.debug(
             "Agent starting for user %s, message length=%d, history=%d messages",
@@ -1761,7 +1768,7 @@ class ClawboltAgent:
             already_replied = any(
                 ToolTags.SENDS_REPLY in tc.tags and not tc.is_error for tc in tool_call_records
             )
-            if not reply_text and not already_replied:
+            if wrap_up_on_max_rounds and not reply_text and not already_replied:
                 wrap_up = await self._wrap_up_after_max_rounds(messages, max_tokens)
                 if wrap_up is not None:
                     if wrap_up.usage:

@@ -618,6 +618,7 @@ async def execute_heartbeat_tasks(
         response: AgentResponse = await agent.process_message(
             message_context=task_context,
             max_tokens=heartbeat_max_tokens,
+            wrap_up_on_max_rounds=False,
         )
     except Exception:
         logger.exception("Heartbeat Phase 2 agent failed for user %s", user.id)

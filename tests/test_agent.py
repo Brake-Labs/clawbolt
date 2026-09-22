@@ -701,6 +701,20 @@ async def test_max_rounds_wrap_up_empty_uses_fallback_text(
 
 
 @patch("backend.app.agent.core.amessages")
+async def test_max_rounds_wrap_up_disabled_stays_silent(
+    mock_amessages: AsyncMock, test_user: User
+) -> None:
+    """Callers that opt out (heartbeats) keep the silent empty reply."""
+    mock_amessages.side_effect = _tool_only_rounds()
+    agent = _recall_agent(test_user)
+
+    response = await agent.process_message("Remove the stale item", wrap_up_on_max_rounds=False)
+
+    assert mock_amessages.call_count == MAX_TOOL_ROUNDS
+    assert response.reply_text == ""
+
+
+@patch("backend.app.agent.core.amessages")
 async def test_max_rounds_skips_wrap_up_when_reply_tool_already_sent(
     mock_amessages: AsyncMock, test_user: User
 ) -> None:
