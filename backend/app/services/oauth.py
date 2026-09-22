@@ -1437,6 +1437,13 @@ def get_quickbooks_oauth_config() -> OAuthConfig | None:
     return config if config.is_configured else None
 
 
+# Google picks the browser's signed-in account unless asked to show the
+# chooser, so a user with two accounts silently connects the wrong one and
+# every saved calendar or file from the other account reads as missing.
+# ``consent`` stays because a refresh token only comes back with it.
+_GOOGLE_PROMPT = "consent select_account"
+
+
 def get_google_calendar_oauth_config() -> OAuthConfig | None:
     """Build the Google Calendar OAuth config from settings."""
     config = OAuthConfig(
@@ -1447,7 +1454,7 @@ def get_google_calendar_oauth_config() -> OAuthConfig | None:
         token_url=GOOGLE_CALENDAR_TOKEN_URL,
         scopes=GOOGLE_CALENDAR_SCOPES,
         use_pkce=False,
-        extra_auth_params={"access_type": "offline", "prompt": "consent"},
+        extra_auth_params={"access_type": "offline", "prompt": _GOOGLE_PROMPT},
     )
     return config if config.is_configured else None
 
@@ -1462,7 +1469,7 @@ def get_google_drive_oauth_config() -> OAuthConfig | None:
         token_url=GOOGLE_DRIVE_TOKEN_URL,
         scopes=GOOGLE_DRIVE_SCOPES,
         use_pkce=False,
-        extra_auth_params={"access_type": "offline", "prompt": "consent"},
+        extra_auth_params={"access_type": "offline", "prompt": _GOOGLE_PROMPT},
     )
     return config if config.is_configured else None
 
@@ -1477,7 +1484,7 @@ def get_gmail_oauth_config() -> OAuthConfig | None:
         token_url=GMAIL_TOKEN_URL,
         scopes=GMAIL_SCOPES,
         use_pkce=False,
-        extra_auth_params={"access_type": "offline", "prompt": "consent"},
+        extra_auth_params={"access_type": "offline", "prompt": _GOOGLE_PROMPT},
     )
     return config if config.is_configured else None
 

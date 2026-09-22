@@ -104,8 +104,12 @@ def test_get_gmail_oauth_config_returns_config_when_set() -> None:
     assert config.client_id == "gmail-cid"
     assert config.scopes == GMAIL_SCOPES
     assert config.use_pkce is False
-    # access_type=offline is required to receive a refresh_token from Google.
-    assert config.extra_auth_params == {"access_type": "offline", "prompt": "consent"}
+    # access_type=offline is required to receive a refresh_token from Google,
+    # and select_account makes Google ask which account instead of assuming.
+    assert config.extra_auth_params == {
+        "access_type": "offline",
+        "prompt": "consent select_account",
+    }
 
 
 def test_get_oauth_config_dispatches_gmail() -> None:
