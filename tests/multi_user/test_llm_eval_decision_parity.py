@@ -93,6 +93,25 @@ class _Turn:
     name: str
     rounds: tuple[tuple[_Call, ...], ...]
     reply: str = "sent it"
+    prose_with_call: str = ""
+    """What the candidate says alongside its scored call, when it says anything.
+
+    The record cannot carry this: the outbound row holds the turn's final
+    reply and all of its calls in one flat list, so a decision that opened
+    with a call has no prose of its own. It is the asymmetry
+    ``judge._describe`` drops in this mode, and pinning it here says the two
+    walks are still expected to agree on the *call* when they differ on the
+    prose.
+    """
+    flattened: bool = False
+    """What ``HistoricDecision.flattened`` must be for this record.
+
+    Load-bearing rather than incidental: ``metrics`` reads it as the
+    confounder that stops the silent-no-op and fabricated-ID tiers blocking,
+    and ``runner`` reads it to withhold the turn from the judge
+    (``JudgeSkipReason.FLATTENED_ROUNDS``). Nothing asserted it, so a walk
+    that stopped setting it would have quietly re-armed every tier it guards.
+    """
     diverges: str = ""
     """Why the two paths cannot land on the same decision here. Empty when
     they must, which is the case this file exists to hold."""
@@ -110,24 +129,43 @@ class _Turn:
 
 TURNS = [
     _Turn(name="a write with nothing before it", rounds=((_send("1186"),),)),
-    _Turn(name="a lookup then a write", rounds=((_find("Acme"),), (_send("1186"),))),
+    _Turn(
+        name="a lookup then a write",
+        rounds=((_find("Acme"),), (_send("1186"),)),
+        # Two calls in one list. The two walks agree on the write anyway,
+        # which is why ``metrics._flattening_could_have_decided`` drops this
+        # shape before it reaches a confounder rate.
+        flattened=True,
+    ),
+    _Turn(
+        name="a lookup then a write, with the candidate saying why",
+        rounds=((_find("Acme"),), (_send("1186"),)),
+        prose_with_call="Found it, sending now.",
+        flattened=True,
+    ),
     _Turn(
         name="two lookups then a write",
         rounds=((_find("Acme"),), (_find("Acme stalls"),), (_send("1186"),)),
+        flattened=True,
     ),
     _Turn(
         name="lookups until the round budget runs out",
         rounds=tuple((_find(f"customer {i}"),) for i in range(4)),
+        flattened=True,
     ),
     _Turn(name="a turn that only replied", rounds=((),), reply="All good."),
     _Turn(
         name="a lookup then a reply",
         rounds=((_find("Acme"),), ()),
         reply="They owe 1186.",
+        # Every call was a skipped lookup, so the decision is the prose the
+        # turn ended on and there is no scored call to be ambiguous about.
+        flattened=False,
     ),
     _Turn(
         name="a lookup and a write in one response",
         rounds=((_find("Acme"), _send("1186")),),
+        flattened=True,
         diverges=(
             "the round holds a write, so the replay cannot answer any of it and scores "
             "the whole response; the record has no round boundary, so the walk skips the "
@@ -139,6 +177,7 @@ TURNS = [
     _Turn(
         name="four lookups, two to a round, then a write",
         rounds=((_find("a"), _find("b")), (_find("c"), _find("d")), (_send("1186"),)),
+        flattened=True,
         diverges=(
             "the replay spends two of its three rounds on four lookups and reaches the "
             "write; the walk spends one of its three on each lookup, runs out, and scores "
@@ -186,30 +225,59 @@ def _recorded(turn: _Turn) -> tuple[RecordedToolResult, ...]:
     )
 
 
-def _rows(turn: _Turn) -> list[StoredMessage]:
-    """The transcript rows production would have persisted for this turn."""
-    interactions = json.dumps(
+def _interactions(calls: list[_Call], offset: int = 0) -> str:
+    return json.dumps(
         [
-            {"tool_call_id": f"t{index}", "name": name, "args": args, "result": f"{name} ok"}
-            for index, (name, args) in enumerate(turn.recorded_calls)
+            {
+                "tool_call_id": f"t{offset + index}",
+                "name": name,
+                "args": args,
+                "result": f"{name} ok",
+            }
+            for index, (name, args) in enumerate(calls)
         ]
     )
+
+
+def _inbound() -> StoredMessage:
+    return StoredMessage(
+        seq=1,
+        direction="inbound",
+        body=TURN_TEXT,
+        processed_context=TURN_TEXT,
+        timestamp=BASE_TIME.isoformat(),
+    )
+
+
+def _outbound(seq: int, reply: str, calls: list[_Call], offset: int = 0) -> StoredMessage:
+    return StoredMessage(
+        seq=seq,
+        direction="outbound",
+        body=reply,
+        llm_reply_text=reply,
+        tool_interactions_json=_interactions(calls, offset) if calls else "",
+        timestamp=(BASE_TIME + _dt.timedelta(seconds=8 + seq)).isoformat(),
+    )
+
+
+def _rows(turn: _Turn) -> list[StoredMessage]:
+    """The transcript rows production would have persisted for this turn."""
+    return [_inbound(), _outbound(2, turn.reply, turn.recorded_calls)]
+
+
+def _split_rows(turn: _Turn, at: int) -> list[StoredMessage]:
+    """The same turn, persisted as two outbound rows split after *at* calls.
+
+    Production writes one row per outbound message, and a turn that sent an
+    interim update before finishing records its calls across both. ``_recorded_calls``
+    concatenates them, so the walk has to reach the same decision either way;
+    reading only the first row would score a lookup as the whole turn.
+    """
+    head, tail = turn.recorded_calls[:at], turn.recorded_calls[at:]
     return [
-        StoredMessage(
-            seq=1,
-            direction="inbound",
-            body=TURN_TEXT,
-            processed_context=TURN_TEXT,
-            timestamp=BASE_TIME.isoformat(),
-        ),
-        StoredMessage(
-            seq=2,
-            direction="outbound",
-            body=turn.reply,
-            llm_reply_text=turn.reply,
-            tool_interactions_json=interactions if turn.recorded_calls else "",
-            timestamp=(BASE_TIME + _dt.timedelta(seconds=9)).isoformat(),
-        ),
+        _inbound(),
+        _outbound(2, "one moment", head),
+        _outbound(3, turn.reply, tail, offset=at),
     ]
 
 
@@ -217,8 +285,12 @@ async def _candidate_decision(turn: _Turn) -> ModelCallResult:
     """Drive the real ``call_model`` over this turn's rounds."""
     # Prose rides on the round that carries no call, which is how a turn that
     # ends in an answer looks. A round with calls says nothing, so the two
-    # sides' prose is comparable where either has any.
-    responses = [_response(calls, "" if calls else turn.reply) for calls in turn.rounds]
+    # sides' prose is comparable where either has any, unless the turn asked
+    # for ``prose_with_call``: a live model routinely says something
+    # alongside its call, and no record can.
+    responses = [
+        _response(calls, turn.prose_with_call if calls else turn.reply) for calls in turn.rounds
+    ]
     mock = AsyncMock(side_effect=responses)
     with patch("backend.app.services.llm_eval.execution.amessages", mock):
         return await call_model(
@@ -243,11 +315,12 @@ class _Decisions:
     historic_calls: list[_Call] = field(default_factory=list)
     historic_lookups: list[_Call] = field(default_factory=list)
     historic_text: str = ""
+    historic_flattened: bool = False
 
 
-async def _both(turn: _Turn) -> _Decisions:
+async def _both(turn: _Turn, rows: list[StoredMessage] | None = None) -> _Decisions:
     candidate = await _candidate_decision(turn)
-    historic = _historic_first_decision(_rows(turn), 0, TOOLS)
+    historic = _historic_first_decision(rows if rows is not None else _rows(turn), 0, TOOLS)
     assert historic.available, turn.name
     return _Decisions(
         candidate_calls=_pairs(candidate.tool_calls),
@@ -256,6 +329,7 @@ async def _both(turn: _Turn) -> _Decisions:
         historic_calls=_pairs(historic.calls),
         historic_lookups=_pairs(historic.lookups),
         historic_text=historic.text,
+        historic_flattened=historic.flattened,
     )
 
 
@@ -274,6 +348,52 @@ async def test_both_paths_score_the_same_decision_on_the_same_record() -> None:
         assert decisions.candidate_lookups == decisions.historic_lookups, turn.name
         if not decisions.candidate_calls:
             assert decisions.candidate_text == decisions.historic_text, turn.name
+
+
+async def test_the_flattening_flag_is_set_for_every_record_shape() -> None:
+    """The confounder flag, pinned on both the agreeing and diverging shapes.
+
+    ``metrics`` stops two tiers blocking on it and ``runner`` withholds the
+    turn from the judge on it, so a walk that stopped setting it would
+    re-arm both without failing anything else here.
+    """
+    for turn in TURNS:
+        decisions = await _both(turn)
+        assert decisions.historic_flattened is turn.flattened, turn.name
+
+
+async def test_only_the_candidate_can_speak_beside_its_call() -> None:
+    """A record has no prose of its own on an acting turn.
+
+    The outbound row holds the turn's final reply and all of its calls in one
+    flat list, so the prose belongs to the finished turn rather than to the
+    scored round. The two walks must still land on the same call; it is the
+    prose that only one side has, which is what ``judge._describe`` drops in
+    this mode rather than pairing the candidate's note against a polished
+    summary.
+    """
+    turn = next(t for t in TURNS if t.prose_with_call)
+    decisions = await _both(turn)
+    assert decisions.candidate_calls == decisions.historic_calls
+    assert decisions.candidate_text == turn.prose_with_call
+    assert decisions.historic_text == ""
+
+
+async def test_a_record_split_across_two_outbound_rows_reads_the_same() -> None:
+    """A turn that sent an interim update records its calls across both rows.
+
+    Reading only the first would score a lookup as the whole decision, which
+    is the reading that reports the incumbent as having done nothing on a
+    turn it acted on.
+    """
+    for turn in TURNS:
+        if len(turn.recorded_calls) < 2:
+            continue
+        whole = await _both(turn)
+        split = await _both(turn, _split_rows(turn, 1))
+        assert split.historic_calls == whole.historic_calls, turn.name
+        assert split.historic_lookups == whole.historic_lookups, turn.name
+        assert split.historic_flattened is whole.historic_flattened, turn.name
 
 
 async def test_the_batched_round_divergences_are_the_only_ones_and_have_not_moved() -> None:
