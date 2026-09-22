@@ -4011,14 +4011,14 @@
         }
       }
     },
-    "/api/admin/llm-eval/users/{user_id}/runs": {
+    "/api/admin/model-comparison/users/{user_id}/runs": {
       "post": {
         "tags": [
           "admin"
         ],
         "summary": "Start Run",
         "description": "Queue a comparison run and return the row immediately.\n\nThe run executes on a background task; poll the returned ``id`` for\nprogress. One active run per user: a second concurrent replay of the\nsame history would double the provider load for no extra information.",
-        "operationId": "start_run_api_admin_llm_eval_users__user_id__runs_post",
+        "operationId": "start_run_api_admin_model_comparison_users__user_id__runs_post",
         "parameters": [
           {
             "name": "user_id",
@@ -4035,7 +4035,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/AdminLLMEvalRunCreate"
+                "$ref": "#/components/schemas/ComparisonRunCreate"
               }
             }
           }
@@ -4046,7 +4046,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/AdminLLMEvalRunItem"
+                  "$ref": "#/components/schemas/ComparisonRunItem"
                 }
               }
             }
@@ -4064,14 +4064,14 @@
         }
       }
     },
-    "/api/admin/llm-eval/runs": {
+    "/api/admin/model-comparison/runs": {
       "get": {
         "tags": [
           "admin"
         ],
         "summary": "List Runs",
-        "description": "Evaluation runs, newest first, across every user or one of them.\n\nUnfiltered by default so the console can answer \"what has been evaluated\nlately\", which is how an operator finds a run again weeks later without\nremembering whose it was. ``user_id`` narrows it to one user for the run\nform beside it.\n\nNo consent gate here, unlike the report: a row is run metadata (which\nmodels, what verdict, how many turns), not the user's conversations. Each\nrow carries ``user_consented`` so the console can show that a run's\nevidence is no longer readable rather than offering a link that 403s.",
-        "operationId": "list_runs_api_admin_llm_eval_runs_get",
+        "description": "Comparison runs, newest first, across every user or one of them.\n\nUnfiltered by default so the console can answer \"what has been compared\nlately\", which is how an operator finds a run again weeks later without\nremembering whose it was. ``user_id`` narrows it to one user for the run\nform beside it.\n\nNo consent gate here, unlike the report: a row is run metadata (which\nmodel, how many turns, what it cost), not the user's conversations. Each\nrow carries ``user_consented`` so the console can show that a run's\nevidence is no longer readable rather than offering a link that 403s.",
+        "operationId": "list_runs_api_admin_model_comparison_runs_get",
         "parameters": [
           {
             "name": "user_id",
@@ -4119,7 +4119,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/AdminLLMEvalRunListResponse"
+                  "$ref": "#/components/schemas/ComparisonRunListResponse"
                 }
               }
             }
@@ -4137,14 +4137,14 @@
         }
       }
     },
-    "/api/admin/llm-eval/runs/{run_id}": {
+    "/api/admin/model-comparison/runs/{run_id}": {
       "get": {
         "tags": [
           "admin"
         ],
         "summary": "Get Report",
-        "description": "Return a run and a page of its evidence, most concerning turns first.\n\nPaged because every text column on a turn is envelope-encrypted and then\nPII-redacted: serializing a 200-turn run whole is roughly twelve hundred\ndecrypts for a single page view. The ordering is what makes a page worth\nreading, so the sort runs across the whole run and the page is taken from\nthe result, not the other way round.",
-        "operationId": "get_report_api_admin_llm_eval_runs__run_id__get",
+        "description": "Return a run and a page of its turns, the ones worth reading first.\n\nThe default page is ten because that is the part of the report anyone\nacts on. The rest is available on request rather than shipped by default:\nevery text column on a turn is envelope-encrypted and then PII-redacted,\nso serializing a 200-turn run whole is over a thousand decrypts for a\nsingle page view. The ordering is what makes a page worth reading, so the\nsort runs across the whole run and the page is taken from the result, not\nthe other way round.",
+        "operationId": "get_report_api_admin_model_comparison_runs__run_id__get",
         "parameters": [
           {
             "name": "run_id",
@@ -4163,7 +4163,7 @@
               "type": "integer",
               "maximum": 1000,
               "minimum": 1,
-              "default": 50,
+              "default": 10,
               "title": "Limit"
             }
           },
@@ -4185,7 +4185,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/AdminLLMEvalReportResponse"
+                  "$ref": "#/components/schemas/ComparisonReportResponse"
                 }
               }
             }
@@ -4207,8 +4207,8 @@
           "admin"
         ],
         "summary": "Delete Run",
-        "description": "Discard a run and every turn it recorded.\n\nRuns accumulate: a verdict is only as good as the harness that produced\nit, so a scoring change strands every earlier run at a number nobody\nshould act on. Leaving them listed is worse than losing them, because the\nconsole sorts newest-first and an operator reading a stale\n``do_not_switch`` has no way to tell it was measured by since-fixed code.\n\nNot consent-gated, unlike the report. A run belonging to a user who has\nsince withdrawn consent is exactly the run most worth removing, and a\ngate here would pin it in the list permanently.\n\nRefuses while the run is still going. Its workers are mid-flight against\na paid provider, and deleting under them throws that spend away for a\nresult nobody asked to abandon, so stopping the run is a decision the\noperator makes explicitly: cancel first, then delete. A worker that is\nalready inside a turn when the row goes away unwinds quietly; see the\n``IntegrityError`` branch in ``llm_eval.runner``.\n\nThe turn results go with the run through\n``llm_eval_turn_results.run_id``'s ``ON DELETE CASCADE``. The audit row\nthis request writes survives, and is the only remaining evidence the run\nwas ever here.",
-        "operationId": "delete_run_api_admin_llm_eval_runs__run_id__delete",
+        "description": "Discard a run and every turn it recorded.\n\nRuns accumulate, and a report is only as good as the checks that produced\nit, so a change to what the replay looks for strands every earlier run.\nLeaving them listed is worse than losing them, because the console sorts\nnewest-first and nothing on a stale row says it was measured by\nsince-changed code.\n\nNot consent-gated, unlike the report. A run belonging to a user who has\nsince withdrawn consent is the run most worth removing, and a gate here\nwould pin it in the list permanently.\n\nRefuses while the run is still going. Its workers are mid-flight against\na paid provider, and deleting under them throws that spend away for a\nresult nobody asked to abandon, so stopping the run is a decision the\noperator makes explicitly: cancel first, then delete. A worker that is\nalready inside a turn when the row goes away unwinds quietly; see the\n``IntegrityError`` branch in ``model_comparison.runner``.\n\nThe turns go with the run through ``model_comparison_turns.run_id``'s\n``ON DELETE CASCADE``. The audit row this request writes survives, and is\nthe only remaining evidence the run was ever here.",
+        "operationId": "delete_run_api_admin_model_comparison_runs__run_id__delete",
         "parameters": [
           {
             "name": "run_id",
@@ -4237,14 +4237,14 @@
         }
       }
     },
-    "/api/admin/llm-eval/runs/{run_id}/progress": {
+    "/api/admin/model-comparison/runs/{run_id}/progress": {
       "get": {
         "tags": [
           "admin"
         ],
         "summary": "Get Run Progress",
-        "description": "Report how far a run has got.\n\nDeliberately not audited, and deliberately not consent-gated: it returns\ncounters and a status, never a turn, a model output, or an email. The\nconsole polls this every couple of seconds while a run is in flight and\nfetches the audited report only when there is something new to read. The\naudited endpoints were being polled at the same cadence, which buried a\nsingle human read under hundreds of ``view_llm_eval_report`` rows.",
-        "operationId": "get_run_progress_api_admin_llm_eval_runs__run_id__progress_get",
+        "description": "Report how far a run has got.\n\nDeliberately not audited, and deliberately not consent-gated: it returns\ncounters and a status, never a turn, a model output, or an email. The\nconsole polls this every couple of seconds while a run is in flight and\nfetches the audited report only when there is something new to read. The\naudited endpoints were being polled at the same cadence, which buried a\nsingle human read under hundreds of audit rows.",
+        "operationId": "get_run_progress_api_admin_model_comparison_runs__run_id__progress_get",
         "parameters": [
           {
             "name": "run_id",
@@ -4262,7 +4262,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/AdminLLMEvalRunProgress"
+                  "$ref": "#/components/schemas/ComparisonRunProgress"
                 }
               }
             }
@@ -4280,14 +4280,14 @@
         }
       }
     },
-    "/api/admin/llm-eval/runs/{run_id}/cancel": {
+    "/api/admin/model-comparison/runs/{run_id}/cancel": {
       "post": {
         "tags": [
           "admin"
         ],
         "summary": "Cancel Run",
         "description": "Ask an in-flight run to stop.\n\nFlips the status; the worker checks it between turns and unwinds. Turns\nalready written stay, so a cancelled run keeps whatever evidence it had\ngathered.",
-        "operationId": "cancel_run_api_admin_llm_eval_runs__run_id__cancel_post",
+        "operationId": "cancel_run_api_admin_model_comparison_runs__run_id__cancel_post",
         "parameters": [
           {
             "name": "run_id",
@@ -4305,7 +4305,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/AdminLLMEvalRunItem"
+                  "$ref": "#/components/schemas/ComparisonRunItem"
                 }
               }
             }
@@ -5758,851 +5758,6 @@
         "title": "AdminLLMConfigUpdate",
         "description": "All fields optional. Pass only what you want to change."
       },
-      "AdminLLMEvalDecision": {
-        "properties": {
-          "text": {
-            "type": "string",
-            "title": "Text",
-            "default": ""
-          },
-          "tool_calls": {
-            "items": {
-              "$ref": "#/components/schemas/AdminLLMEvalToolCall"
-            },
-            "type": "array",
-            "title": "Tool Calls"
-          },
-          "replayed_lookups": {
-            "items": {
-              "$ref": "#/components/schemas/AdminLLMEvalLookup"
-            },
-            "type": "array",
-            "title": "Replayed Lookups"
-          },
-          "stop_reason": {
-            "type": "string",
-            "title": "Stop Reason",
-            "default": ""
-          },
-          "input_tokens": {
-            "type": "integer",
-            "title": "Input Tokens",
-            "default": 0
-          },
-          "output_tokens": {
-            "type": "integer",
-            "title": "Output Tokens",
-            "default": 0
-          },
-          "cache_read_tokens": {
-            "type": "integer",
-            "title": "Cache Read Tokens",
-            "default": 0
-          },
-          "cache_creation_tokens": {
-            "type": "integer",
-            "title": "Cache Creation Tokens",
-            "default": 0
-          },
-          "latency_ms": {
-            "type": "number",
-            "title": "Latency Ms",
-            "default": 0.0
-          },
-          "error": {
-            "type": "string",
-            "title": "Error",
-            "default": ""
-          }
-        },
-        "type": "object",
-        "title": "AdminLLMEvalDecision",
-        "description": "One model's decision for one replayed turn."
-      },
-      "AdminLLMEvalJudgePreference": {
-        "properties": {
-          "better": {
-            "type": "integer",
-            "title": "Better",
-            "default": 0
-          },
-          "worse": {
-            "type": "integer",
-            "title": "Worse",
-            "default": 0
-          },
-          "judged": {
-            "type": "integer",
-            "title": "Judged",
-            "default": 0
-          },
-          "net_worse_rate": {
-            "type": "number",
-            "title": "Net Worse Rate",
-            "default": 0.0
-          },
-          "p_value": {
-            "type": "number",
-            "title": "P Value",
-            "default": 1.0
-          }
-        },
-        "type": "object",
-        "title": "AdminLLMEvalJudgePreference",
-        "description": "How often the judge preferred each side, over the turns it scored."
-      },
-      "AdminLLMEvalLookup": {
-        "properties": {
-          "name": {
-            "type": "string",
-            "title": "Name"
-          },
-          "arguments": {
-            "additionalProperties": true,
-            "type": "object",
-            "title": "Arguments"
-          },
-          "result": {
-            "type": "string",
-            "title": "Result",
-            "default": ""
-          },
-          "is_error": {
-            "type": "boolean",
-            "title": "Is Error",
-            "default": false
-          }
-        },
-        "type": "object",
-        "required": [
-          "name"
-        ],
-        "title": "AdminLLMEvalLookup",
-        "description": "A lookup the replay fed back from the live turn before the decision."
-      },
-      "AdminLLMEvalModelTotals": {
-        "properties": {
-          "provider": {
-            "type": "string",
-            "title": "Provider",
-            "default": ""
-          },
-          "model": {
-            "type": "string",
-            "title": "Model",
-            "default": ""
-          },
-          "input_tokens": {
-            "type": "integer",
-            "title": "Input Tokens",
-            "default": 0
-          },
-          "output_tokens": {
-            "type": "integer",
-            "title": "Output Tokens",
-            "default": 0
-          },
-          "cache_read_tokens": {
-            "type": "integer",
-            "title": "Cache Read Tokens",
-            "default": 0
-          },
-          "cache_creation_tokens": {
-            "type": "integer",
-            "title": "Cache Creation Tokens",
-            "default": 0
-          },
-          "cache_read_ratio": {
-            "type": "number",
-            "title": "Cache Read Ratio",
-            "default": 0.0
-          },
-          "cache_participation_ratio": {
-            "type": "number",
-            "title": "Cache Participation Ratio",
-            "default": 0.0
-          },
-          "total_cost_usd": {
-            "type": "string",
-            "title": "Total Cost Usd",
-            "default": "0.000000"
-          },
-          "pricing_available": {
-            "type": "boolean",
-            "title": "Pricing Available",
-            "default": true
-          },
-          "pricing_unknown_reason": {
-            "type": "string",
-            "title": "Pricing Unknown Reason",
-            "default": ""
-          },
-          "latency_p50_ms": {
-            "type": "number",
-            "title": "Latency P50 Ms",
-            "default": 0.0
-          },
-          "latency_p95_ms": {
-            "type": "number",
-            "title": "Latency P95 Ms",
-            "default": 0.0
-          }
-        },
-        "type": "object",
-        "title": "AdminLLMEvalModelTotals",
-        "description": "Cost, cache, and latency totals for one model across a run."
-      },
-      "AdminLLMEvalReportResponse": {
-        "properties": {
-          "run": {
-            "$ref": "#/components/schemas/AdminLLMEvalRunItem"
-          },
-          "turns": {
-            "items": {
-              "$ref": "#/components/schemas/AdminLLMEvalTurn"
-            },
-            "type": "array",
-            "title": "Turns"
-          },
-          "total_turns": {
-            "type": "integer",
-            "title": "Total Turns",
-            "default": 0
-          }
-        },
-        "type": "object",
-        "required": [
-          "run",
-          "turns"
-        ],
-        "title": "AdminLLMEvalReportResponse",
-        "description": "A run plus a page of its per-turn evidence, worst turns first."
-      },
-      "AdminLLMEvalRunCreate": {
-        "properties": {
-          "candidate_endpoint": {
-            "type": "string",
-            "maxLength": 64,
-            "title": "Candidate Endpoint",
-            "default": ""
-          },
-          "candidate_provider": {
-            "type": "string",
-            "maxLength": 64,
-            "title": "Candidate Provider",
-            "default": ""
-          },
-          "candidate_model": {
-            "type": "string",
-            "maxLength": 128,
-            "minLength": 1,
-            "title": "Candidate Model"
-          },
-          "baseline_reasoning_effort": {
-            "anyOf": [
-              {
-                "type": "string",
-                "enum": [
-                  "none",
-                  "minimal",
-                  "low",
-                  "medium",
-                  "high",
-                  "xhigh",
-                  "auto"
-                ]
-              },
-              {
-                "type": "string",
-                "const": ""
-              }
-            ],
-            "title": "Baseline Reasoning Effort",
-            "default": ""
-          },
-          "candidate_reasoning_effort": {
-            "anyOf": [
-              {
-                "type": "string",
-                "enum": [
-                  "none",
-                  "minimal",
-                  "low",
-                  "medium",
-                  "high",
-                  "xhigh",
-                  "auto"
-                ]
-              },
-              {
-                "type": "string",
-                "const": ""
-              }
-            ],
-            "title": "Candidate Reasoning Effort",
-            "default": ""
-          },
-          "sample_count": {
-            "type": "integer",
-            "minimum": 1.0,
-            "title": "Sample Count",
-            "default": 100
-          },
-          "judge_enabled": {
-            "type": "boolean",
-            "title": "Judge Enabled",
-            "default": true
-          }
-        },
-        "type": "object",
-        "required": [
-          "candidate_model"
-        ],
-        "title": "AdminLLMEvalRunCreate",
-        "description": "Request to replay a user's recent turns against a candidate model.\n\nThe baseline is not accepted from the client: it is resolved server-side\nfrom the user's effective configuration (their subscription override, or\nthe global default), so a report can never compare against a model the\nuser was not actually on."
-      },
-      "AdminLLMEvalRunItem": {
-        "properties": {
-          "id": {
-            "type": "string",
-            "title": "Id"
-          },
-          "user_id": {
-            "type": "string",
-            "title": "User Id"
-          },
-          "user_email": {
-            "type": "string",
-            "title": "User Email",
-            "default": ""
-          },
-          "user_consented": {
-            "type": "boolean",
-            "title": "User Consented",
-            "default": true
-          },
-          "baseline_endpoint": {
-            "type": "string",
-            "title": "Baseline Endpoint",
-            "default": ""
-          },
-          "baseline_provider": {
-            "type": "string",
-            "title": "Baseline Provider"
-          },
-          "baseline_model": {
-            "type": "string",
-            "title": "Baseline Model"
-          },
-          "baseline_reasoning_effort": {
-            "type": "string",
-            "title": "Baseline Reasoning Effort",
-            "default": ""
-          },
-          "candidate_endpoint": {
-            "type": "string",
-            "title": "Candidate Endpoint",
-            "default": ""
-          },
-          "candidate_provider": {
-            "type": "string",
-            "title": "Candidate Provider"
-          },
-          "candidate_model": {
-            "type": "string",
-            "title": "Candidate Model"
-          },
-          "candidate_reasoning_effort": {
-            "type": "string",
-            "title": "Candidate Reasoning Effort",
-            "default": ""
-          },
-          "judge_model": {
-            "type": "string",
-            "title": "Judge Model"
-          },
-          "requested_samples": {
-            "type": "integer",
-            "title": "Requested Samples"
-          },
-          "status": {
-            "type": "string",
-            "title": "Status"
-          },
-          "progress_completed": {
-            "type": "integer",
-            "title": "Progress Completed"
-          },
-          "progress_total": {
-            "type": "integer",
-            "title": "Progress Total"
-          },
-          "recommendation": {
-            "type": "string",
-            "title": "Recommendation"
-          },
-          "error": {
-            "type": "string",
-            "title": "Error"
-          },
-          "created_at": {
-            "type": "string",
-            "title": "Created At"
-          },
-          "started_at": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Started At"
-          },
-          "completed_at": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Completed At"
-          },
-          "summary": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/AdminLLMEvalSummary"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          }
-        },
-        "type": "object",
-        "required": [
-          "id",
-          "user_id",
-          "baseline_provider",
-          "baseline_model",
-          "candidate_provider",
-          "candidate_model",
-          "judge_model",
-          "requested_samples",
-          "status",
-          "progress_completed",
-          "progress_total",
-          "recommendation",
-          "error",
-          "created_at"
-        ],
-        "title": "AdminLLMEvalRunItem",
-        "description": "One run, without its per-turn evidence."
-      },
-      "AdminLLMEvalRunListResponse": {
-        "properties": {
-          "runs": {
-            "items": {
-              "$ref": "#/components/schemas/AdminLLMEvalRunItem"
-            },
-            "type": "array",
-            "title": "Runs"
-          },
-          "total": {
-            "type": "integer",
-            "title": "Total"
-          },
-          "max_samples": {
-            "type": "integer",
-            "title": "Max Samples"
-          },
-          "min_turns_for_verdict": {
-            "type": "integer",
-            "title": "Min Turns For Verdict"
-          },
-          "max_page_size": {
-            "type": "integer",
-            "title": "Max Page Size"
-          }
-        },
-        "type": "object",
-        "required": [
-          "runs",
-          "total",
-          "max_samples",
-          "min_turns_for_verdict",
-          "max_page_size"
-        ],
-        "title": "AdminLLMEvalRunListResponse",
-        "description": "This user's runs, plus the bounds the run form has to respect.\n\n``max_samples`` is ``LLM_EVAL_MAX_SAMPLES``, which ``start_run`` enforces.\nWithout it on the wire the sample control can only guess, and a deployment\nthat lowers the setting gets a form offering values the API rejects.\n``min_turns_for_verdict`` is the floor below which a run reports\n``inconclusive`` rather than a pass, which is worth showing before someone\nspends a run finding out."
-      },
-      "AdminLLMEvalRunProgress": {
-        "properties": {
-          "id": {
-            "type": "string",
-            "title": "Id"
-          },
-          "status": {
-            "type": "string",
-            "title": "Status"
-          },
-          "progress_completed": {
-            "type": "integer",
-            "title": "Progress Completed"
-          },
-          "progress_total": {
-            "type": "integer",
-            "title": "Progress Total"
-          },
-          "recommendation": {
-            "type": "string",
-            "title": "Recommendation"
-          }
-        },
-        "type": "object",
-        "required": [
-          "id",
-          "status",
-          "progress_completed",
-          "progress_total",
-          "recommendation"
-        ],
-        "title": "AdminLLMEvalRunProgress",
-        "description": "Just enough to answer \"is it done yet\".\n\nCarries no conversation content and no per-turn evidence, which is what\nlets the console poll it without writing an audit row every two seconds\nfor a single human read."
-      },
-      "AdminLLMEvalSafetyIssue": {
-        "properties": {
-          "finding": {
-            "type": "string",
-            "title": "Finding"
-          },
-          "tool_name": {
-            "type": "string",
-            "title": "Tool Name",
-            "default": ""
-          },
-          "detail": {
-            "type": "string",
-            "title": "Detail",
-            "default": ""
-          },
-          "blocking": {
-            "type": "boolean",
-            "title": "Blocking",
-            "default": true
-          },
-          "side": {
-            "type": "string",
-            "enum": [
-              "baseline",
-              "candidate"
-            ],
-            "title": "Side",
-            "default": "candidate"
-          }
-        },
-        "type": "object",
-        "required": [
-          "finding"
-        ],
-        "title": "AdminLLMEvalSafetyIssue"
-      },
-      "AdminLLMEvalSideComparison": {
-        "properties": {
-          "candidate_turns": {
-            "type": "integer",
-            "title": "Candidate Turns",
-            "default": 0
-          },
-          "baseline_turns": {
-            "type": "integer",
-            "title": "Baseline Turns",
-            "default": 0
-          },
-          "candidate_only": {
-            "type": "integer",
-            "title": "Candidate Only",
-            "default": 0
-          },
-          "baseline_only": {
-            "type": "integer",
-            "title": "Baseline Only",
-            "default": 0
-          },
-          "p_value": {
-            "type": "number",
-            "title": "P Value",
-            "default": 1.0
-          }
-        },
-        "type": "object",
-        "title": "AdminLLMEvalSideComparison",
-        "description": "How often each model had something, over the turns both answered."
-      },
-      "AdminLLMEvalSummary": {
-        "properties": {
-          "turns_total": {
-            "type": "integer",
-            "title": "Turns Total",
-            "default": 0
-          },
-          "turns_completed": {
-            "type": "integer",
-            "title": "Turns Completed",
-            "default": 0
-          },
-          "turns_failed": {
-            "type": "integer",
-            "title": "Turns Failed",
-            "default": 0
-          },
-          "agreement_counts": {
-            "additionalProperties": {
-              "type": "integer"
-            },
-            "type": "object",
-            "title": "Agreement Counts"
-          },
-          "safety_counts": {
-            "additionalProperties": {
-              "type": "integer"
-            },
-            "type": "object",
-            "title": "Safety Counts"
-          },
-          "baseline_safety_counts": {
-            "anyOf": [
-              {
-                "additionalProperties": {
-                  "type": "integer"
-                },
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Baseline Safety Counts"
-          },
-          "blocking_findings": {
-            "type": "integer",
-            "title": "Blocking Findings",
-            "default": 0
-          },
-          "safety_comparison": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/AdminLLMEvalSideComparison"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "fabricated_id_comparison": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/AdminLLMEvalSideComparison"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "judge_counts": {
-            "additionalProperties": {
-              "type": "integer"
-            },
-            "type": "object",
-            "title": "Judge Counts"
-          },
-          "judge_skip_counts": {
-            "additionalProperties": {
-              "type": "integer"
-            },
-            "type": "object",
-            "title": "Judge Skip Counts"
-          },
-          "judge_preference": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/AdminLLMEvalJudgePreference"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "identical_rate": {
-            "type": "number",
-            "title": "Identical Rate",
-            "default": 0.0
-          },
-          "divergence_rate": {
-            "type": "number",
-            "title": "Divergence Rate",
-            "default": 0.0
-          },
-          "divergence_noise_floor": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Divergence Noise Floor"
-          },
-          "divergence_threshold": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Divergence Threshold"
-          },
-          "silent_noop_rate": {
-            "type": "number",
-            "title": "Silent Noop Rate",
-            "default": 0.0
-          },
-          "silent_noop_blocking_rate": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Silent Noop Blocking Rate"
-          },
-          "baseline": {
-            "$ref": "#/components/schemas/AdminLLMEvalModelTotals"
-          },
-          "candidate": {
-            "$ref": "#/components/schemas/AdminLLMEvalModelTotals"
-          },
-          "recommendation": {
-            "type": "string",
-            "title": "Recommendation",
-            "default": ""
-          },
-          "reasons": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array",
-            "title": "Reasons"
-          },
-          "warnings": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array",
-            "title": "Warnings"
-          }
-        },
-        "type": "object",
-        "title": "AdminLLMEvalSummary",
-        "description": "The frozen aggregate stored on the run when it completed."
-      },
-      "AdminLLMEvalToolCall": {
-        "properties": {
-          "name": {
-            "type": "string",
-            "title": "Name"
-          },
-          "arguments": {
-            "additionalProperties": true,
-            "type": "object",
-            "title": "Arguments"
-          }
-        },
-        "type": "object",
-        "required": [
-          "name"
-        ],
-        "title": "AdminLLMEvalToolCall"
-      },
-      "AdminLLMEvalTurn": {
-        "properties": {
-          "message_seq": {
-            "type": "integer",
-            "title": "Message Seq"
-          },
-          "message_timestamp": {
-            "type": "string",
-            "title": "Message Timestamp"
-          },
-          "user_message": {
-            "type": "string",
-            "title": "User Message"
-          },
-          "historic_reply": {
-            "type": "string",
-            "title": "Historic Reply",
-            "default": ""
-          },
-          "historic_tool_names": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array",
-            "title": "Historic Tool Names"
-          },
-          "baseline": {
-            "$ref": "#/components/schemas/AdminLLMEvalDecision"
-          },
-          "candidate": {
-            "$ref": "#/components/schemas/AdminLLMEvalDecision"
-          },
-          "agreement": {
-            "type": "string",
-            "title": "Agreement"
-          },
-          "safety_issues": {
-            "items": {
-              "$ref": "#/components/schemas/AdminLLMEvalSafetyIssue"
-            },
-            "type": "array",
-            "title": "Safety Issues"
-          },
-          "judge_verdict": {
-            "type": "string",
-            "title": "Judge Verdict",
-            "default": "not_judged"
-          },
-          "judge_rationale": {
-            "type": "string",
-            "title": "Judge Rationale",
-            "default": ""
-          },
-          "judge_skip_reason": {
-            "type": "string",
-            "title": "Judge Skip Reason",
-            "default": ""
-          }
-        },
-        "type": "object",
-        "required": [
-          "message_seq",
-          "message_timestamp",
-          "user_message",
-          "baseline",
-          "candidate",
-          "agreement"
-        ],
-        "title": "AdminLLMEvalTurn",
-        "description": "One replayed turn: the user's message and both models' decisions.\n\n``historic_reply`` and ``historic_tool_names`` are what the agent actually\ndid for this turn when it happened. They are shown alongside, not scored:\nthat turn ran against an older system prompt and an older tool set, so it\nis context for a human reading the diff rather than a third contestant."
-      },
       "AdminLLMModelsResponse": {
         "properties": {
           "provider": {
@@ -7906,6 +7061,670 @@
         ],
         "title": "CompactUserContextResponse",
         "description": "Outcome of an admin-triggered context compaction.\n\n``event_id`` is the row this call wrote, populated only when the\ncall did real work. ``previous_event_id`` is populated only on\nno-op returns and points at the most recent prior compaction event\nfor the user (if any), so admin tooling can tell apart \"you already\ndid this seconds ago\" from \"there was never anything to do\"."
+      },
+      "ComparisonFinding": {
+        "properties": {
+          "finding": {
+            "type": "string",
+            "title": "Finding"
+          },
+          "tool_name": {
+            "type": "string",
+            "title": "Tool Name"
+          },
+          "detail": {
+            "type": "string",
+            "title": "Detail"
+          },
+          "violation": {
+            "type": "boolean",
+            "title": "Violation"
+          },
+          "side": {
+            "type": "string",
+            "enum": [
+              "production",
+              "candidate"
+            ],
+            "title": "Side"
+          }
+        },
+        "type": "object",
+        "required": [
+          "finding",
+          "tool_name",
+          "detail",
+          "violation",
+          "side"
+        ],
+        "title": "ComparisonFinding"
+      },
+      "ComparisonModelTotals": {
+        "properties": {
+          "provider": {
+            "type": "string",
+            "title": "Provider"
+          },
+          "model": {
+            "type": "string",
+            "title": "Model"
+          },
+          "input_tokens": {
+            "type": "integer",
+            "title": "Input Tokens"
+          },
+          "output_tokens": {
+            "type": "integer",
+            "title": "Output Tokens"
+          },
+          "cache_read_tokens": {
+            "type": "integer",
+            "title": "Cache Read Tokens"
+          },
+          "cache_creation_tokens": {
+            "type": "integer",
+            "title": "Cache Creation Tokens"
+          },
+          "billed_prompt_tokens": {
+            "type": "integer",
+            "title": "Billed Prompt Tokens"
+          },
+          "total_cost_usd": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Cost Usd"
+          },
+          "cost_unavailable_reason": {
+            "type": "string",
+            "title": "Cost Unavailable Reason"
+          },
+          "latency_p50_ms": {
+            "type": "number",
+            "title": "Latency P50 Ms"
+          },
+          "latency_p95_ms": {
+            "type": "number",
+            "title": "Latency P95 Ms"
+          }
+        },
+        "type": "object",
+        "required": [
+          "provider",
+          "model",
+          "input_tokens",
+          "output_tokens",
+          "cache_read_tokens",
+          "cache_creation_tokens",
+          "billed_prompt_tokens",
+          "total_cost_usd",
+          "cost_unavailable_reason",
+          "latency_p50_ms",
+          "latency_p95_ms"
+        ],
+        "title": "ComparisonModelTotals",
+        "description": "Token, cost, and latency totals for the candidate across a run."
+      },
+      "ComparisonReportResponse": {
+        "properties": {
+          "run": {
+            "$ref": "#/components/schemas/ComparisonRunItem"
+          },
+          "turns": {
+            "items": {
+              "$ref": "#/components/schemas/ComparisonTurnItem"
+            },
+            "type": "array",
+            "title": "Turns"
+          },
+          "total_turns": {
+            "type": "integer",
+            "title": "Total Turns"
+          }
+        },
+        "type": "object",
+        "required": [
+          "run",
+          "turns",
+          "total_turns"
+        ],
+        "title": "ComparisonReportResponse",
+        "description": "A run plus a page of its turns, the ones worth reading first."
+      },
+      "ComparisonRunCreate": {
+        "properties": {
+          "candidate_endpoint": {
+            "type": "string",
+            "maxLength": 64,
+            "title": "Candidate Endpoint",
+            "default": ""
+          },
+          "candidate_provider": {
+            "type": "string",
+            "maxLength": 64,
+            "title": "Candidate Provider",
+            "default": ""
+          },
+          "candidate_model": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Candidate Model"
+          },
+          "candidate_reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "none",
+                  "minimal",
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "auto"
+                ]
+              },
+              {
+                "type": "string",
+                "const": ""
+              }
+            ],
+            "title": "Candidate Reasoning Effort",
+            "default": ""
+          },
+          "sample_count": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Sample Count",
+            "default": 50
+          }
+        },
+        "type": "object",
+        "required": [
+          "candidate_model"
+        ],
+        "title": "ComparisonRunCreate",
+        "description": "Request to replay a user's recent turns through a candidate model.\n\nThe baseline is not accepted from the client and is not a model at all:\nit is what production actually did, read back from the user's transcript.\nThe run records the user's current model as a label so the report says\nwhat the candidate was being considered against."
+      },
+      "ComparisonRunItem": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "user_id": {
+            "type": "string",
+            "title": "User Id"
+          },
+          "user_email": {
+            "type": "string",
+            "title": "User Email"
+          },
+          "user_consented": {
+            "type": "boolean",
+            "title": "User Consented"
+          },
+          "incumbent_endpoint": {
+            "type": "string",
+            "title": "Incumbent Endpoint"
+          },
+          "incumbent_provider": {
+            "type": "string",
+            "title": "Incumbent Provider"
+          },
+          "incumbent_model": {
+            "type": "string",
+            "title": "Incumbent Model"
+          },
+          "candidate_endpoint": {
+            "type": "string",
+            "title": "Candidate Endpoint"
+          },
+          "candidate_provider": {
+            "type": "string",
+            "title": "Candidate Provider"
+          },
+          "candidate_model": {
+            "type": "string",
+            "title": "Candidate Model"
+          },
+          "candidate_reasoning_effort": {
+            "type": "string",
+            "title": "Candidate Reasoning Effort"
+          },
+          "requested_samples": {
+            "type": "integer",
+            "title": "Requested Samples"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "progress_completed": {
+            "type": "integer",
+            "title": "Progress Completed"
+          },
+          "progress_total": {
+            "type": "integer",
+            "title": "Progress Total"
+          },
+          "error": {
+            "type": "string",
+            "title": "Error"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "completed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          },
+          "summary": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ComparisonSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "user_id",
+          "user_email",
+          "user_consented",
+          "incumbent_endpoint",
+          "incumbent_provider",
+          "incumbent_model",
+          "candidate_endpoint",
+          "candidate_provider",
+          "candidate_model",
+          "candidate_reasoning_effort",
+          "requested_samples",
+          "status",
+          "progress_completed",
+          "progress_total",
+          "error",
+          "created_at",
+          "started_at",
+          "completed_at",
+          "summary"
+        ],
+        "title": "ComparisonRunItem",
+        "description": "One run, without its per-turn evidence."
+      },
+      "ComparisonRunListResponse": {
+        "properties": {
+          "runs": {
+            "items": {
+              "$ref": "#/components/schemas/ComparisonRunItem"
+            },
+            "type": "array",
+            "title": "Runs"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "max_samples": {
+            "type": "integer",
+            "title": "Max Samples"
+          },
+          "max_page_size": {
+            "type": "integer",
+            "title": "Max Page Size"
+          }
+        },
+        "type": "object",
+        "required": [
+          "runs",
+          "total",
+          "max_samples",
+          "max_page_size"
+        ],
+        "title": "ComparisonRunListResponse",
+        "description": "Runs, plus the bounds the start form has to respect.\n\n``max_samples`` is ``MODEL_COMPARISON_MAX_SAMPLES``, which ``start_run``\nenforces. Without it on the wire the sample control can only guess, and a\ndeployment that lowers the setting gets a form offering values the API\nrejects."
+      },
+      "ComparisonRunProgress": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "progress_completed": {
+            "type": "integer",
+            "title": "Progress Completed"
+          },
+          "progress_total": {
+            "type": "integer",
+            "title": "Progress Total"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "status",
+          "progress_completed",
+          "progress_total"
+        ],
+        "title": "ComparisonRunProgress",
+        "description": "Just enough to answer \"is it done yet\".\n\nCarries no conversation content and no per-turn evidence, which is what\nlets the console poll it without writing an audit row every two seconds\nfor a single human read."
+      },
+      "ComparisonSummary": {
+        "properties": {
+          "turns_total": {
+            "type": "integer",
+            "title": "Turns Total"
+          },
+          "turns_replayed": {
+            "type": "integer",
+            "title": "Turns Replayed"
+          },
+          "turns_failed": {
+            "type": "integer",
+            "title": "Turns Failed"
+          },
+          "outcome_counts": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Outcome Counts"
+          },
+          "candidate_findings": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Candidate Findings"
+          },
+          "production_findings": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Production Findings"
+          },
+          "candidate_violations": {
+            "type": "integer",
+            "title": "Candidate Violations"
+          },
+          "production_violations": {
+            "type": "integer",
+            "title": "Production Violations"
+          },
+          "production_checked_findings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Production Checked Findings"
+          },
+          "writes_total": {
+            "type": "integer",
+            "title": "Writes Total"
+          },
+          "writes_matched": {
+            "type": "integer",
+            "title": "Writes Matched"
+          },
+          "writes_args_differ": {
+            "type": "integer",
+            "title": "Writes Args Differ"
+          },
+          "writes_missed": {
+            "type": "integer",
+            "title": "Writes Missed"
+          },
+          "write_match_rate": {
+            "type": "number",
+            "title": "Write Match Rate"
+          },
+          "candidate": {
+            "$ref": "#/components/schemas/ComparisonModelTotals"
+          },
+          "notes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Notes"
+          }
+        },
+        "type": "object",
+        "required": [
+          "turns_total",
+          "turns_replayed",
+          "turns_failed",
+          "outcome_counts",
+          "candidate_findings",
+          "production_findings",
+          "candidate_violations",
+          "production_violations",
+          "production_checked_findings",
+          "writes_total",
+          "writes_matched",
+          "writes_args_differ",
+          "writes_missed",
+          "write_match_rate",
+          "candidate",
+          "notes"
+        ],
+        "title": "ComparisonSummary",
+        "description": "The frozen summary stored on the run when it finished.\n\nCounts and totals. A reader who wants a recommendation reads the turns."
+      },
+      "ComparisonToolCall": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "arguments": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Arguments"
+          },
+          "result": {
+            "type": "string",
+            "title": "Result"
+          },
+          "is_error": {
+            "type": "boolean",
+            "title": "Is Error"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "arguments",
+          "result",
+          "is_error"
+        ],
+        "title": "ComparisonToolCall"
+      },
+      "ComparisonTurnItem": {
+        "properties": {
+          "message_seq": {
+            "type": "integer",
+            "title": "Message Seq"
+          },
+          "message_timestamp": {
+            "type": "string",
+            "title": "Message Timestamp"
+          },
+          "user_message": {
+            "type": "string",
+            "title": "User Message"
+          },
+          "production_reply": {
+            "type": "string",
+            "title": "Production Reply"
+          },
+          "production_tool_calls": {
+            "items": {
+              "$ref": "#/components/schemas/ComparisonToolCall"
+            },
+            "type": "array",
+            "title": "Production Tool Calls"
+          },
+          "candidate_text": {
+            "type": "string",
+            "title": "Candidate Text"
+          },
+          "candidate_tool_calls": {
+            "items": {
+              "$ref": "#/components/schemas/ComparisonToolCall"
+            },
+            "type": "array",
+            "title": "Candidate Tool Calls"
+          },
+          "candidate_replayed_lookups": {
+            "items": {
+              "$ref": "#/components/schemas/ComparisonToolCall"
+            },
+            "type": "array",
+            "title": "Candidate Replayed Lookups"
+          },
+          "candidate_stop_reason": {
+            "type": "string",
+            "title": "Candidate Stop Reason"
+          },
+          "candidate_input_tokens": {
+            "type": "integer",
+            "title": "Candidate Input Tokens"
+          },
+          "candidate_output_tokens": {
+            "type": "integer",
+            "title": "Candidate Output Tokens"
+          },
+          "candidate_cache_read_tokens": {
+            "type": "integer",
+            "title": "Candidate Cache Read Tokens"
+          },
+          "candidate_cache_creation_tokens": {
+            "type": "integer",
+            "title": "Candidate Cache Creation Tokens"
+          },
+          "candidate_latency_ms": {
+            "type": "number",
+            "title": "Candidate Latency Ms"
+          },
+          "candidate_error": {
+            "type": "string",
+            "title": "Candidate Error"
+          },
+          "outcome": {
+            "type": "string",
+            "title": "Outcome"
+          },
+          "writes": {
+            "items": {
+              "$ref": "#/components/schemas/ComparisonWrite"
+            },
+            "type": "array",
+            "title": "Writes"
+          },
+          "findings": {
+            "items": {
+              "$ref": "#/components/schemas/ComparisonFinding"
+            },
+            "type": "array",
+            "title": "Findings"
+          }
+        },
+        "type": "object",
+        "required": [
+          "message_seq",
+          "message_timestamp",
+          "user_message",
+          "production_reply",
+          "production_tool_calls",
+          "candidate_text",
+          "candidate_tool_calls",
+          "candidate_replayed_lookups",
+          "candidate_stop_reason",
+          "candidate_input_tokens",
+          "candidate_output_tokens",
+          "candidate_cache_read_tokens",
+          "candidate_cache_creation_tokens",
+          "candidate_latency_ms",
+          "candidate_error",
+          "outcome",
+          "writes",
+          "findings"
+        ],
+        "title": "ComparisonTurnItem",
+        "description": "One replayed turn, production's decision beside the candidate's."
+      },
+      "ComparisonWrite": {
+        "properties": {
+          "tool_name": {
+            "type": "string",
+            "title": "Tool Name"
+          },
+          "outcome": {
+            "type": "string",
+            "title": "Outcome"
+          },
+          "key_arguments": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Key Arguments"
+          },
+          "candidate_arguments": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidate Arguments"
+          }
+        },
+        "type": "object",
+        "required": [
+          "tool_name",
+          "outcome",
+          "key_arguments",
+          "candidate_arguments"
+        ],
+        "title": "ComparisonWrite",
+        "description": "One write the live turn made, and what the candidate did about it."
       },
       "DataSharingConsentRequest": {
         "properties": {

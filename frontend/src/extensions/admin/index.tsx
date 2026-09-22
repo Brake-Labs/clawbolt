@@ -11,8 +11,8 @@ import AccessAndWaitlistTab from './tabs/access-and-waitlist';
 import ReportedTab from './tabs/reported';
 import ApiKeysTab from './tabs/api-keys';
 import MonitoringTab from './tabs/monitoring';
-import ModelEvalTab from './tabs/model-eval';
-import ModelEvalReportPage from './tabs/model-eval-report';
+import ModelComparisonTab from './tabs/model-comparison';
+import ModelComparisonReportPage from './tabs/model-comparison-report';
 
 // --- Navigation model ---
 //
@@ -184,10 +184,10 @@ function UsersRoute({ currentUserId }: { currentUserId?: string }) {
  * on the list response, so we page the list until the row shows up rather
  * than adding a backend endpoint.
  */
-function ModelEvalReportRoute() {
+function ModelComparisonReportRoute() {
   const { runId } = useParams<{ runId: string }>();
-  if (!runId) return <Navigate to={adminPath('model-eval')} replace />;
-  return <ModelEvalReportPage runId={runId} />;
+  if (!runId) return <Navigate to={adminPath('model-comparison')} replace />;
+  return <ModelComparisonReportPage runId={runId} />;
 }
 
 function UserDetailRoute({ currentUserId }: { currentUserId?: string }) {
@@ -303,18 +303,18 @@ export default function AdminPanel() {
         }
       />
       <Route
-        path="model-eval"
+        path="model-comparison"
         element={
-          <AdminSection slug="model-eval">
-            <ModelEvalTab />
+          <AdminSection slug="model-comparison">
+            <ModelComparisonTab />
           </AdminSection>
         }
       />
       <Route
-        path="model-eval/:runId"
+        path="model-comparison/:runId"
         element={
-          <AdminSection slug="model-eval">
-            <ModelEvalReportRoute />
+          <AdminSection slug="model-comparison">
+            <ModelComparisonReportRoute />
           </AdminSection>
         }
       />

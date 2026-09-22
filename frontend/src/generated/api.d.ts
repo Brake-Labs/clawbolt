@@ -2307,7 +2307,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/admin/llm-eval/users/{user_id}/runs": {
+    "/api/admin/model-comparison/users/{user_id}/runs": {
         parameters: {
             query?: never;
             header?: never;
@@ -2324,14 +2324,14 @@ export interface paths {
          *     progress. One active run per user: a second concurrent replay of the
          *     same history would double the provider load for no extra information.
          */
-        post: operations["start_run_api_admin_llm_eval_users__user_id__runs_post"];
+        post: operations["start_run_api_admin_model_comparison_users__user_id__runs_post"];
         delete?: never;
         options?: never;
         head?: never;
         patch?: never;
         trace?: never;
     };
-    "/api/admin/llm-eval/runs": {
+    "/api/admin/model-comparison/runs": {
         parameters: {
             query?: never;
             header?: never;
@@ -2340,19 +2340,19 @@ export interface paths {
         };
         /**
          * List Runs
-         * @description Evaluation runs, newest first, across every user or one of them.
+         * @description Comparison runs, newest first, across every user or one of them.
          *
-         *     Unfiltered by default so the console can answer "what has been evaluated
+         *     Unfiltered by default so the console can answer "what has been compared
          *     lately", which is how an operator finds a run again weeks later without
          *     remembering whose it was. ``user_id`` narrows it to one user for the run
          *     form beside it.
          *
          *     No consent gate here, unlike the report: a row is run metadata (which
-         *     models, what verdict, how many turns), not the user's conversations. Each
+         *     model, how many turns, what it cost), not the user's conversations. Each
          *     row carries ``user_consented`` so the console can show that a run's
          *     evidence is no longer readable rather than offering a link that 403s.
          */
-        get: operations["list_runs_api_admin_llm_eval_runs_get"];
+        get: operations["list_runs_api_admin_model_comparison_runs_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -2361,7 +2361,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/admin/llm-eval/runs/{run_id}": {
+    "/api/admin/model-comparison/runs/{run_id}": {
         parameters: {
             query?: never;
             header?: never;
@@ -2370,50 +2370,51 @@ export interface paths {
         };
         /**
          * Get Report
-         * @description Return a run and a page of its evidence, most concerning turns first.
+         * @description Return a run and a page of its turns, the ones worth reading first.
          *
-         *     Paged because every text column on a turn is envelope-encrypted and then
-         *     PII-redacted: serializing a 200-turn run whole is roughly twelve hundred
-         *     decrypts for a single page view. The ordering is what makes a page worth
-         *     reading, so the sort runs across the whole run and the page is taken from
-         *     the result, not the other way round.
+         *     The default page is ten because that is the part of the report anyone
+         *     acts on. The rest is available on request rather than shipped by default:
+         *     every text column on a turn is envelope-encrypted and then PII-redacted,
+         *     so serializing a 200-turn run whole is over a thousand decrypts for a
+         *     single page view. The ordering is what makes a page worth reading, so the
+         *     sort runs across the whole run and the page is taken from the result, not
+         *     the other way round.
          */
-        get: operations["get_report_api_admin_llm_eval_runs__run_id__get"];
+        get: operations["get_report_api_admin_model_comparison_runs__run_id__get"];
         put?: never;
         post?: never;
         /**
          * Delete Run
          * @description Discard a run and every turn it recorded.
          *
-         *     Runs accumulate: a verdict is only as good as the harness that produced
-         *     it, so a scoring change strands every earlier run at a number nobody
-         *     should act on. Leaving them listed is worse than losing them, because the
-         *     console sorts newest-first and an operator reading a stale
-         *     ``do_not_switch`` has no way to tell it was measured by since-fixed code.
+         *     Runs accumulate, and a report is only as good as the checks that produced
+         *     it, so a change to what the replay looks for strands every earlier run.
+         *     Leaving them listed is worse than losing them, because the console sorts
+         *     newest-first and nothing on a stale row says it was measured by
+         *     since-changed code.
          *
          *     Not consent-gated, unlike the report. A run belonging to a user who has
-         *     since withdrawn consent is exactly the run most worth removing, and a
-         *     gate here would pin it in the list permanently.
+         *     since withdrawn consent is the run most worth removing, and a gate here
+         *     would pin it in the list permanently.
          *
          *     Refuses while the run is still going. Its workers are mid-flight against
          *     a paid provider, and deleting under them throws that spend away for a
          *     result nobody asked to abandon, so stopping the run is a decision the
          *     operator makes explicitly: cancel first, then delete. A worker that is
          *     already inside a turn when the row goes away unwinds quietly; see the
-         *     ``IntegrityError`` branch in ``llm_eval.runner``.
+         *     ``IntegrityError`` branch in ``model_comparison.runner``.
          *
-         *     The turn results go with the run through
-         *     ``llm_eval_turn_results.run_id``'s ``ON DELETE CASCADE``. The audit row
-         *     this request writes survives, and is the only remaining evidence the run
-         *     was ever here.
+         *     The turns go with the run through ``model_comparison_turns.run_id``'s
+         *     ``ON DELETE CASCADE``. The audit row this request writes survives, and is
+         *     the only remaining evidence the run was ever here.
          */
-        delete: operations["delete_run_api_admin_llm_eval_runs__run_id__delete"];
+        delete: operations["delete_run_api_admin_model_comparison_runs__run_id__delete"];
         options?: never;
         head?: never;
         patch?: never;
         trace?: never;
     };
-    "/api/admin/llm-eval/runs/{run_id}/progress": {
+    "/api/admin/model-comparison/runs/{run_id}/progress": {
         parameters: {
             query?: never;
             header?: never;
@@ -2429,9 +2430,9 @@ export interface paths {
          *     console polls this every couple of seconds while a run is in flight and
          *     fetches the audited report only when there is something new to read. The
          *     audited endpoints were being polled at the same cadence, which buried a
-         *     single human read under hundreds of ``view_llm_eval_report`` rows.
+         *     single human read under hundreds of audit rows.
          */
-        get: operations["get_run_progress_api_admin_llm_eval_runs__run_id__progress_get"];
+        get: operations["get_run_progress_api_admin_model_comparison_runs__run_id__progress_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -2440,7 +2441,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/admin/llm-eval/runs/{run_id}/cancel": {
+    "/api/admin/model-comparison/runs/{run_id}/cancel": {
         parameters: {
             query?: never;
             header?: never;
@@ -2457,7 +2458,7 @@ export interface paths {
          *     already written stay, so a cancelled run keeps whatever evidence it had
          *     gathered.
          */
-        post: operations["cancel_run_api_admin_llm_eval_runs__run_id__cancel_post"];
+        post: operations["cancel_run_api_admin_model_comparison_runs__run_id__cancel_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3239,541 +3240,6 @@ export interface components {
             reasoning_effort?: ("none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "auto") | null;
         };
         /**
-         * AdminLLMEvalDecision
-         * @description One model's decision for one replayed turn.
-         */
-        AdminLLMEvalDecision: {
-            /**
-             * Text
-             * @default
-             */
-            text: string;
-            /** Tool Calls */
-            tool_calls?: components["schemas"]["AdminLLMEvalToolCall"][];
-            /** Replayed Lookups */
-            replayed_lookups?: components["schemas"]["AdminLLMEvalLookup"][];
-            /**
-             * Stop Reason
-             * @default
-             */
-            stop_reason: string;
-            /**
-             * Input Tokens
-             * @default 0
-             */
-            input_tokens: number;
-            /**
-             * Output Tokens
-             * @default 0
-             */
-            output_tokens: number;
-            /**
-             * Cache Read Tokens
-             * @default 0
-             */
-            cache_read_tokens: number;
-            /**
-             * Cache Creation Tokens
-             * @default 0
-             */
-            cache_creation_tokens: number;
-            /**
-             * Latency Ms
-             * @default 0
-             */
-            latency_ms: number;
-            /**
-             * Error
-             * @default
-             */
-            error: string;
-        };
-        /**
-         * AdminLLMEvalJudgePreference
-         * @description How often the judge preferred each side, over the turns it scored.
-         */
-        AdminLLMEvalJudgePreference: {
-            /**
-             * Better
-             * @default 0
-             */
-            better: number;
-            /**
-             * Worse
-             * @default 0
-             */
-            worse: number;
-            /**
-             * Judged
-             * @default 0
-             */
-            judged: number;
-            /**
-             * Net Worse Rate
-             * @default 0
-             */
-            net_worse_rate: number;
-            /**
-             * P Value
-             * @default 1
-             */
-            p_value: number;
-        };
-        /**
-         * AdminLLMEvalLookup
-         * @description A lookup the replay fed back from the live turn before the decision.
-         */
-        AdminLLMEvalLookup: {
-            /** Name */
-            name: string;
-            /** Arguments */
-            arguments?: {
-                [key: string]: unknown;
-            };
-            /**
-             * Result
-             * @default
-             */
-            result: string;
-            /**
-             * Is Error
-             * @default false
-             */
-            is_error: boolean;
-        };
-        /**
-         * AdminLLMEvalModelTotals
-         * @description Cost, cache, and latency totals for one model across a run.
-         */
-        AdminLLMEvalModelTotals: {
-            /**
-             * Provider
-             * @default
-             */
-            provider: string;
-            /**
-             * Model
-             * @default
-             */
-            model: string;
-            /**
-             * Input Tokens
-             * @default 0
-             */
-            input_tokens: number;
-            /**
-             * Output Tokens
-             * @default 0
-             */
-            output_tokens: number;
-            /**
-             * Cache Read Tokens
-             * @default 0
-             */
-            cache_read_tokens: number;
-            /**
-             * Cache Creation Tokens
-             * @default 0
-             */
-            cache_creation_tokens: number;
-            /**
-             * Cache Read Ratio
-             * @default 0
-             */
-            cache_read_ratio: number;
-            /**
-             * Cache Participation Ratio
-             * @default 0
-             */
-            cache_participation_ratio: number;
-            /**
-             * Total Cost Usd
-             * @default 0.000000
-             */
-            total_cost_usd: string;
-            /**
-             * Pricing Available
-             * @default true
-             */
-            pricing_available: boolean;
-            /**
-             * Pricing Unknown Reason
-             * @default
-             */
-            pricing_unknown_reason: string;
-            /**
-             * Latency P50 Ms
-             * @default 0
-             */
-            latency_p50_ms: number;
-            /**
-             * Latency P95 Ms
-             * @default 0
-             */
-            latency_p95_ms: number;
-        };
-        /**
-         * AdminLLMEvalReportResponse
-         * @description A run plus a page of its per-turn evidence, worst turns first.
-         */
-        AdminLLMEvalReportResponse: {
-            run: components["schemas"]["AdminLLMEvalRunItem"];
-            /** Turns */
-            turns: components["schemas"]["AdminLLMEvalTurn"][];
-            /**
-             * Total Turns
-             * @default 0
-             */
-            total_turns: number;
-        };
-        /**
-         * AdminLLMEvalRunCreate
-         * @description Request to replay a user's recent turns against a candidate model.
-         *
-         *     The baseline is not accepted from the client: it is resolved server-side
-         *     from the user's effective configuration (their subscription override, or
-         *     the global default), so a report can never compare against a model the
-         *     user was not actually on.
-         */
-        AdminLLMEvalRunCreate: {
-            /**
-             * Candidate Endpoint
-             * @default
-             */
-            candidate_endpoint: string;
-            /**
-             * Candidate Provider
-             * @default
-             */
-            candidate_provider: string;
-            /** Candidate Model */
-            candidate_model: string;
-            /**
-             * Baseline Reasoning Effort
-             * @default
-             */
-            baseline_reasoning_effort: ("none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "auto") | "";
-            /**
-             * Candidate Reasoning Effort
-             * @default
-             */
-            candidate_reasoning_effort: ("none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "auto") | "";
-            /**
-             * Sample Count
-             * @default 100
-             */
-            sample_count: number;
-            /**
-             * Judge Enabled
-             * @default true
-             */
-            judge_enabled: boolean;
-        };
-        /**
-         * AdminLLMEvalRunItem
-         * @description One run, without its per-turn evidence.
-         */
-        AdminLLMEvalRunItem: {
-            /** Id */
-            id: string;
-            /** User Id */
-            user_id: string;
-            /**
-             * User Email
-             * @default
-             */
-            user_email: string;
-            /**
-             * User Consented
-             * @default true
-             */
-            user_consented: boolean;
-            /**
-             * Baseline Endpoint
-             * @default
-             */
-            baseline_endpoint: string;
-            /** Baseline Provider */
-            baseline_provider: string;
-            /** Baseline Model */
-            baseline_model: string;
-            /**
-             * Baseline Reasoning Effort
-             * @default
-             */
-            baseline_reasoning_effort: string;
-            /**
-             * Candidate Endpoint
-             * @default
-             */
-            candidate_endpoint: string;
-            /** Candidate Provider */
-            candidate_provider: string;
-            /** Candidate Model */
-            candidate_model: string;
-            /**
-             * Candidate Reasoning Effort
-             * @default
-             */
-            candidate_reasoning_effort: string;
-            /** Judge Model */
-            judge_model: string;
-            /** Requested Samples */
-            requested_samples: number;
-            /** Status */
-            status: string;
-            /** Progress Completed */
-            progress_completed: number;
-            /** Progress Total */
-            progress_total: number;
-            /** Recommendation */
-            recommendation: string;
-            /** Error */
-            error: string;
-            /** Created At */
-            created_at: string;
-            /** Started At */
-            started_at?: string | null;
-            /** Completed At */
-            completed_at?: string | null;
-            summary?: components["schemas"]["AdminLLMEvalSummary"] | null;
-        };
-        /**
-         * AdminLLMEvalRunListResponse
-         * @description This user's runs, plus the bounds the run form has to respect.
-         *
-         *     ``max_samples`` is ``LLM_EVAL_MAX_SAMPLES``, which ``start_run`` enforces.
-         *     Without it on the wire the sample control can only guess, and a deployment
-         *     that lowers the setting gets a form offering values the API rejects.
-         *     ``min_turns_for_verdict`` is the floor below which a run reports
-         *     ``inconclusive`` rather than a pass, which is worth showing before someone
-         *     spends a run finding out.
-         */
-        AdminLLMEvalRunListResponse: {
-            /** Runs */
-            runs: components["schemas"]["AdminLLMEvalRunItem"][];
-            /** Total */
-            total: number;
-            /** Max Samples */
-            max_samples: number;
-            /** Min Turns For Verdict */
-            min_turns_for_verdict: number;
-            /** Max Page Size */
-            max_page_size: number;
-        };
-        /**
-         * AdminLLMEvalRunProgress
-         * @description Just enough to answer "is it done yet".
-         *
-         *     Carries no conversation content and no per-turn evidence, which is what
-         *     lets the console poll it without writing an audit row every two seconds
-         *     for a single human read.
-         */
-        AdminLLMEvalRunProgress: {
-            /** Id */
-            id: string;
-            /** Status */
-            status: string;
-            /** Progress Completed */
-            progress_completed: number;
-            /** Progress Total */
-            progress_total: number;
-            /** Recommendation */
-            recommendation: string;
-        };
-        /** AdminLLMEvalSafetyIssue */
-        AdminLLMEvalSafetyIssue: {
-            /** Finding */
-            finding: string;
-            /**
-             * Tool Name
-             * @default
-             */
-            tool_name: string;
-            /**
-             * Detail
-             * @default
-             */
-            detail: string;
-            /**
-             * Blocking
-             * @default true
-             */
-            blocking: boolean;
-            /**
-             * Side
-             * @default candidate
-             * @enum {string}
-             */
-            side: "baseline" | "candidate";
-        };
-        /**
-         * AdminLLMEvalSideComparison
-         * @description How often each model had something, over the turns both answered.
-         */
-        AdminLLMEvalSideComparison: {
-            /**
-             * Candidate Turns
-             * @default 0
-             */
-            candidate_turns: number;
-            /**
-             * Baseline Turns
-             * @default 0
-             */
-            baseline_turns: number;
-            /**
-             * Candidate Only
-             * @default 0
-             */
-            candidate_only: number;
-            /**
-             * Baseline Only
-             * @default 0
-             */
-            baseline_only: number;
-            /**
-             * P Value
-             * @default 1
-             */
-            p_value: number;
-        };
-        /**
-         * AdminLLMEvalSummary
-         * @description The frozen aggregate stored on the run when it completed.
-         */
-        AdminLLMEvalSummary: {
-            /**
-             * Turns Total
-             * @default 0
-             */
-            turns_total: number;
-            /**
-             * Turns Completed
-             * @default 0
-             */
-            turns_completed: number;
-            /**
-             * Turns Failed
-             * @default 0
-             */
-            turns_failed: number;
-            /** Agreement Counts */
-            agreement_counts?: {
-                [key: string]: number;
-            };
-            /** Safety Counts */
-            safety_counts?: {
-                [key: string]: number;
-            };
-            /** Baseline Safety Counts */
-            baseline_safety_counts?: {
-                [key: string]: number;
-            } | null;
-            /**
-             * Blocking Findings
-             * @default 0
-             */
-            blocking_findings: number;
-            safety_comparison?: components["schemas"]["AdminLLMEvalSideComparison"] | null;
-            fabricated_id_comparison?: components["schemas"]["AdminLLMEvalSideComparison"] | null;
-            /** Judge Counts */
-            judge_counts?: {
-                [key: string]: number;
-            };
-            /** Judge Skip Counts */
-            judge_skip_counts?: {
-                [key: string]: number;
-            };
-            judge_preference?: components["schemas"]["AdminLLMEvalJudgePreference"] | null;
-            /**
-             * Identical Rate
-             * @default 0
-             */
-            identical_rate: number;
-            /**
-             * Divergence Rate
-             * @default 0
-             */
-            divergence_rate: number;
-            /** Divergence Noise Floor */
-            divergence_noise_floor?: number | null;
-            /** Divergence Threshold */
-            divergence_threshold?: number | null;
-            /**
-             * Silent Noop Rate
-             * @default 0
-             */
-            silent_noop_rate: number;
-            /** Silent Noop Blocking Rate */
-            silent_noop_blocking_rate?: number | null;
-            baseline?: components["schemas"]["AdminLLMEvalModelTotals"];
-            candidate?: components["schemas"]["AdminLLMEvalModelTotals"];
-            /**
-             * Recommendation
-             * @default
-             */
-            recommendation: string;
-            /** Reasons */
-            reasons?: string[];
-            /** Warnings */
-            warnings?: string[];
-        };
-        /** AdminLLMEvalToolCall */
-        AdminLLMEvalToolCall: {
-            /** Name */
-            name: string;
-            /** Arguments */
-            arguments?: {
-                [key: string]: unknown;
-            };
-        };
-        /**
-         * AdminLLMEvalTurn
-         * @description One replayed turn: the user's message and both models' decisions.
-         *
-         *     ``historic_reply`` and ``historic_tool_names`` are what the agent actually
-         *     did for this turn when it happened. They are shown alongside, not scored:
-         *     that turn ran against an older system prompt and an older tool set, so it
-         *     is context for a human reading the diff rather than a third contestant.
-         */
-        AdminLLMEvalTurn: {
-            /** Message Seq */
-            message_seq: number;
-            /** Message Timestamp */
-            message_timestamp: string;
-            /** User Message */
-            user_message: string;
-            /**
-             * Historic Reply
-             * @default
-             */
-            historic_reply: string;
-            /** Historic Tool Names */
-            historic_tool_names?: string[];
-            baseline: components["schemas"]["AdminLLMEvalDecision"];
-            candidate: components["schemas"]["AdminLLMEvalDecision"];
-            /** Agreement */
-            agreement: string;
-            /** Safety Issues */
-            safety_issues?: components["schemas"]["AdminLLMEvalSafetyIssue"][];
-            /**
-             * Judge Verdict
-             * @default not_judged
-             */
-            judge_verdict: string;
-            /**
-             * Judge Rationale
-             * @default
-             */
-            judge_rationale: string;
-            /**
-             * Judge Skip Reason
-             * @default
-             */
-            judge_skip_reason: string;
-        };
-        /**
          * AdminLLMModelsResponse
          * @description Structured result of an ``alist_models`` call, with failure context.
          *
@@ -4364,6 +3830,294 @@ export interface components {
             event_id: number | null;
             /** Previous Event Id */
             previous_event_id?: number | null;
+        };
+        /** ComparisonFinding */
+        ComparisonFinding: {
+            /** Finding */
+            finding: string;
+            /** Tool Name */
+            tool_name: string;
+            /** Detail */
+            detail: string;
+            /** Violation */
+            violation: boolean;
+            /**
+             * Side
+             * @enum {string}
+             */
+            side: "production" | "candidate";
+        };
+        /**
+         * ComparisonModelTotals
+         * @description Token, cost, and latency totals for the candidate across a run.
+         */
+        ComparisonModelTotals: {
+            /** Provider */
+            provider: string;
+            /** Model */
+            model: string;
+            /** Input Tokens */
+            input_tokens: number;
+            /** Output Tokens */
+            output_tokens: number;
+            /** Cache Read Tokens */
+            cache_read_tokens: number;
+            /** Cache Creation Tokens */
+            cache_creation_tokens: number;
+            /** Billed Prompt Tokens */
+            billed_prompt_tokens: number;
+            /** Total Cost Usd */
+            total_cost_usd: string | null;
+            /** Cost Unavailable Reason */
+            cost_unavailable_reason: string;
+            /** Latency P50 Ms */
+            latency_p50_ms: number;
+            /** Latency P95 Ms */
+            latency_p95_ms: number;
+        };
+        /**
+         * ComparisonReportResponse
+         * @description A run plus a page of its turns, the ones worth reading first.
+         */
+        ComparisonReportResponse: {
+            run: components["schemas"]["ComparisonRunItem"];
+            /** Turns */
+            turns: components["schemas"]["ComparisonTurnItem"][];
+            /** Total Turns */
+            total_turns: number;
+        };
+        /**
+         * ComparisonRunCreate
+         * @description Request to replay a user's recent turns through a candidate model.
+         *
+         *     The baseline is not accepted from the client and is not a model at all:
+         *     it is what production actually did, read back from the user's transcript.
+         *     The run records the user's current model as a label so the report says
+         *     what the candidate was being considered against.
+         */
+        ComparisonRunCreate: {
+            /**
+             * Candidate Endpoint
+             * @default
+             */
+            candidate_endpoint: string;
+            /**
+             * Candidate Provider
+             * @default
+             */
+            candidate_provider: string;
+            /** Candidate Model */
+            candidate_model: string;
+            /**
+             * Candidate Reasoning Effort
+             * @default
+             */
+            candidate_reasoning_effort: ("none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "auto") | "";
+            /**
+             * Sample Count
+             * @default 50
+             */
+            sample_count: number;
+        };
+        /**
+         * ComparisonRunItem
+         * @description One run, without its per-turn evidence.
+         */
+        ComparisonRunItem: {
+            /** Id */
+            id: string;
+            /** User Id */
+            user_id: string;
+            /** User Email */
+            user_email: string;
+            /** User Consented */
+            user_consented: boolean;
+            /** Incumbent Endpoint */
+            incumbent_endpoint: string;
+            /** Incumbent Provider */
+            incumbent_provider: string;
+            /** Incumbent Model */
+            incumbent_model: string;
+            /** Candidate Endpoint */
+            candidate_endpoint: string;
+            /** Candidate Provider */
+            candidate_provider: string;
+            /** Candidate Model */
+            candidate_model: string;
+            /** Candidate Reasoning Effort */
+            candidate_reasoning_effort: string;
+            /** Requested Samples */
+            requested_samples: number;
+            /** Status */
+            status: string;
+            /** Progress Completed */
+            progress_completed: number;
+            /** Progress Total */
+            progress_total: number;
+            /** Error */
+            error: string;
+            /** Created At */
+            created_at: string;
+            /** Started At */
+            started_at: string | null;
+            /** Completed At */
+            completed_at: string | null;
+            summary: components["schemas"]["ComparisonSummary"] | null;
+        };
+        /**
+         * ComparisonRunListResponse
+         * @description Runs, plus the bounds the start form has to respect.
+         *
+         *     ``max_samples`` is ``MODEL_COMPARISON_MAX_SAMPLES``, which ``start_run``
+         *     enforces. Without it on the wire the sample control can only guess, and a
+         *     deployment that lowers the setting gets a form offering values the API
+         *     rejects.
+         */
+        ComparisonRunListResponse: {
+            /** Runs */
+            runs: components["schemas"]["ComparisonRunItem"][];
+            /** Total */
+            total: number;
+            /** Max Samples */
+            max_samples: number;
+            /** Max Page Size */
+            max_page_size: number;
+        };
+        /**
+         * ComparisonRunProgress
+         * @description Just enough to answer "is it done yet".
+         *
+         *     Carries no conversation content and no per-turn evidence, which is what
+         *     lets the console poll it without writing an audit row every two seconds
+         *     for a single human read.
+         */
+        ComparisonRunProgress: {
+            /** Id */
+            id: string;
+            /** Status */
+            status: string;
+            /** Progress Completed */
+            progress_completed: number;
+            /** Progress Total */
+            progress_total: number;
+        };
+        /**
+         * ComparisonSummary
+         * @description The frozen summary stored on the run when it finished.
+         *
+         *     Counts and totals. A reader who wants a recommendation reads the turns.
+         */
+        ComparisonSummary: {
+            /** Turns Total */
+            turns_total: number;
+            /** Turns Replayed */
+            turns_replayed: number;
+            /** Turns Failed */
+            turns_failed: number;
+            /** Outcome Counts */
+            outcome_counts: {
+                [key: string]: number;
+            };
+            /** Candidate Findings */
+            candidate_findings: {
+                [key: string]: number;
+            };
+            /** Production Findings */
+            production_findings: {
+                [key: string]: number;
+            };
+            /** Candidate Violations */
+            candidate_violations: number;
+            /** Production Violations */
+            production_violations: number;
+            /** Production Checked Findings */
+            production_checked_findings: string[];
+            /** Writes Total */
+            writes_total: number;
+            /** Writes Matched */
+            writes_matched: number;
+            /** Writes Args Differ */
+            writes_args_differ: number;
+            /** Writes Missed */
+            writes_missed: number;
+            /** Write Match Rate */
+            write_match_rate: number;
+            candidate: components["schemas"]["ComparisonModelTotals"];
+            /** Notes */
+            notes: string[];
+        };
+        /** ComparisonToolCall */
+        ComparisonToolCall: {
+            /** Name */
+            name: string;
+            /** Arguments */
+            arguments: {
+                [key: string]: unknown;
+            };
+            /** Result */
+            result: string;
+            /** Is Error */
+            is_error: boolean;
+        };
+        /**
+         * ComparisonTurnItem
+         * @description One replayed turn, production's decision beside the candidate's.
+         */
+        ComparisonTurnItem: {
+            /** Message Seq */
+            message_seq: number;
+            /** Message Timestamp */
+            message_timestamp: string;
+            /** User Message */
+            user_message: string;
+            /** Production Reply */
+            production_reply: string;
+            /** Production Tool Calls */
+            production_tool_calls: components["schemas"]["ComparisonToolCall"][];
+            /** Candidate Text */
+            candidate_text: string;
+            /** Candidate Tool Calls */
+            candidate_tool_calls: components["schemas"]["ComparisonToolCall"][];
+            /** Candidate Replayed Lookups */
+            candidate_replayed_lookups: components["schemas"]["ComparisonToolCall"][];
+            /** Candidate Stop Reason */
+            candidate_stop_reason: string;
+            /** Candidate Input Tokens */
+            candidate_input_tokens: number;
+            /** Candidate Output Tokens */
+            candidate_output_tokens: number;
+            /** Candidate Cache Read Tokens */
+            candidate_cache_read_tokens: number;
+            /** Candidate Cache Creation Tokens */
+            candidate_cache_creation_tokens: number;
+            /** Candidate Latency Ms */
+            candidate_latency_ms: number;
+            /** Candidate Error */
+            candidate_error: string;
+            /** Outcome */
+            outcome: string;
+            /** Writes */
+            writes: components["schemas"]["ComparisonWrite"][];
+            /** Findings */
+            findings: components["schemas"]["ComparisonFinding"][];
+        };
+        /**
+         * ComparisonWrite
+         * @description One write the live turn made, and what the candidate did about it.
+         */
+        ComparisonWrite: {
+            /** Tool Name */
+            tool_name: string;
+            /** Outcome */
+            outcome: string;
+            /** Key Arguments */
+            key_arguments: {
+                [key: string]: unknown;
+            };
+            /** Candidate Arguments */
+            candidate_arguments: {
+                [key: string]: unknown;
+            } | null;
         };
         /**
          * DataSharingConsentRequest
@@ -9023,7 +8777,7 @@ export interface operations {
             };
         };
     };
-    start_run_api_admin_llm_eval_users__user_id__runs_post: {
+    start_run_api_admin_model_comparison_users__user_id__runs_post: {
         parameters: {
             query?: never;
             header?: never;
@@ -9034,7 +8788,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["AdminLLMEvalRunCreate"];
+                "application/json": components["schemas"]["ComparisonRunCreate"];
             };
         };
         responses: {
@@ -9044,7 +8798,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["AdminLLMEvalRunItem"];
+                    "application/json": components["schemas"]["ComparisonRunItem"];
                 };
             };
             /** @description Validation Error */
@@ -9058,7 +8812,7 @@ export interface operations {
             };
         };
     };
-    list_runs_api_admin_llm_eval_runs_get: {
+    list_runs_api_admin_model_comparison_runs_get: {
         parameters: {
             query?: {
                 user_id?: string | null;
@@ -9077,7 +8831,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["AdminLLMEvalRunListResponse"];
+                    "application/json": components["schemas"]["ComparisonRunListResponse"];
                 };
             };
             /** @description Validation Error */
@@ -9091,7 +8845,7 @@ export interface operations {
             };
         };
     };
-    get_report_api_admin_llm_eval_runs__run_id__get: {
+    get_report_api_admin_model_comparison_runs__run_id__get: {
         parameters: {
             query?: {
                 limit?: number;
@@ -9111,7 +8865,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["AdminLLMEvalReportResponse"];
+                    "application/json": components["schemas"]["ComparisonReportResponse"];
                 };
             };
             /** @description Validation Error */
@@ -9125,7 +8879,7 @@ export interface operations {
             };
         };
     };
-    delete_run_api_admin_llm_eval_runs__run_id__delete: {
+    delete_run_api_admin_model_comparison_runs__run_id__delete: {
         parameters: {
             query?: never;
             header?: never;
@@ -9154,7 +8908,7 @@ export interface operations {
             };
         };
     };
-    get_run_progress_api_admin_llm_eval_runs__run_id__progress_get: {
+    get_run_progress_api_admin_model_comparison_runs__run_id__progress_get: {
         parameters: {
             query?: never;
             header?: never;
@@ -9171,7 +8925,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["AdminLLMEvalRunProgress"];
+                    "application/json": components["schemas"]["ComparisonRunProgress"];
                 };
             };
             /** @description Validation Error */
@@ -9185,7 +8939,7 @@ export interface operations {
             };
         };
     };
-    cancel_run_api_admin_llm_eval_runs__run_id__cancel_post: {
+    cancel_run_api_admin_model_comparison_runs__run_id__cancel_post: {
         parameters: {
             query?: never;
             header?: never;
@@ -9202,7 +8956,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["AdminLLMEvalRunItem"];
+                    "application/json": components["schemas"]["ComparisonRunItem"];
                 };
             };
             /** @description Validation Error */

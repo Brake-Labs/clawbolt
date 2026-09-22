@@ -1,14 +1,13 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import {
-  deleteEvalRun,
+  deleteComparisonRun,
   getAdminUsers,
-  getEvalRunProgress,
-  listEvalRuns,
-  startEvalRun,
+  getComparisonProgress,
+  listComparisonRuns,
+  startComparisonRun,
   type AdminUser,
-  type EvalRecommendation,
-  type EvalRun,
+  type ComparisonRun,
 } from '../admin-api';
 import ConfirmDialog from '../ConfirmDialog';
 import {
@@ -19,49 +18,56 @@ import {
 } from '../llm-picker';
 import { formatRelative } from '../format';
 import { adminPath } from '../nav-items';
-import { ACTIVE_STATUSES, POLL_MS, RECOMMENDATION_COPY } from './model-eval-common';
+import { ACTIVE_STATUSES, POLL_MS } from './model-comparison-common';
 
-// Model comparison: "can I move this user to a different model without
-// breaking them". A run replays the user's own recent turns through their
-// current model and a candidate and records what each decided.
+// Model comparison: "what would change if I moved this user to this model".
+// A run replays the user's own recent turns through the candidate and records
+// what it decided beside what production actually did.
 //
 // This page starts runs and lists them. A run's evidence lives at its own URL
-// (``model-eval/<public id>``, rendered by ``model-eval-report.tsx``), because
-// a report is read long after the run that produced it and is often read by
-// someone who did not start it.
+// (``model-comparison/<public id>``, rendered by
+// ``model-comparison-report.tsx``), because a report is read long after the
+// run that produced it and often by someone who did not start it.
 //
-// Only users who opted into data sharing can be evaluated: a run reads their
+// Only users who opted into data sharing can be compared: a run reads their
 // real conversations and the report renders them back. The picker is filtered
 // to consenting users so the 403 is never reachable from the UI.
 
-// Slider bounds. The ceiling comes from the API (LLM_EVAL_MAX_SAMPLES), so a
-// deployment that lowers the setting cannot be offered a value start_run would
-// reject. These constants are the fallback until the first list call answers,
-// plus the floor and step, which are the UI's own.
+// Slider bounds. The ceiling comes from the API
+// (MODEL_COMPARISON_MAX_SAMPLES), so a deployment that lowers the setting
+// cannot be offered a value start_run would reject. These constants are the
+// fallback until the first list call answers, plus the floor and step, which
+// are the UI's own.
 const SAMPLE_MIN = 5;
 const SAMPLE_STEP = 5;
 const SAMPLE_MAX_FALLBACK = 200;
-const SAMPLE_DEFAULT = 100;
+const SAMPLE_DEFAULT = 50;
 
 // Rows per page in the run table. Each row is one run's metadata, so this is
 // about scanning, not cost.
 const RUN_PAGE_SIZE = 25;
 
-
-// ---------------------------------------------------------------------------
-// Row pieces, shared by the two layouts
-// ---------------------------------------------------------------------------
-
-/** The run's verdict, or *empty* when it has none.
+/** A settled run's headline numbers, or *empty* while it has none.
  *
- * The table passes a dash: a blank cell in a column of pills reads as a
- * rendering fault. A card has no column to keep aligned, so it passes
- * nothing and lets the status line carry "running" or "cancelled".
+ * Two numbers and no verdict, which is the whole point: hard safety
+ * violations on each side, and how many of production's writes the candidate
+ * reached. A reader who wants more opens the report.
  */
-function VerdictPill({ run, empty = null }: { run: EvalRun; empty?: ReactNode }) {
-  const copy = RECOMMENDATION_COPY[run.recommendation as EvalRecommendation];
-  if (!copy) return <>{empty}</>;
-  return <span className={`rounded-full px-2 py-0.5 text-xs ${copy.className}`}>{copy.label}</span>;
+function RunHeadline({ run }: { run: ComparisonRun }) {
+  const summary = run.summary;
+  if (!summary) return <span className="text-muted-foreground">-</span>;
+  return (
+    <span className="whitespace-nowrap text-xs text-muted-foreground">
+      <span className={summary.candidate_violations ? 'text-error-text' : ''}>
+        {summary.candidate_violations}
+      </span>
+      {' / '}
+      {summary.production_violations} violations
+      {summary.writes_total > 0
+        ? ` | ${summary.writes_matched}/${summary.writes_total} writes`
+        : ''}
+    </span>
+  );
 }
 
 /** Withheld while the run is in flight, since the API refuses to delete an
@@ -71,7 +77,13 @@ function VerdictPill({ run, empty = null }: { run: EvalRun; empty?: ReactNode })
  * its report can no longer be opened, which makes it the row most worth
  * clearing out.
  */
-function DeleteRunButton({ run, onPick }: { run: EvalRun; onPick: (run: EvalRun) => void }) {
+function DeleteRunButton({
+  run,
+  onPick,
+}: {
+  run: ComparisonRun;
+  onPick: (run: ComparisonRun) => void;
+}) {
   if (ACTIVE_STATUSES.has(run.status)) return null;
   return (
     <button
@@ -96,7 +108,7 @@ function DeleteRunButton({ run, onPick }: { run: EvalRun; onPick: (run: EvalRun)
 // Page
 // ---------------------------------------------------------------------------
 
-export default function ModelEvalTab() {
+export default function ModelComparisonTab() {
   const navigate = useNavigate();
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [usersLoading, setUsersLoading] = useState(true);
@@ -106,10 +118,8 @@ export default function ModelEvalTab() {
   const [provider, setProvider] = useState('');
   const [model, setModel] = useState('');
   // Empty means "whatever the deployment runs at", which the API resolves and
-  // freezes onto the run. The two sides are separate because effort does not
-  // mean the same thing to two model families, and an endpoint that spells
-  // reasoning differently can reject the other side's spelling outright.
-  const [baselineEffort, setBaselineEffort] = useState('');
+  // freezes onto the run. Only the candidate has one: nothing is sent to the
+  // incumbent, so there is no second effort to set.
   const [candidateEffort, setCandidateEffort] = useState('');
   const [sampleCount, setSampleCount] = useState(SAMPLE_DEFAULT);
   const [sampleMax, setSampleMax] = useState(SAMPLE_MAX_FALLBACK);
@@ -117,10 +127,8 @@ export default function ModelEvalTab() {
   // poll closes over ``runsShown`` every later tick fails too, so the table
   // stops updating rather than merely stopping growing.
   const [pageMax, setPageMax] = useState(RUN_PAGE_SIZE);
-  const [minTurnsForVerdict, setMinTurnsForVerdict] = useState(0);
-  const [judgeEnabled, setJudgeEnabled] = useState(true);
 
-  const [runs, setRuns] = useState<EvalRun[]>([]);
+  const [runs, setRuns] = useState<ComparisonRun[]>([]);
   const [runTotal, setRunTotal] = useState(0);
   const [runsShown, setRunsShown] = useState(RUN_PAGE_SIZE);
 
@@ -130,10 +138,10 @@ export default function ModelEvalTab() {
   // The run the confirm dialog is asking about, or null when it is closed.
   // Holding the row rather than a bare id lets the dialog name what it is
   // about to destroy, which is the only thing making the gate meaningful.
-  const [deleteTarget, setDeleteTarget] = useState<EvalRun | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<ComparisonRun | null>(null);
   const [deleting, setDeleting] = useState(false);
 
-  // Only consenting users are evaluable, so the picker never offers a user
+  // Only consenting users can be compared, so the picker never offers a user
   // whose run would 403.
   useEffect(() => {
     setUsersLoading(true);
@@ -144,15 +152,14 @@ export default function ModelEvalTab() {
   }, []);
 
   // Unfiltered when no user is picked: the table's job is answering "what has
-  // been evaluated lately" so a run can be found again without remembering
+  // been compared lately" so a run can be found again without remembering
   // whose it was. Picking a user in the form above narrows it.
   const refreshRuns = useCallback(async (id: string, limit: number) => {
     try {
-      const list = await listEvalRuns({ userId: id || undefined, limit });
+      const list = await listComparisonRuns({ userId: id || undefined, limit });
       setRuns(list.runs);
       setRunTotal(list.total);
       setSampleMax(list.max_samples);
-      setMinTurnsForVerdict(list.min_turns_for_verdict);
       setPageMax(list.max_page_size);
       // A cap below the current selection would leave the thumb pinned past
       // the end of its own track and start a run the API rejects.
@@ -168,10 +175,7 @@ export default function ModelEvalTab() {
 
   // Scoped to the selected user on purpose. ``start_run`` allows one active
   // run per user, so another tenant's run in the unfiltered list must not
-  // disable this form. With no user picked there is no run to speak for:
-  // ``!userId`` here used to match any active row, which is the opposite of
-  // what this comment promises, and put another tenant's progress bar under
-  // the words "already running for this user".
+  // disable this form. With no user picked there is no run to speak for.
   const activeRun = userId
     ? runs.find(r => ACTIVE_STATUSES.has(r.status) && r.user_id === userId)
     : undefined;
@@ -181,9 +185,8 @@ export default function ModelEvalTab() {
   // and the interval clears itself rather than polling a finished run forever.
   //
   // The counters come from the unaudited progress endpoint. Re-reading the
-  // whole list every two seconds wrote a ``view_llm_eval_runs`` audit row per
-  // tick, so a long run left open in a tab buried a single human read under
-  // hundreds of them.
+  // whole list every two seconds wrote an audit row per tick, so a long run
+  // left open in a tab buried a single human read under hundreds of them.
   const activeRunId = activeRun?.id ?? null;
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   useEffect(() => {
@@ -192,7 +195,7 @@ export default function ModelEvalTab() {
     pollRef.current = setInterval(() => {
       void (async () => {
         try {
-          const progress = await getEvalRunProgress(activeRunId);
+          const progress = await getComparisonProgress(activeRunId);
           setRuns(prev =>
             prev.map(r =>
               r.id === activeRunId
@@ -201,13 +204,12 @@ export default function ModelEvalTab() {
                     status: progress.status,
                     progress_completed: progress.progress_completed,
                     progress_total: progress.progress_total,
-                    recommendation: progress.recommendation,
                   }
                 : r,
             ),
           );
           if (!ACTIVE_STATUSES.has(progress.status)) {
-            // Settled: the row now has a summary and a verdict worth reading.
+            // Settled: the row now has a summary worth reading.
             await refreshRuns(userId, runsShown);
           }
         } catch {
@@ -224,17 +226,15 @@ export default function ModelEvalTab() {
     setError(null);
     setStarting(true);
     try {
-      const run = await startEvalRun(userId, {
+      const run = await startComparisonRun(userId, {
         candidateEndpoint: endpoint,
         candidateProvider: provider,
         candidateModel: model,
-        baselineReasoningEffort: baselineEffort,
         candidateReasoningEffort: candidateEffort,
         sampleCount,
-        judgeEnabled,
       });
       setRuns(prev => [run, ...prev]);
-      navigate(`${adminPath('model-eval')}/${run.id}`);
+      navigate(`${adminPath('model-comparison')}/${run.id}`);
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -246,7 +246,7 @@ export default function ModelEvalTab() {
     if (!deleteTarget) return;
     setDeleting(true);
     try {
-      await deleteEvalRun(deleteTarget.id);
+      await deleteComparisonRun(deleteTarget.id);
       // Drop the row locally rather than refetching: the list may be paged
       // several clicks deep and a reload would snap it back to the first page.
       setRuns(prev => prev.filter(r => r.id !== deleteTarget.id));
@@ -265,8 +265,7 @@ export default function ModelEvalTab() {
 
   // An endpoint carries its own dialect, so it is a complete destination on
   // its own; without one a provider is still required to have any.
-  const canStart =
-    Boolean(userId && (endpoint || provider) && model) && !starting && !activeRun;
+  const canStart = Boolean(userId && (endpoint || provider) && model) && !starting && !activeRun;
 
   return (
     <div className="space-y-6">
@@ -367,33 +366,12 @@ export default function ModelEvalTab() {
               // and it buys nothing here.
               className="mt-1 w-full cursor-pointer accent-primary"
             />
-            {/* Endpoints only, with the middle left empty until there is
-                something worth saying there: in a four-column grid this cell
-                is narrow, and a permanent hint between the bounds wraps and
-                crowds them. */}
             <span className="mt-1 flex items-baseline justify-between gap-2 text-xs text-muted-foreground">
               <span>{SAMPLE_MIN}</span>
-              {minTurnsForVerdict > 0 && sampleCount < minTurnsForVerdict ? (
-                <span className="text-warning-text">
-                  Under {minTurnsForVerdict} reports inconclusive
-                </span>
-              ) : null}
               <span>{sampleMax}</span>
             </span>
           </label>
-        </div>
 
-        <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
-          <label className="block">
-            <span className="mb-1 block text-sm text-muted-foreground">
-              Incumbent reasoning effort
-            </span>
-            <ReasoningEffortSelect
-              value={baselineEffort}
-              onChange={setBaselineEffort}
-              inheritLabel="Deployment default"
-            />
-          </label>
           <label className="block">
             <span className="mb-1 block text-sm text-muted-foreground">
               Candidate reasoning effort
@@ -405,38 +383,27 @@ export default function ModelEvalTab() {
             />
           </label>
         </div>
-        <p className="mt-2 text-xs text-muted-foreground">
-          Set these separately when the two models disagree about what effort means. Whatever a run
-          used is recorded on it, so two reports stay comparable.
-        </p>
 
         <div className="mt-4 flex flex-wrap items-center gap-4">
-          <label className="flex items-center gap-2 text-sm text-muted-foreground">
-            <input
-              type="checkbox"
-              checked={judgeEnabled}
-              onChange={e => setJudgeEnabled(e.target.checked)}
-            />
-            Adjudicate divergences with the incumbent model
-          </label>
           <button
             type="button"
             onClick={() => void handleStart()}
             disabled={!canStart}
             className="rounded-[--radius-md] bg-primary px-4 py-2 text-sm font-medium text-primary-foreground disabled:opacity-50"
           >
-            {starting ? 'Starting...' : 'Run analysis'}
+            {starting ? 'Starting...' : 'Run comparison'}
           </button>
           {activeRun ? (
             <span className="text-sm text-muted-foreground">
-              An evaluation is already running for this user.
+              A comparison is already running for this user.
             </span>
           ) : null}
         </div>
         <p className="mt-3 text-xs text-muted-foreground">
-          Each turn is sent to both models and no tool is ever executed, so a run cannot message
-          anyone or change any record. Replays use the current system prompt and tool set, not the
-          ones in force when the turn happened.
+          Only the candidate is called. What the report compares it with is what production
+          actually did, read back from the transcript. No tool is ever executed, so a run cannot
+          message anyone or change any record. Replays use the current system prompt and tool set,
+          not the ones in force when the turn happened.
         </p>
       </section>
 
@@ -448,10 +415,10 @@ export default function ModelEvalTab() {
           <div className="flex flex-col items-start gap-2 sm:flex-row sm:items-center sm:justify-between">
             <p className="min-w-0 break-words text-sm text-foreground">
               Replaying {activeRun.progress_completed} of {activeRun.progress_total || '?'} turns
-              against {activeRun.candidate_model}
+              through {activeRun.candidate_model}
             </p>
             <Link
-              to={`${adminPath('model-eval')}/${activeRun.id}`}
+              to={`${adminPath('model-comparison')}/${activeRun.id}`}
               className="shrink-0 rounded-[--radius-md] border border-border px-3 py-1 text-sm text-muted-foreground"
             >
               Open report
@@ -476,7 +443,7 @@ export default function ModelEvalTab() {
       <section className="rounded-[--radius-lg] border border-border bg-card">
         <div className="flex flex-wrap items-baseline justify-between gap-2 border-b border-border p-3">
           <h3 className="text-sm font-semibold text-foreground">
-            {userId ? 'Runs for this user' : 'Recent evaluations'}
+            {userId ? 'Runs for this user' : 'Recent comparisons'}
           </h3>
           <p className="text-xs text-muted-foreground">
             {runTotal > runs.length
@@ -487,37 +454,26 @@ export default function ModelEvalTab() {
         {runs.length === 0 ? (
           <p className="p-3 text-sm text-muted-foreground">
             {userId
-              ? 'No evaluations for this user yet.'
-              : 'No evaluations yet. Pick a user above to run the first one.'}
+              ? 'No comparisons for this user yet.'
+              : 'No comparisons yet. Pick a user above to run the first one.'}
           </p>
         ) : (
           <>
-            {/* Cards up to the width where the table below fits. Eight
-                columns of it measure 990px, and the sidebar leaves 750px at
-                1024px of viewport, so the switch is ``xl``: anything narrower
-                showed Started and User and hid the verdict and the delete
-                control behind a sideways scroll inside the card, which is the
-                same complaint on a laptop as on a phone. Two-up from ``sm``,
-                since one column of cards across a 1200px window is mostly
-                empty space.
-
-                Both layouts sit in the DOM and CSS picks one. Choosing in JS
-                would need a media query, which is only readable after mount,
-                so the first paint would show the wrong one and then jump. */}
+            {/* Cards up to the width where the table below fits. Both layouts
+                sit in the DOM and CSS picks one. Choosing in JS would need a
+                media query, which is only readable after mount, so the first
+                paint would show the wrong one and then jump. */}
             <ul
-              aria-label="Evaluation runs"
+              aria-label="Comparison runs"
               // ``grid-cols-1`` is not redundant. Without an explicit track
               // the single implicit column is sized to max-content, and the
               // card's nowrap user line then sets the card's width instead of
               // the reverse: ``truncate`` never fires, the card grows past
-              // the viewport, and the delete control ends up off-screen. At
-              // 320px with a 47-character email that was a 420px card in a
-              // 320px window. ``main`` absorbs the overflow, so the document
-              // width stays honest and only the scroller shows it.
+              // the viewport, and the delete control ends up off-screen.
               className="grid grid-cols-1 gap-2 p-3 sm:grid-cols-2 xl:hidden"
             >
               {runs.map(run => {
-                const href = `${adminPath('model-eval')}/${run.id}`;
+                const href = `${adminPath('model-comparison')}/${run.id}`;
                 return (
                   <li
                     key={run.id}
@@ -544,7 +500,7 @@ export default function ModelEvalTab() {
                           {formatRelative(run.created_at)}
                         </span>
                       )}
-                      <VerdictPill run={run} />
+                      <RunHeadline run={run} />
                     </div>
                     {/* ``break-all`` rather than a truncation: a
                         gateway-qualified model id is one unbroken 40-character
@@ -554,7 +510,7 @@ export default function ModelEvalTab() {
                       {run.candidate_model}
                     </p>
                     <p className="break-all font-mono text-xs text-muted-foreground">
-                      against {run.baseline_model}
+                      user is on {run.incumbent_model || 'an unrecorded model'}
                     </p>
                     <div className="flex items-end justify-between gap-2">
                       <div className="min-w-0 text-xs text-muted-foreground">
@@ -584,13 +540,7 @@ export default function ModelEvalTab() {
                 the far edge of the table, and stretches the document to
                 match, at which point the browser renders the whole page
                 zoomed out to fit. Nothing else about the page looks wrong,
-                which is what made it hard to find.
-
-                It still matters at the widths this table is shown at, not
-                only at the phone widths that first surfaced it: whenever the
-                table exceeds this scroller, dropping the class stretches the
-                document. Measured at 1280px with a long user email, where the
-                table wants 1112px in a 1006px box. */}
+                which is what made it hard to find. */}
             <div className="relative hidden overflow-x-auto xl:block">
               <table className="w-full text-sm">
                 <thead>
@@ -598,10 +548,10 @@ export default function ModelEvalTab() {
                     <th className="p-3">Started</th>
                     {userId ? null : <th className="p-3">User</th>}
                     <th className="p-3">Candidate</th>
-                    <th className="p-3">Incumbent</th>
+                    <th className="p-3">User is on</th>
                     <th className="p-3">Turns</th>
                     <th className="p-3">Status</th>
-                    <th className="p-3">Verdict</th>
+                    <th className="p-3">Candidate / production</th>
                     <th className="p-3">
                       <span className="sr-only">Actions</span>
                     </th>
@@ -609,7 +559,7 @@ export default function ModelEvalTab() {
                 </thead>
                 <tbody>
                   {runs.map(run => {
-                    const href = `${adminPath('model-eval')}/${run.id}`;
+                    const href = `${adminPath('model-comparison')}/${run.id}`;
                     return (
                       <tr
                         key={run.id}
@@ -647,15 +597,13 @@ export default function ModelEvalTab() {
                         )}
                         {/* Wrapping, unlike every other column. A
                             gateway-qualified model id runs past 40 characters
-                            and two of them held on one line pushed Verdict
-                            and the delete control off the right edge of the
-                            card at 1440px, where the only way to reach them
-                            was to scroll the table sideways. */}
+                            and two of them held on one line pushed the
+                            rightmost columns off the edge of the card. */}
                         <td className="break-all p-3 font-mono text-xs text-foreground">
                           {run.candidate_model}
                         </td>
                         <td className="break-all p-3 font-mono text-xs text-muted-foreground">
-                          {run.baseline_model}
+                          {run.incumbent_model}
                         </td>
                         <td className="p-3 text-muted-foreground">
                           {run.progress_total || run.requested_samples}
@@ -663,11 +611,8 @@ export default function ModelEvalTab() {
                         <td className="whitespace-nowrap p-3 text-muted-foreground">
                           {run.status}
                         </td>
-                        <td className="whitespace-nowrap p-3">
-                          <VerdictPill
-                            run={run}
-                            empty={<span className="text-muted-foreground">-</span>}
-                          />
+                        <td className="p-3">
+                          <RunHeadline run={run} />
                         </td>
                         <td className="whitespace-nowrap p-3 text-right">
                           <DeleteRunButton run={run} onPick={setDeleteTarget} />
@@ -701,15 +646,15 @@ export default function ModelEvalTab() {
         open={deleteTarget !== null}
         onClose={() => setDeleteTarget(null)}
         onConfirm={handleDelete}
-        title="Delete this evaluation run?"
+        title="Delete this comparison run?"
         description={
           <div className="space-y-2">
             <p>
-              This removes the run and every turn of evidence recorded under it. It cannot be
-              undone, and the replay would have to be paid for again to get it back.
+              This removes the run and every turn recorded under it. It cannot be undone, and the
+              replay would have to be paid for again to get it back.
             </p>
             <p className="text-xs">
-              {deleteTarget?.candidate_model} against {deleteTarget?.baseline_model}, started{' '}
+              {deleteTarget?.candidate_model}, started{' '}
               {deleteTarget ? formatRelative(deleteTarget.created_at) : ''}.
             </p>
           </div>
