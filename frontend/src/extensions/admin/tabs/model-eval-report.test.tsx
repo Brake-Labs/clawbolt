@@ -637,4 +637,57 @@ describe('ModelEvalReportPage', () => {
       await screen.findByText(/1 finding\(s\) crossed a blocking threshold/),
     ).toBeInTheDocument();
   });
+
+  it('says a rate that cannot block cannot block, on the tile that carries it', async () => {
+    // The field reached the API and the TS types and was rendered nowhere,
+    // so a reader saw the rate and no sign that the verdict had declined to
+    // act on it.
+    const api = await import('../admin-api');
+    vi.mocked(api.getEvalReport).mockResolvedValue(
+      report({
+        run: run({
+          summary: summary({
+            incumbent_source: 'historic',
+            incumbent_source_counts: { historic: 30, unavailable: 10 },
+            silent_noop_rate: 0.4,
+            silent_noop_blocking_rate: 0.4,
+            silent_noop_comparable: false,
+          }),
+        }),
+      }),
+    );
+    renderReport();
+
+    expect(
+      await screen.findByText(/Reported only: too much of this run's sample/),
+    ).toBeInTheDocument();
+  });
+
+  it('says the same of the judge preference, where the judge counts are', async () => {
+    const api = await import('../admin-api');
+    vi.mocked(api.getEvalReport).mockResolvedValue(
+      report({
+        run: run({
+          summary: summary({
+            incumbent_source: 'historic',
+            incumbent_source_counts: { historic: 40 },
+            judge_counts: { equivalent: 4 },
+            judge_skip_counts: { identical: 20, flattened_rounds: 16 },
+            judge_preference: {
+              better: 0,
+              worse: 0,
+              judged: 4,
+              net_worse_rate: 0,
+              p_value: 1,
+              comparable: false,
+            },
+          }),
+        }),
+      }),
+    );
+    renderReport();
+
+    expect(await screen.findByText(/Its preference is reported only/)).toBeInTheDocument();
+    expect(screen.getByText(/16 whose recorded calls share one flat list/)).toBeInTheDocument();
+  });
 });

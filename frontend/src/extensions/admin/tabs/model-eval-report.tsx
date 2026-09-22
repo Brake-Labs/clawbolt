@@ -75,6 +75,10 @@ const SKIP_COPY: Record<string, string> = {
   call_failed: 'Not judged: a provider call failed, so there was no decision',
   judge_disabled: 'Not judged: this run had the judge turned off',
   incumbent_unavailable: 'Not judged: the incumbent decision for this turn could not be read',
+  flattened_rounds:
+    'Not judged: the recorded calls share one flat list, so the two sides may not have been scored on the same decision',
+  unblindable_shape:
+    'Not judged: the candidate asked for several tools at once, which a recorded decision never does, so the judge could have told the sides apart',
 };
 
 /** How the incumbent side of one turn was obtained, when it was not a call.
@@ -216,6 +220,22 @@ function SummaryGrid({ summary }: { summary: EvalSummary }) {
   // historic run it is not, and every column it would otherwise fill is
   // zero for want of a measurement.
   const measured = summary.incumbent_source !== 'historic';
+  // This rate is one of the two the run can block on, so whether it is
+  // allowed to is part of reading it. False means the tier's own evidence was
+  // too confounded, and a reader who sees only the number will act on a rate
+  // the verdict deliberately did not.
+  const noopBase =
+    noopMeasured && summary.silent_noop_rate > (noopBlocking as number)
+      ? `${noopConceded} of ${Math.round(
+          summary.silent_noop_rate * summary.turns_completed,
+        )} silent no-ops; the judge preferred the rest`
+      : measured
+        ? 'Turns the incumbent acted on'
+        : 'Turns production acted on';
+  const noopHint =
+    summary.silent_noop_comparable === false
+      ? `${noopBase}. Reported only: too much of this run's sample is confounded for it to block`
+      : noopBase;
   return (
     <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
       <Stat
@@ -231,15 +251,7 @@ function SummaryGrid({ summary }: { summary: EvalSummary }) {
       <Stat
         label={noopMeasured ? 'Replied where acting was better' : 'Replied instead of acting'}
         value={pct(noopMeasured ? (noopBlocking as number) : summary.silent_noop_rate)}
-        hint={
-          noopMeasured && summary.silent_noop_rate > (noopBlocking as number)
-            ? `${noopConceded} of ${Math.round(
-                summary.silent_noop_rate * summary.turns_completed,
-              )} silent no-ops; the judge preferred the rest`
-            : measured
-              ? 'Turns the incumbent acted on'
-              : 'Turns production acted on'
-        }
+        hint={noopHint}
       />
       <Stat
         label="Cost per run"
@@ -296,15 +308,29 @@ function SummaryGrid({ summary }: { summary: EvalSummary }) {
 // as a broken judge.
 function JudgeAccounting({ summary }: { summary: EvalSummary }) {
   const entries = Object.entries(summary.judge_skip_counts).filter(([, count]) => count > 0);
-  if (entries.length === 0) return null;
+  const preference = summary.judge_preference;
+  if (entries.length === 0 && !preference) return null;
   return (
     <p className="text-xs text-muted-foreground">
       The judge scored {Object.values(summary.judge_counts).reduce((a, b) => a + b, 0)} of{' '}
-      {summary.turns_total} turns; only diverging, measurable turns are adjudicated. Not judged:{' '}
-      {entries
-        .map(([reason, count]) => `${count} ${SKIP_REASON_SHORT[reason] ?? reason}`)
-        .join(', ')}
-      .
+      {summary.turns_total} turns; only diverging, measurable turns are adjudicated.
+      {entries.length > 0 ? (
+        <>
+          {' '}
+          Not judged:{' '}
+          {entries
+            .map(([reason, count]) => `${count} ${SKIP_REASON_SHORT[reason] ?? reason}`)
+            .join(', ')}
+          .
+        </>
+      ) : null}
+      {/* The other rate the run can block on. Same reading as the silent
+          no-op hint above, said here because this is where the judge's
+          counts are, and a preference that cannot block must not be read as
+          one that simply did not. */}
+      {preference?.comparable === false
+        ? ` Its preference is reported only: too much of the evidence it would have been read over is confounded for it to block.`
+        : ''}
     </p>
   );
 }
@@ -316,6 +342,8 @@ const SKIP_REASON_SHORT: Record<string, string> = {
   call_failed: 'where a provider call failed',
   judge_disabled: 'with the judge turned off',
   incumbent_unavailable: 'whose incumbent decision could not be read',
+  flattened_rounds: 'whose recorded calls share one flat list',
+  unblindable_shape: 'where the candidate asked for several tools at once',
 };
 
 /** Where the incumbent's decisions came from, and what that cost.
@@ -352,7 +380,7 @@ function IncumbentSourceNote({ summary }: { summary: EvalSummary }) {
           run's own sample was too confounded to read. Said once, under the
           tiles the rates appear in. */}
       {summary.safety_comparison?.comparable === false
-        ? ' The incumbent was never checked for safety findings, so that comparison reports rather than decides; a replay run is what settles it.'
+        ? ' Most safety checks cannot be run against a recorded decision, so that comparison reports rather than decides; a replay run is what settles it. Writes to a record ID the model was never shown are the exception: that check is deterministic against what each side was shown, so it runs on both here and can still block.'
         : ''}
       {summary.blocking_withheld?.length
         ? ` ${summary.blocking_withheld.length} finding(s) crossed a blocking threshold on a sample too confounded to adjudicate, so this run is inconclusive rather than an endorsement. The reasons above say which.`
