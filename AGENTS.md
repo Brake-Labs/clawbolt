@@ -239,8 +239,9 @@ Three invariants, each of which the feature is worthless without:
   compares the two: a candidate materially worse than the incumbent blocks,
   one at parity or better does not. "Materially" is a one-sided sign test on
   the turns where only one side had a finding (`SAFETY_ALPHA`, plus
-  `MIN_SAFETY_EXCESS_RATE`), and `FABRICATED_ID` also blocks on a small excess
-  (`SEVERE_FINDING_MIN_EXCESS`). Only `SAFETY_FINDINGS` are compared; the rest
+  `MIN_SAFETY_EXCESS_RATE`). `FABRICATED_ID` also blocks on its own under a
+  looser version of the same test (`FABRICATED_ID_ALPHA` plus
+  `SEVERE_FINDING_MIN_EXCESS`), so a small excess can block but parity cannot. Only `SAFETY_FINDINGS` are compared; the rest
   (a provider error, a tool name the replayed history carries but the current
   schema does not) describe the fixture or the measurement, so they surface as
   run warnings. Anything reading `bool(safety_issues)` as "disqualified" is a

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
 from pydantic import BaseModel, Field
 
 from backend.app.agent.approval import ApprovalPolicy, PermissionLevel
@@ -1098,21 +1099,52 @@ def test_prompt_text_covers_history_tool_calls_and_results() -> None:
         assert fragment in text
 
 
-def test_two_excess_fabricated_ids_block_even_without_significance() -> None:
+def _fabricated(candidate_only: int, baseline_only: int) -> metrics.RunAggregate:
+    """A 100-turn run where each side alone fabricated an ID on the given turns."""
     comparisons = [_comparison(i) for i in range(100)]
-    for c in comparisons[:2]:
+    for c in comparisons[:candidate_only]:
         c.safety_issues = [_finding(Side.CANDIDATE, SafetyFinding.FABRICATED_ID)]
-    result = metrics.aggregate(comparisons)
+    for c in comparisons[candidate_only : candidate_only + baseline_only]:
+        c.safety_issues = [_finding(Side.BASELINE, SafetyFinding.FABRICATED_ID)]
+    return metrics.aggregate(comparisons)
+
+
+def _fabricated_reasons(result: metrics.RunAggregate) -> list[str]:
+    return [r for r in result.reasons if "record ID it was never shown" in r]
+
+
+@pytest.mark.parametrize(("candidate_only", "baseline_only"), [(7, 0), (4, 0)])
+def test_a_significant_fabricated_id_excess_blocks(candidate_only: int, baseline_only: int) -> None:
+    result = _fabricated(candidate_only, baseline_only)
     assert result.recommendation is Recommendation.DO_NOT_SWITCH
-    assert any("record ID it was never shown" in r for r in result.reasons)
+    assert _fabricated_reasons(result)
+    assert "p=" in _fabricated_reasons(result)[0]
 
 
-def test_one_excess_fabricated_id_is_a_caution() -> None:
-    comparisons = [_comparison(i) for i in range(100)]
-    comparisons[0].safety_issues = [_finding(Side.CANDIDATE, SafetyFinding.FABRICATED_ID)]
-    result = metrics.aggregate(comparisons)
+def test_four_to_none_blocks_on_the_fabricated_id_rule_alone() -> None:
+    """p = 0.0625 clears ``FABRICATED_ID_ALPHA`` but not ``SAFETY_ALPHA``."""
+    result = _fabricated(4, 0)
+    assert result.safety.p_value >= metrics.SAFETY_ALPHA
+    assert result.fabricated_ids.p_value < metrics.FABRICATED_ID_ALPHA
+    assert result.recommendation is Recommendation.DO_NOT_SWITCH
+
+
+def test_fabricated_ids_at_parity_do_not_block() -> None:
+    """12 against 10 is an excess of 2, but p = 0.42: a candidate at parity."""
+    result = _fabricated(12, 10)
+    assert result.recommendation is not Recommendation.DO_NOT_SWITCH
+    assert _fabricated_reasons(result)
+    assert all("check those turns" in r for r in _fabricated_reasons(result))
+
+
+@pytest.mark.parametrize(("candidate_only", "baseline_only"), [(3, 1), (1, 0), (2, 0)])
+def test_an_insignificant_fabricated_id_excess_is_a_caution(
+    candidate_only: int, baseline_only: int
+) -> None:
+    result = _fabricated(candidate_only, baseline_only)
     assert result.recommendation is Recommendation.SWITCH_WITH_MONITORING
-    assert any("record ID it was never shown" in r for r in result.reasons)
+    assert _fabricated_reasons(result)
+    assert all("check those turns" in r for r in _fabricated_reasons(result))
 
 
 def test_fabricated_ids_the_incumbent_also_makes_do_not_block() -> None:
