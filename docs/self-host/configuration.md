@@ -437,10 +437,10 @@ Set `SMTP_HOST` and `SMTP_FROM_EMAIL` together; partial configuration fails star
 | `ALERTS_ENABLED` | `true` | Route ERROR-level application logs to the operator's inbox |
 | `ALERT_EMAIL` | | Recipient. Falls back to `ADMIN_EMAIL` |
 | `ALERT_FLUSH_INTERVAL_SECONDS` | `60` | How often queued alerts are sent |
-| `ALERT_DEDUPE_MINUTES` | `30` | Minimum gap between emails for the same fingerprint |
+| `ALERT_DEDUPE_MINUTES` | `30` | Minutes an alert group must go without recurring before it is reported resolved |
 | `ALERT_MAX_EMAILS_PER_HOUR` | `20` | Hard ceiling on outbound alert volume |
 
-Alerts require SMTP and a recipient. They group repeated errors, enforce per-group cooldowns, and cap hourly sends. See [Monitoring and alerting](./monitoring.md) for testing and diagnostics.
+Alerts require SMTP and a recipient. They group repeated errors, email once when a group starts and once when it resolves, and cap hourly sends. See [Monitoring and alerting](./monitoring.md) for testing and diagnostics.
 
 ### Health monitoring
 

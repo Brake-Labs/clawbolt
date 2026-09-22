@@ -50,7 +50,9 @@ Ports 465 and 2465 require implicit TLS and are not supported. `SMTP_TIMEOUT_SEC
 
 A logging handler watches the `backend` and `uvicorn.error` trees. Every `ERROR` record enters the alert pipeline.
 
-Alerts group by logger, exception type, and unformatted log template. Each group sends at most once per `ALERT_DEDUPE_MINUTES`, including the number of suppressed occurrences. `ALERT_MAX_EMAILS_PER_HOUR` caps total sends. A failed email does not start the cooldown.
+Alerts group by logger, exception type, and unformatted log template. Each group is an incident: its first occurrence sends one email, repeats while it is open are counted without emailing, and once it has gone `ALERT_DEDUPE_MINUTES` without recurring a resolved email reports the total count and duration. A recurrence after that opens a new incident. Tool failures follow the same lifecycle. `ALERT_MAX_EMAILS_PER_HOUR` caps total sends. A failed email is retried on the next flush.
+
+Open incidents are held in memory. After a restart, a problem that is still happening opens again, and one that stopped across the restart gets no resolved email.
 
 Failures that do not raise or log at `ERROR` require a health probe or the tool-failure layer.
 
@@ -135,7 +137,7 @@ curl -s https://your-domain.example/api/monitoring/status \
 
 If alert volume is too high:
 
-1. Raise `ALERT_DEDUPE_MINUTES`.
+1. Raise `ALERT_DEDUPE_MINUTES` if an intermittent problem resolves and reopens repeatedly.
 2. Raise `HEALTH_FAILURE_THRESHOLD` for flaky dependencies.
 3. Change routine `logger.error` calls to `logger.warning` at the source.
 
