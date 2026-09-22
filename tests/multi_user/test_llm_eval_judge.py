@@ -402,6 +402,13 @@ def test_a_historic_turn_shows_two_structurally_identical_responses() -> None:
         model="candidate",
         tool_calls=[ToolCall(name="qb_send", arguments={"invoice_id": "1187"})],
         replayed_lookups=[lookup],
+        # The candidate routinely says something alongside its call. A
+        # decision read out of the transcript never can: the outbound row
+        # holds the turn's final reply and all of its calls in one flat
+        # list, so a decision that opened with a call carries no prose of
+        # its own. Both blocks together would mark the candidate on every
+        # acting turn, and the judge defaults to the incumbent model.
+        text="Sending that one now.",
     )
     sample = ReplaySample(
         seq=SEQ_CANDIDATE_IS_A,
@@ -412,10 +419,44 @@ def test_a_historic_turn_shows_two_structurally_identical_responses() -> None:
     prompt = _judge_prompt(sample, candidate, historic, None, historic_side_shown=True)
     first, second = _responses(prompt)
     assert _blocks(first) == _blocks(second) == ["Lookups made first", "Tool calls"]
+    assert "Sending that one now." not in prompt
     # And the live turn's own calls are withheld: the historic side is
     # literally the head of that list, so printing it names which is which.
     assert "The live assistant's tool calls" not in prompt
     assert "incumbent" not in prompt
+
+
+def test_a_decision_that_only_replied_keeps_its_prose_in_historic_mode() -> None:
+    """Dropping it there would leave a response with nothing in it.
+
+    A turn both sides answered in prose has no tool call to identify either
+    of them, and the prose is the whole of what the judge is being asked to
+    compare.
+    """
+    historic = ModelCallResult(
+        provider="anthropic", model="incumbent", text="They owe 1186 on that job."
+    )
+    candidate = ModelCallResult(
+        provider="anthropic", model="candidate", text="The balance is 1186."
+    )
+    sample = ReplaySample(seq=SEQ_CANDIDATE_IS_A, timestamp="", message_context=TURN_TEXT)
+    prompt = _judge_prompt(sample, candidate, historic, None, historic_side_shown=True)
+    first, second = _responses(prompt)
+    assert _blocks(first) == _blocks(second) == ["Tool calls", "Reply text"]
+    assert "The balance is 1186." in prompt
+
+
+def test_a_replayed_turn_keeps_the_prose_beside_the_call() -> None:
+    """Both sides were elicited, so neither is marked by carrying prose."""
+    candidate = ModelCallResult(
+        provider="anthropic",
+        model="candidate",
+        tool_calls=[ToolCall(name="qb_send", arguments={"invoice_id": "1187"})],
+        text="Sending that one now.",
+    )
+    sample = ReplaySample(seq=SEQ_CANDIDATE_IS_A, timestamp="", message_context=TURN_TEXT)
+    prompt = _judge_prompt(sample, candidate, BASELINE, None)
+    assert "Sending that one now." in prompt
 
 
 def test_a_replayed_turn_still_gets_the_live_turns_calls_as_context() -> None:

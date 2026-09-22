@@ -215,7 +215,7 @@ def _dump(arguments: dict[str, Any]) -> str:
         return repr(arguments)
 
 
-def _describe(call: ModelCallResult) -> str:
+def _describe(call: ModelCallResult, *, prose_with_calls: bool = True) -> str:
     """Render one model's decision for the judge, without naming the model.
 
     Every block here is conditional on the decision carrying that thing, so
@@ -224,6 +224,22 @@ def _describe(call: ModelCallResult) -> str:
     prose, and a decision read out of the transcript never carries prose
     alongside a tool call, so in historic mode that line marked the
     incumbent on every acting turn.
+
+    *prose_with_calls* is False when one of the two sides was read out of
+    the transcript. A recorded outbound row holds the turn's final reply and
+    all of its calls in one flat list, so a decision that opened with a call
+    has no prose of its own: any response carrying both a "Tool calls:" and
+    a "Reply text:" block is necessarily the candidate, and the judge
+    defaults to the incumbent model, which makes that a self-preference
+    channel.
+
+    The fix is to drop the candidate's prose on an acting turn rather than
+    to give the historic side the turn's reply. That reply was written after
+    the scored round, possibly after more tool rounds, so attaching it would
+    show the judge a polished summary of a completed turn as if it were the
+    reasoning offered alongside the call, and score the candidate's
+    mid-turn note against it. Dropping prose loses a little signal on both
+    sides equally; attaching it invents evidence for one.
     """
     parts: list[str] = []
     if call.replayed_lookups:
@@ -243,7 +259,7 @@ def _describe(call: ModelCallResult) -> str:
         parts.append("Tool calls:\n" + "\n".join(lines))
     else:
         parts.append("Tool calls: none")
-    if call.text.strip():
+    if call.text.strip() and (prose_with_calls or not call.tool_calls):
         parts.append(f"Reply text:\n{_truncate(call.text, _MAX_TEXT_CHARS)}")
     return "\n\n".join(parts)
 
@@ -259,10 +275,11 @@ def _judge_prompt(
     """The judge's prompt for one turn, with neither side identifiable.
 
     *historic_side_shown* says one of the two responses was read out of the
-    live turn rather than elicited. The live turn's own tool calls are then
-    withheld: they are context on a replayed run, but here the historic side
-    is literally the head of that list, and naming it hands the judge the
-    answer to which response is which.
+    live turn rather than elicited. Two things are then withheld, both of
+    which mark that side on sight rather than by its content. The live
+    turn's own tool calls: they are context on a replayed run, but here the
+    historic side is literally the head of that list. And prose alongside a
+    tool call, which only the candidate can have (see ``_describe``).
     """
     sections: list[str] = []
     if context is not None and context.current_time:
@@ -275,8 +292,9 @@ def _judge_prompt(
             f"answer key): {', '.join(sample.historic_tool_names)}"
         )
     sections.append(f"User message:\n{_truncate(sample.user_text, _MAX_TEXT_CHARS)}")
-    sections.append(f"--- Response A ---\n{_describe(first)}")
-    sections.append(f"--- Response B ---\n{_describe(second)}")
+    prose_with_calls = not historic_side_shown
+    sections.append(f"--- Response A ---\n{_describe(first, prose_with_calls=prose_with_calls)}")
+    sections.append(f"--- Response B ---\n{_describe(second, prose_with_calls=prose_with_calls)}")
     return "\n\n".join(sections)
 
 

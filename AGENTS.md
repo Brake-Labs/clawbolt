@@ -243,9 +243,12 @@ edit away from breaking:
   reproduced production exactly came back `do_not_switch` at a 100% silent
   no-op rate. Whatever is scored on one side has a counterpart on the other,
   the skipped lookups included, which is also what keeps the two responses
-  structurally indistinguishable in `judge._judge_prompt`. The live turn's own
-  tool calls are withheld from that prompt in this mode, since the incumbent's
-  side is the head of that list.
+  structurally indistinguishable in `judge._judge_prompt`. Two things are
+  withheld from that prompt in this mode, both of which mark the recorded side
+  on sight rather than by its content: the live turn's own tool calls, since
+  the incumbent's side is the head of that list, and prose alongside a tool
+  call, which only an elicited decision can carry. The judge defaults to the
+  incumbent model, so either one is a self-preference channel.
 
 Three invariants, each of which the feature is worthless without:
 
