@@ -179,7 +179,7 @@ def _turn_row(run_id: int, comparison: TurnComparison) -> LLMEvalTurnResult:
         run_id=run_id,
         message_seq=sample.seq,
         message_timestamp=sample.timestamp,
-        user_message=sample.message_context,
+        user_message=sample.user_text,
         historic_reply=sample.historic_reply,
         historic_tool_names=json.dumps(sample.historic_tool_names),
         baseline_text=base.text,

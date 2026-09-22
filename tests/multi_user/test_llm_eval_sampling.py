@@ -89,7 +89,11 @@ async def test_selects_only_inbound_turns_most_recent_last(
 async def test_limit_keeps_the_most_recent_turns(
     db_session: Session, test_user: User, _reset_stores: None
 ) -> None:
-    _seed(db_session, test_user, [("inbound", f"ask {i}", None) for i in range(1, 6)])
+    # Answered turns: unanswered rows a minute apart would be one batch.
+    turns: list[tuple[str, str, list[dict] | None]] = []
+    for i in range(1, 6):
+        turns += [("inbound", f"ask {i}", None), ("outbound", f"answer {i}", None)]
+    _seed(db_session, test_user, turns)
     fixture = await _fixture_for(test_user)
     samples = select_samples(fixture, limit=2)
     assert [s.message_context for s in samples] == ["ask 4", "ask 5"]
@@ -349,16 +353,15 @@ async def test_a_window_holding_enough_turns_but_no_history_falls_back(
 # ---------------------------------------------------------------------------
 
 
-async def test_rapid_fire_turns_all_see_the_response_to_the_batch(
+async def test_a_rapid_fire_batch_is_replayed_once_at_its_last_row(
     db_session: Session, test_user: User, _reset_stores: None
 ) -> None:
-    """Four messages in a row are one turn as far as the agent is concerned.
+    """Regression: every row of a batch was replayed as its own turn.
 
-    The agent answers the batch once, after the last message. Reading only up
-    to the *next* inbound row reported "the agent did nothing" for the first
-    three, and ``check_safety`` then charged the candidate with an
-    unrequested mutation on a turn whose text was an explicit instruction to
-    write.
+    Production answers the batch once, after the last message, with the
+    earlier ones already in the history it loads. Replaying "rebuild the
+    stalls" on its own scored a decision production never made, on a third
+    of what the user asked, and the judge read that third as the request.
     """
     _seed(
         db_session,
@@ -384,12 +387,38 @@ async def test_rapid_fire_turns_all_see_the_response_to_the_batch(
     fixture = await _fixture_for(test_user)
     samples = select_samples(fixture, limit=10)
 
-    assert [s.seq for s in samples] == [1, 2, 3]
-    for sample in samples:
-        assert sample.historic_tool_names == ["qb_update"], (
-            f"seq {sample.seq} lost the batch's response"
+    assert [s.seq for s in samples] == [3]
+    (sample,) = samples
+    assert sample.message_context == "build and send"
+    assert sample.batched_messages == ("rebuild the stalls", "add 5000 for the staircase")
+    assert sample.user_text == "rebuild the stalls\n\nadd 5000 for the staircase\n\nbuild and send"
+    assert sample.historic_tool_names == ["qb_update"]
+    assert sample.historic_reply == "sent"
+
+    # The earlier rows reach the model the way production shows them: as
+    # history in front of the last row, not folded into the current turn.
+    history = [m.content for m in _history_for(fixture, sample)]
+    assert any("rebuild the stalls" in str(c) for c in history)
+    assert any("add 5000 for the staircase" in str(c) for c in history)
+
+
+async def test_rows_minutes_apart_are_separate_turns(
+    db_session: Session, test_user: User, _reset_stores: None
+) -> None:
+    """Only a real batch is grouped; an unanswered row stays its own turn."""
+    _seed(db_session, test_user, [("inbound", "first", None)])
+    session_rows = await _fixture_for(test_user)
+    session_rows.rows.append(
+        StoredMessage(
+            seq=2,
+            direction="inbound",
+            body="three hours later",
+            timestamp=(BASE_TIME + _dt.timedelta(hours=3)).isoformat(),
         )
-        assert sample.historic_reply == "sent"
+    )
+    samples = select_samples(session_rows, limit=10)
+    assert [s.seq for s in samples] == [1, 2]
+    assert all(s.batched_messages == () for s in samples)
 
 
 async def test_a_trailing_turn_with_no_response_yet_reports_no_tools(

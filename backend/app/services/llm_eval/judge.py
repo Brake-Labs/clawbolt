@@ -235,7 +235,7 @@ async def judge_turn(
     first, second = (candidate, baseline) if candidate_is_a else (baseline, candidate)
 
     prompt = (
-        f"User message:\n{_truncate(sample.message_context, _MAX_TEXT_CHARS)}\n\n"
+        f"User message:\n{_truncate(sample.user_text, _MAX_TEXT_CHARS)}\n\n"
         f"--- Response A ---\n{_describe(first)}\n\n"
         f"--- Response B ---\n{_describe(second)}"
     )

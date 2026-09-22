@@ -205,6 +205,20 @@ class ReplaySample:
     message_context: str
     historic_reply: str = ""
     historic_tool_names: list[str] = field(default_factory=list)
+    batched_messages: tuple[str, ...] = ()
+    """Earlier messages of the batch this turn closes, oldest first.
+
+    Production answers a rapid-fire batch once, at its last row, with the
+    earlier rows already in the loaded history. The replay does the same, so
+    these are in the prompt as history rather than in ``message_context``;
+    they are carried here for the judge and the report, which would
+    otherwise show a fraction of what the user asked.
+    """
+
+    @property
+    def user_text(self) -> str:
+        """Everything the user sent for this turn, batch included."""
+        return "\n\n".join([*self.batched_messages, self.message_context])
 
 
 @dataclass(frozen=True)

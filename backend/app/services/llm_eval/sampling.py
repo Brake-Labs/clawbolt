@@ -315,30 +315,64 @@ def _historic_response(rows: list[StoredMessage], start: int) -> tuple[str, list
     return "\n\n".join(reply_parts), tool_names
 
 
+def _batch_end(rows: list[StoredMessage], start: int) -> int:
+    """Index of the last inbound row in the batch that begins at *start*."""
+    index = start
+    while (
+        index + 1 < len(rows)
+        and rows[index + 1].direction == MessageDirection.INBOUND
+        and _same_batch(rows[index], rows[index + 1])
+    ):
+        index += 1
+    return index
+
+
+def _message_context(row: StoredMessage) -> str:
+    return row.processed_context or row.body
+
+
 def select_samples(fixture: ReplayFixture, limit: int) -> list[ReplaySample]:
-    """Pick the most recent *limit* inbound turns, oldest first.
+    """Pick the most recent *limit* turns, oldest first.
+
+    A turn is a batch, not a row. Production answers rapid-fire messages once,
+    after the last of them, with the earlier ones already in the history it
+    loads, so that is the replay too: one sample per batch, at the batch's
+    last row. Replaying each row alone scored decisions production never
+    made, on a fraction of what the user had said, and the judge read that
+    fraction as the whole request. The earlier rows ride along as
+    ``batched_messages`` so the report and the judge see everything the user
+    sent.
 
     Blank inbound rows are skipped: rapid-fire attachment batching persists
     a placeholder with no body and no processed context, and replaying one
-    would ask both models to respond to an empty string.
+    would ask both models to respond to an empty string. A batch that ends in
+    one is replayed at its last row with text.
     """
     samples: list[ReplaySample] = []
-    for index, row in enumerate(fixture.rows):
-        if row.direction != MessageDirection.INBOUND:
+    rows = fixture.rows
+    index = 0
+    while index < len(rows):
+        if rows[index].direction != MessageDirection.INBOUND:
+            index += 1
             continue
-        message_context = row.processed_context or row.body
-        if not message_context.strip():
-            continue
-        reply, tool_names = _historic_response(fixture.rows, index)
-        samples.append(
-            ReplaySample(
-                seq=row.seq,
-                timestamp=row.timestamp,
-                message_context=message_context,
-                historic_reply=reply,
-                historic_tool_names=tool_names,
+        end = _batch_end(rows, index)
+        texts = [(i, _message_context(rows[i])) for i in range(index, end + 1)]
+        texts = [(i, text) for i, text in texts if text.strip()]
+        if texts:
+            last_index, message_context = texts[-1]
+            row = rows[last_index]
+            reply, tool_names = _historic_response(rows, last_index)
+            samples.append(
+                ReplaySample(
+                    seq=row.seq,
+                    timestamp=row.timestamp,
+                    message_context=message_context,
+                    historic_reply=reply,
+                    historic_tool_names=tool_names,
+                    batched_messages=tuple(text for _, text in texts[:-1]),
+                )
             )
-        )
+        index = end + 1
     return samples[-limit:] if limit > 0 else samples
 
 
