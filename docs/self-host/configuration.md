@@ -185,7 +185,7 @@ Photos and files the user sends over a messaging channel are cached on disk whil
 | `MESSAGE_BATCH_WINDOW_MS` | `1500` | Milliseconds to wait for more messages before processing. Groups rapid-fire messages into one agent call |
 | `INBOUND_RECOVERY_LOOKBACK_MINUTES` | `30` | On startup, sweep for inbound messages persisted but never dispatched to the agent (worker died during the batcher window). Re-dispatch each one. Older orphans are skipped. Set to `0` to disable |
 | `COMPACTION_RETRY_LOOKBACK_MINUTES` | `10080` | On startup, retry compaction events stuck in `pending` (the background compaction LLM call crashed or the process restarted mid-call). Rows older than a week or already retried 3 times are skipped. Set to `0` to disable |
-| `MAX_TOOL_ROUNDS` | `10` | Maximum tool-calling rounds per agent invocation |
+| `MAX_TOOL_ROUNDS` | `15` | Maximum tool-calling rounds per agent invocation |
 | `MAX_INPUT_TOKENS` | `600000` | Hard ceiling on the input token budget; the trim trigger must stay at or below this |
 | `CONTEXT_TRIM_TARGET_TOKENS` | `120000` | Token budget to retain after trimming |
 | `CONTEXT_TRIM_TRIGGER_TOKENS` | `150000` | Token threshold that triggers trimming. Must be above the target and at or below `MAX_INPUT_TOKENS` |

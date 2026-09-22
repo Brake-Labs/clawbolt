@@ -68,7 +68,7 @@ class TestFieldConstraints:
     def test_defaults_are_valid(self) -> None:
         """The default Settings() should construct without errors."""
         s = Settings()
-        assert s.max_tool_rounds == 10
+        assert s.max_tool_rounds == 15
         assert s.message_batch_window_ms == 1500
         assert s.llm_max_tokens_vision == s.llm_max_tokens_heartbeat == 12000
 

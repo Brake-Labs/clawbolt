@@ -1868,6 +1868,11 @@ class TestExecuteHeartbeatTasks:
             assert result is not None
             assert result.reply_text == "You have 3 unpaid invoices."
             mock_agent_instance.process_message.assert_awaited_once()
+            # A heartbeat that runs out of tool rounds must stay silent, not
+            # text the user an unprompted "ran out of steps" message.
+            call = mock_agent_instance.process_message.await_args
+            assert call is not None
+            assert call.kwargs["wrap_up_on_max_rounds"] is False
 
     async def test_returns_empty_on_error(self, user: User) -> None:
         """Phase 2 should return empty string if agent raises."""
