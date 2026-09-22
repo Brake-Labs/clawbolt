@@ -18,6 +18,7 @@ from backend.app.config import settings
 from backend.app.database import get_async_db
 from backend.app.integrations.calendar.factory import parse_disabled_tools
 from backend.app.integrations.calendar.service import GoogleCalendarService
+from backend.app.integrations.calendar.sync import build_calendar_service
 from backend.app.models import CalendarConfig, User
 from backend.app.query_helpers import fetch_all
 from backend.app.schemas.tools import (
@@ -43,13 +44,7 @@ async def _get_calendar_service(user: User) -> GoogleCalendarService:
     if token is None or not token.access_token:
         raise HTTPException(status_code=400, detail="Google Calendar not connected")
 
-    return GoogleCalendarService(
-        access_token=token.access_token,
-        refresh_token=token.refresh_token,
-        client_id=settings.google_calendar_client_id,
-        client_secret=settings.google_calendar_client_secret,
-        token_expires_at=token.expires_at,
-    )
+    return build_calendar_service(user.id, token)
 
 
 @router.get("/user/calendar/calendars", response_model=CalendarListResponse)

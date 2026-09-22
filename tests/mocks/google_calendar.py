@@ -76,7 +76,7 @@ class MockGoogleCalendarService:
     def provider_name(self) -> str:
         return "google_calendar"
 
-    async def list_calendars(self) -> list[CalendarInfo]:
+    async def list_calendars(self, *, show_hidden: bool = False) -> list[CalendarInfo]:
         return list(self.calendars)
 
     async def list_events(

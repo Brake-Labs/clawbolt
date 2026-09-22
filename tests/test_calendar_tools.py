@@ -3,24 +3,34 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 
 from backend.app.agent.approval import PermissionLevel
+from backend.app.agent.tool_errors import build_error_hint
 from backend.app.agent.tools.base import Tool, ToolErrorKind
 from backend.app.agent.tools.names import ToolName
 from backend.app.agent.tools.registry import ToolContext
 from backend.app.integrations.calendar.factory import (
     _calendar_factory,
+    _calendar_not_visible_result,
     _handle_http_error,
     _parse_dt,
     _resolve_tz,
     create_calendar_tools,
 )
-from backend.app.integrations.calendar.provider import CalendarEventCreate, CalendarEventData
+from backend.app.integrations.calendar.provider import (
+    BusySlot,
+    CalendarEventCreate,
+    CalendarEventData,
+    CalendarEventUpdate,
+    CalendarInfo,
+)
 from backend.app.models import User
+from backend.app.services.pii_redaction import redact_pii
 from tests.mocks.google_calendar import MockGoogleCalendarService
 
 # Tools that are disabled to make a calendar "read-only".
@@ -1182,6 +1192,9 @@ async def test_list_events_skips_disabled_calendar() -> None:
 async def test_list_calendars_shows_access_role() -> None:
     """calendar_list_calendars should display the Google access role."""
     service = MockGoogleCalendarService()
+    service.calendars.append(
+        CalendarInfo(id="shared@example.com", summary="Shared", access_role="reader")
+    )
     tools = create_calendar_tools(
         service,
         enabled_calendars=[
@@ -1332,3 +1345,191 @@ def test_403_with_unparseable_body_falls_back() -> None:
     assert result.error_kind == ToolErrorKind.PERMISSION
     assert "HTTP 403" in result.content
     assert "read-only" not in result.content.lower()
+
+
+# ---------------------------------------------------------------------------
+# Saved calendars the connected account cannot see (reconnect incident)
+# ---------------------------------------------------------------------------
+
+_CONNECTED = "connected@example.com"
+_STALE_ID = "stale-owner@example.com"
+
+
+class _UnreachableCalendarService(MockGoogleCalendarService):
+    """Mock where saved calendars in *unreachable* 404, like ids from another account."""
+
+    def __init__(self, unreachable: set[str]) -> None:
+        super().__init__()
+        self.unreachable = unreachable
+
+    def _guard(self, calendar_id: str) -> None:
+        if calendar_id in self.unreachable:
+            raise _make_http_error(404, '{"error": {"code": 404, "message": "Not Found"}}')
+
+    async def list_events(
+        self, calendar_id: str, time_min: datetime, time_max: datetime
+    ) -> list[CalendarEventData]:
+        self._guard(calendar_id)
+        return await super().list_events(calendar_id, time_min, time_max)
+
+    async def create_event(self, calendar_id: str, event: CalendarEventCreate) -> CalendarEventData:
+        self._guard(calendar_id)
+        return await super().create_event(calendar_id, event)
+
+    async def update_event(
+        self, calendar_id: str, event_id: str, updates: CalendarEventUpdate
+    ) -> CalendarEventData:
+        self._guard(calendar_id)
+        if not any(e.id == event_id for e in self.events):
+            raise _make_http_error(404)
+        return await super().update_event(calendar_id, event_id, updates)
+
+    async def check_availability(
+        self, calendar_id: str, time_min: datetime, time_max: datetime
+    ) -> list[BusySlot]:
+        self._guard(calendar_id)
+        return await super().check_availability(calendar_id, time_min, time_max)
+
+
+def _stale_tools(
+    service: MockGoogleCalendarService, *, connected_account: str = _CONNECTED
+) -> list[Tool]:
+    return create_calendar_tools(
+        service,
+        enabled_calendars=[(_STALE_ID, "Old Personal", [], "owner")],
+        connected_account=connected_account,
+    )
+
+
+async def test_create_event_404_names_connected_account_and_overrides_hint() -> None:
+    """The incident: a create against a saved calendar from another account.
+
+    The result must say the calendar is not visible to the connected account,
+    name that account, and carry a hint that replaces the generic NOT_FOUND
+    "verify the identifier and try again" guidance.
+    """
+    service = _UnreachableCalendarService({_STALE_ID})
+    tool = _get_tool(_stale_tools(service), ToolName.CALENDAR_CREATE_EVENT)
+    result = await tool.function(
+        title="Job: Test", start="2026-03-25T09:00:00", end="2026-03-25T10:00:00"
+    )
+
+    assert result.is_error is True
+    assert result.error_kind == ToolErrorKind.NOT_FOUND
+    assert "not visible to the Google account" in result.content
+    assert _CONNECTED in result.content
+    assert "Refresh calendar config" not in result.content
+    hint = build_error_hint(result)
+    assert "Do not guess" in hint
+    assert "reconnect Google Calendar with the account that owns it" in hint
+    assert "Verify the identifier" not in hint
+
+
+async def test_404_with_unknown_account_says_so() -> None:
+    """Tokens stored before accounts were recorded: say it is unknown, never blank."""
+    service = _UnreachableCalendarService({_STALE_ID})
+    tools = _stale_tools(service, connected_account="")
+    tool = _get_tool(tools, ToolName.CALENDAR_LIST_EVENTS)
+    result = await tool.function(start_date="2026-03-25T00:00:00", end_date="2026-03-26T00:00:00")
+    assert result.is_error is True
+    assert "unrecorded account" in result.content
+    assert "()" not in result.content
+
+
+async def test_update_event_404_on_visible_calendar_is_event_not_found() -> None:
+    """A 404 for a missing event must not be blamed on the account."""
+    service = _UnreachableCalendarService(set())
+    service.calendars.append(CalendarInfo(id=_STALE_ID, summary="Old Personal"))
+    tool = _get_tool(_stale_tools(service), ToolName.CALENDAR_UPDATE_EVENT)
+    result = await tool.function(event_id="does-not-exist", title="x")
+    assert result.is_error is True
+    assert "Event does-not-exist was not found" in result.content
+    assert "not visible" not in result.content
+
+
+async def test_update_event_404_on_unreachable_calendar_is_not_visible() -> None:
+    service = _UnreachableCalendarService({_STALE_ID})
+    tool = _get_tool(_stale_tools(service), ToolName.CALENDAR_UPDATE_EVENT)
+    result = await tool.function(event_id="evt-001", title="x")
+    assert result.is_error is True
+    assert "not visible to the Google account" in result.content
+    assert "Do not guess" in build_error_hint(result)
+
+
+async def test_list_events_skips_unreachable_with_guidance() -> None:
+    """Multi-calendar read: the reachable calendars still answer, and the note
+    about the skipped one names the connected account instead of 'refresh'."""
+    service = _UnreachableCalendarService({_STALE_ID})
+    tools = create_calendar_tools(
+        service,
+        enabled_calendars=[(_STALE_ID, "Old Personal", [], "owner"), *_DEFAULT_ENABLED],
+        connected_account=_CONNECTED,
+    )
+    tool = _get_tool(tools, ToolName.CALENDAR_LIST_EVENTS)
+    result = await tool.function(start_date="2026-03-24T00:00:00", end_date="2026-03-27T00:00:00")
+    assert result.is_error is False
+    assert "Found 2 event(s)" in result.content
+    assert "Old Personal" in result.content
+    assert _CONNECTED in result.content
+    assert "Do not guess" in result.content
+
+
+async def test_check_availability_all_unreachable_is_error_not_free() -> None:
+    """Nothing could be checked, so it must not report the user as free."""
+    service = _UnreachableCalendarService({_STALE_ID, "other-stale@example.com"})
+    tools = create_calendar_tools(
+        service,
+        enabled_calendars=[
+            (_STALE_ID, "Old Personal", [], "owner"),
+            ("other-stale@example.com", "Old Crew", [], "owner"),
+        ],
+        connected_account=_CONNECTED,
+    )
+    tool = _get_tool(tools, ToolName.CALENDAR_CHECK_AVAILABILITY)
+    result = await tool.function(start_date="2026-01-01T00:00:00", end_date="2026-01-02T00:00:00")
+    assert result.is_error is True
+    assert "free" not in result.content.lower()
+    assert "Do not guess" in build_error_hint(result)
+
+
+async def test_list_calendars_flags_saved_calendars_not_visible() -> None:
+    """The listing is labelled as the saved selection, names the account, flags
+    unreachable calendars, and does not present their stale role as live."""
+    service = MockGoogleCalendarService()
+    tools = create_calendar_tools(
+        service,
+        enabled_calendars=[(_STALE_ID, "Old Personal", [], "owner"), *_DEFAULT_ENABLED],
+        connected_account=_CONNECTED,
+    )
+    tool = _get_tool(tools, ToolName.CALENDAR_LIST_CALENDARS)
+    result = await tool.function()
+    assert result.is_error is False
+    assert "saved in Settings" in result.content
+    assert f"Connected Google account: {_CONNECTED}" in result.content
+    stale_line = next(line for line in result.content.splitlines() if "Old Personal" in line)
+    assert "NOT VISIBLE" in stale_line
+    assert "access: owner" not in stale_line
+    jobs_line = next(line for line in result.content.splitlines() if "Jobs |" in line)
+    assert "NOT VISIBLE" not in jobs_line
+
+
+async def test_list_calendars_says_when_it_could_not_verify() -> None:
+    service = MockGoogleCalendarService()
+
+    async def failing(*, show_hidden: bool = False) -> list[CalendarInfo]:
+        raise httpx.ConnectError("down")
+
+    service.list_calendars = failing  # type: ignore[method-assign]
+    tools = create_calendar_tools(service, enabled_calendars=_DEFAULT_ENABLED)
+    result = await _get_tool(tools, ToolName.CALENDAR_LIST_CALENDARS).function()
+    assert result.is_error is False
+    assert "Could not check these against Google" in result.content
+
+
+def test_not_visible_message_is_redacted_in_admin_views() -> None:
+    """Admin shared-data views run tool results through ``redact_pii``; the
+    connected account email in these errors must not survive it."""
+    result = _calendar_not_visible_result(_STALE_ID, "Old Personal", "create event", _CONNECTED)
+    redacted = redact_pii(result.content + " " + result.hint)
+    assert _CONNECTED not in redacted
+    assert _STALE_ID not in redacted

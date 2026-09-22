@@ -61,6 +61,8 @@ Users can connect their Google account in two ways:
 
 Once connected, the calendar tools become available to the agent.
 
+Every connect or reconnect records the Google account's email (read from its primary calendar, so no extra scope) and resyncs the user's saved calendar picks against that account's calendar list: picks it cannot see are removed, and its primary calendar is enabled if anything was removed or nothing was picked. This matters after swapping OAuth clients or when a user reconnects with a different Google account. In multi-user mode, the admin user view lists each connection's account (masked) and whether it matches the sign-in email.
+
 For chat examples, timezone behavior, and approval behavior, see the [Calendar guide](/docs/guide/calendar).
 
 ## Disconnecting

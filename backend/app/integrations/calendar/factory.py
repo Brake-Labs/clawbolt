@@ -26,7 +26,15 @@ from backend.app.integrations.calendar.provider import (
     CalendarEventCreate,
     CalendarEventUpdate,
 )
-from backend.app.integrations.calendar.service import GoogleCalendarService
+from backend.app.integrations.calendar.service import (
+    CalendarNotVisibleError,
+    GoogleCalendarService,
+)
+from backend.app.integrations.calendar.sync import (
+    build_calendar_service,
+    is_calendar_visible,
+    resync_after_connect,
+)
 from backend.app.models import CalendarConfig
 from backend.app.query_helpers import fetch_all
 from backend.app.services.oauth import (
@@ -301,6 +309,49 @@ _WRITE_TOOLS = [
 # Google Calendar access roles that only allow reading.
 _READ_ONLY_ROLES = {"reader", "freeBusyReader"}
 
+# Where the user fixes the calendar selection in the web app.
+_SETTINGS_LOCATION = "the Google Calendar card on the Integrations page"
+
+
+def _account_label(connected_account: str) -> str:
+    """Name the connected Google account for the agent, or say it is unknown."""
+    if connected_account:
+        return connected_account
+    return "an unrecorded account (connected before Clawbolt tracked which account)"
+
+
+def _not_visible_guidance(connected_account: str) -> str:
+    """What the agent should tell the user about a saved calendar it cannot reach."""
+    return (
+        "Do not guess which Google account owns it and do not retry. Tell the user "
+        "this saved calendar is not visible to the Google account connected to "
+        f"Google Calendar ({_account_label(connected_account)}), and that they can "
+        "either reconnect Google Calendar with the account that owns it, or re-pick "
+        f"their calendars in {_SETTINGS_LOCATION}."
+    )
+
+
+def _calendar_not_visible_result(
+    calendar_id: str, calendar_name: str, action: str, connected_account: str
+) -> ToolResult:
+    """Error result for a saved calendar the connected account cannot see.
+
+    Carries an explicit ``hint`` so the generic NOT_FOUND hint ("verify the
+    identifier and try again") does not steer the agent into retrying or
+    guessing another account.
+    """
+    return ToolResult(
+        content=(
+            f"Could not {action}: the saved calendar '{calendar_name}' (id: {calendar_id}) "
+            "is not visible to the Google account currently connected to Google Calendar "
+            f"({_account_label(connected_account)}). It may belong to a different Google "
+            "account than the one connected now."
+        ),
+        is_error=True,
+        error_kind=ToolErrorKind.NOT_FOUND,
+        hint=_not_visible_guidance(connected_account),
+    )
+
 
 # ---------------------------------------------------------------------------
 # Tool creation
@@ -312,6 +363,7 @@ def create_calendar_tools(
     user_timezone: str = "",
     enabled_calendars: list[tuple[str, str, list[str], str]] | None = None,
     primary_calendar_id: str = "",
+    connected_account: str = "",
 ) -> list[Tool]:
     """Create calendar tools bound to a calendar service instance.
 
@@ -329,6 +381,10 @@ def create_calendar_tools(
     *primary_calendar_id* is the calendar Google flags as ``primary: true``
     on the user's calendarList. Used as a tiebreaker when the LLM omits
     ``calendar_id`` and multiple calendars are enabled.
+
+    *connected_account* is the email of the Google account the stored token
+    belongs to ("" when it was not recorded). Errors about saved calendars
+    the connection cannot see name it, so the agent does not guess.
     """
     default_tz = _resolve_tz(user_timezone)
     raw: list[tuple[str, str, list[str], str]] = enabled_calendars or [
@@ -354,13 +410,88 @@ def create_calendar_tools(
     # behavior for users who haven't synced multi-calendar yet.
     _primary_id = primary_calendar_id or (raw[0][0] if len(raw) == 1 else "")
 
+    async def _live_calendar_roles() -> dict[str, str] | None:
+        """Map of calendar id to access role the connection sees now, or None on failure."""
+        try:
+            live = await service.list_calendars(show_hidden=True)
+        except Exception as exc:
+            logger.warning("Could not load live calendar list: %s", type(exc).__name__)
+            return None
+        return {c.id: c.access_role for c in live if c.id}
+
+    async def _not_found_result(cal_id: str, action: str, *, event_id: str = "") -> ToolResult:
+        """Explain a 404 against a saved calendar.
+
+        Reads and creates only 404 when the calendar itself is unreachable.
+        An event update or delete also 404s for a missing event, so those
+        check the live calendar list to tell the two apart.
+        """
+        cal_name = _cal_name_map.get(cal_id, cal_id)
+        if not event_id:
+            return _calendar_not_visible_result(cal_id, cal_name, action, connected_account)
+        live = await _live_calendar_roles()
+        if live is not None and not is_calendar_visible(cal_id, set(live)):
+            return _calendar_not_visible_result(cal_id, cal_name, action, connected_account)
+        if live is not None:
+            return ToolResult(
+                content=(
+                    f"Event {event_id} was not found on '{cal_name}' while trying to "
+                    f"{action}. It may have been deleted or be on a different calendar."
+                ),
+                is_error=True,
+                error_kind=ToolErrorKind.NOT_FOUND,
+            )
+        return ToolResult(
+            content=(
+                f"Not found while trying to {action}: either event {event_id} no longer "
+                f"exists on '{cal_name}', or that saved calendar is not visible to the "
+                f"connected Google account ({_account_label(connected_account)})."
+            ),
+            is_error=True,
+            error_kind=ToolErrorKind.NOT_FOUND,
+            hint=(
+                "Check the event with calendar_list_events. If that also fails for this "
+                "calendar, " + _not_visible_guidance(connected_account)
+            ),
+        )
+
+    def _skipped_note(skipped: list[str]) -> str:
+        if not skipped:
+            return ""
+        return (
+            f"\n(Skipped {len(skipped)} saved calendar(s) not visible to the connected "
+            f"Google account ({_account_label(connected_account)}): {', '.join(skipped)}. "
+            f"They may belong to a different Google account. "
+            f"{_not_visible_guidance(connected_account)})"
+        )
+
     async def calendar_list_calendars() -> ToolResult:
-        """List enabled calendars for the user."""
+        """List the saved calendar selection, checked against the live connection."""
         if not _enabled:
             return ToolResult(content="No calendars enabled.")
 
-        lines = [f"{len(_enabled)} enabled calendar(s):"]
+        live = await _live_calendar_roles()
+        lines = [
+            f"{len(_enabled)} enabled calendar(s), from the calendar selection saved in "
+            f"Settings. Connected Google account: {_account_label(connected_account)}."
+        ]
+        if live is None:
+            lines.append(
+                "(Could not check these against Google right now; they may not all be reachable.)"
+            )
+        not_visible: list[str] = []
         for cal_id, cal_name, disabled, access_role in _enabled:
+            if live is not None and not is_calendar_visible(cal_id, set(live)):
+                not_visible.append(cal_name)
+                lines.append(
+                    f"- {cal_name} | NOT VISIBLE to the connected Google account, every "
+                    f"call on it will fail | id: {cal_id}"
+                )
+                continue
+            # Prefer the role Google reports now over the one saved with the
+            # config, which can be stale after a reconnect.
+            if live is not None and live.get(cal_id):
+                access_role = live[cal_id]
             disabled_set = set(disabled)
             allowed = [
                 t.replace("calendar_", "").replace("_", " ")
@@ -380,6 +511,12 @@ def create_calendar_tools(
                 parts.append(f"blocked: {', '.join(blocked)}")
             parts.append(f"id: {cal_id}")
             lines.append("- " + " | ".join(parts))
+        if not_visible:
+            lines.append(
+                f"{len(not_visible)} saved calendar(s) are not visible to the connected "
+                f"account and may belong to a different Google account. "
+                f"{_not_visible_guidance(connected_account)}"
+            )
         return ToolResult(content="\n".join(lines))
 
     async def calendar_list_events(
@@ -435,10 +572,12 @@ def create_calendar_tools(
                     error_kind=ToolErrorKind.SERVICE,
                 )
             except httpx.HTTPStatusError as exc:
-                if exc.response.status_code == 404 and len(query_cals) > 1:
-                    logger.warning("Calendar %s (%s) returned 404, skipping", cal_id, cal_name)
-                    skipped.append(cal_name)
-                    continue
+                if exc.response.status_code == 404:
+                    if len(query_cals) > 1:
+                        logger.warning("Saved calendar returned 404, skipping")
+                        skipped.append(cal_name)
+                        continue
+                    return await _not_found_result(cal_id, "list events")
                 return _handle_http_error(exc, "list events")
             except Exception as exc:
                 logger.exception("Calendar list_events failed for %s", cal_id)
@@ -448,12 +587,19 @@ def create_calendar_tools(
                     error_kind=ToolErrorKind.SERVICE,
                 )
 
-        skip_note = ""
-        if skipped:
-            skip_note = (
-                f"\n(Skipped {len(skipped)} calendar(s) not found: "
-                f"{', '.join(skipped)}. Refresh calendar config in Settings.)"
+        if skipped and len(skipped) == len(query_cals):
+            return ToolResult(
+                content=(
+                    f"Could not list events: none of the {len(skipped)} saved calendar(s) "
+                    f"({', '.join(skipped)}) are visible to the Google account connected to "
+                    f"Google Calendar ({_account_label(connected_account)}). They may belong "
+                    "to a different Google account."
+                ),
+                is_error=True,
+                error_kind=ToolErrorKind.NOT_FOUND,
+                hint=_not_visible_guidance(connected_account),
             )
+        skip_note = _skipped_note(skipped)
 
         if not all_events:
             return ToolResult(
@@ -526,6 +672,8 @@ def create_calendar_tools(
                 error_kind=ToolErrorKind.SERVICE,
             )
         except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                return await _not_found_result(resolved_id, "create event")
             return _handle_http_error(exc, "create event")
         except Exception as exc:
             logger.exception("Calendar create_event failed")
@@ -611,6 +759,8 @@ def create_calendar_tools(
                 error_kind=ToolErrorKind.SERVICE,
             )
         except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                return await _not_found_result(resolved_id, "update event", event_id=event_id)
             return _handle_http_error(exc, f"update event {event_id}")
         except Exception as exc:
             logger.exception("Calendar update_event failed")
@@ -654,6 +804,8 @@ def create_calendar_tools(
                 error_kind=ToolErrorKind.SERVICE,
             )
         except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                return await _not_found_result(resolved_id, "delete event", event_id=event_id)
             return _handle_http_error(exc, f"delete event {event_id}")
         except Exception as exc:
             logger.exception("Calendar delete_event failed")
@@ -710,18 +862,18 @@ def create_calendar_tools(
                 busy_slots = await service.check_availability(cal_id, time_min, time_max)
                 for slot in busy_slots:
                     all_slots.append((cal_name, slot))
+                continue
             except httpx.TimeoutException:
                 return ToolResult(
                     content="Calendar service unavailable (timeout). Try again shortly.",
                     is_error=True,
                     error_kind=ToolErrorKind.SERVICE,
                 )
+            except CalendarNotVisibleError:
+                pass
             except httpx.HTTPStatusError as exc:
-                if exc.response.status_code == 404 and len(query_cals) > 1:
-                    logger.warning("Calendar %s (%s) returned 404, skipping", cal_id, cal_name)
-                    skipped.append(cal_name)
-                    continue
-                return _handle_http_error(exc, "check availability")
+                if exc.response.status_code != 404:
+                    return _handle_http_error(exc, "check availability")
             except Exception as exc:
                 logger.exception("Calendar check_availability failed for %s", cal_id)
                 return ToolResult(
@@ -729,13 +881,27 @@ def create_calendar_tools(
                     is_error=True,
                     error_kind=ToolErrorKind.SERVICE,
                 )
+            # Reached only when the connection cannot see this saved calendar.
+            if len(query_cals) == 1:
+                return await _not_found_result(cal_id, "check availability")
+            logger.warning("Saved calendar not visible to connection, skipping")
+            skipped.append(cal_name)
 
-        skip_note = ""
-        if skipped:
-            skip_note = (
-                f"\n(Skipped {len(skipped)} calendar(s) not found: "
-                f"{', '.join(skipped)}. Refresh calendar config in Settings.)"
+        # An unreachable calendar reports no busy slots. Saying "free" when
+        # nothing could be checked would invite a double booking.
+        if skipped and len(skipped) == len(query_cals):
+            return ToolResult(
+                content=(
+                    f"Could not check availability: none of the {len(skipped)} saved "
+                    f"calendar(s) ({', '.join(skipped)}) are visible to the Google account "
+                    f"connected to Google Calendar ({_account_label(connected_account)}). "
+                    "They may belong to a different Google account."
+                ),
+                is_error=True,
+                error_kind=ToolErrorKind.NOT_FOUND,
+                hint=_not_visible_guidance(connected_account),
             )
+        skip_note = _skipped_note(skipped)
 
         if not all_slots:
             return ToolResult(
@@ -751,6 +917,8 @@ def create_calendar_tools(
             lines.append(
                 f"- {label}{slot.start.strftime('%Y-%m-%d %H:%M')} - {slot.end.strftime('%H:%M')}"
             )
+        if skip_note:
+            lines.append(skip_note)
         return ToolResult(content="\n".join(lines))
 
     return [
@@ -759,7 +927,8 @@ def create_calendar_tools(
             tags={ToolTags.READ_ONLY},
             description=(
                 "List the calendars the user has enabled for the assistant. "
-                "Shows calendar names and IDs."
+                "Shows calendar names and IDs, the connected Google account, and flags "
+                "saved calendars that account can no longer see."
             ),
             function=calendar_list_calendars,
             params_model=CalendarListCalendarsParams,
@@ -1050,14 +1219,7 @@ async def _calendar_factory(ctx: ToolContext) -> list[Tool]:
     token = await oauth_service.get_valid_token(ctx.user.id, "google_calendar")
     if token is None or not token.access_token:
         return []
-    service = GoogleCalendarService(
-        access_token=token.access_token,
-        refresh_token=token.refresh_token,
-        client_id=settings.google_calendar_client_id,
-        client_secret=settings.google_calendar_client_secret,
-        token_expires_at=token.expires_at or 0.0,
-        on_token_refresh=oauth_service.build_on_refresh_callback(ctx.user.id, "google_calendar"),
-    )
+    service = build_calendar_service(ctx.user.id, token)
     enabled_calendars = await _get_enabled_calendars(ctx.user.id)
     primary_calendar_id = await _get_primary_calendar_id(ctx.user.id)
     return create_calendar_tools(
@@ -1065,6 +1227,7 @@ async def _calendar_factory(ctx: ToolContext) -> list[Tool]:
         user_timezone=ctx.user.timezone,
         enabled_calendars=enabled_calendars,
         primary_calendar_id=primary_calendar_id,
+        connected_account=token.account_email,
     )
 
 
@@ -1114,6 +1277,9 @@ def _register() -> None:
         ],
         auth_check=_calendar_auth_check,
     )
+    # Reconcile saved calendars with whichever account was just connected,
+    # so ids from a previous account stop 404ing (see ``sync``).
+    oauth_service.register_post_connect_hook("google_calendar", resync_after_connect)
 
 
 _register()
