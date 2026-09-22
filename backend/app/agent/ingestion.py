@@ -31,6 +31,7 @@ from backend.app.agent.approval import (
 from backend.app.agent.concurrency import user_locks
 from backend.app.agent.context import get_or_create_conversation
 from backend.app.agent.dto import SessionState, StoredMessage
+from backend.app.agent.midturn import PendingInbound, midturn_inbox, run_unless_folded
 from backend.app.agent.router import handle_inbound_message
 from backend.app.agent.session_db import get_session_store
 from backend.app.agent.user_db import provision_user
@@ -344,6 +345,7 @@ async def _dispatch_to_pipeline(
     request_id: str = "",
     downloaded_media: list[DownloadedMedia] | None = None,
     download_media: Callable[[str], Awaitable[DownloadedMedia]] | None = None,
+    batched_messages: list[StoredMessage] | None = None,
 ) -> None:
     """Acquire the per-user lock, refresh user state, and run the agent pipeline.
 
@@ -357,17 +359,44 @@ async def _dispatch_to_pipeline(
     the batcher dispatches the first but before the approval gate is set
     would deadlock: pipeline 1 waits on the gate, pipeline 2 waits on
     the lock, nobody resolves the gate.
+
+    A messaging-channel dispatch that has to wait registers itself in
+    ``midturn_inbox``. If the turn holding the lock claims it (see
+    ``backend/app/agent/midturn.py``), the message is answered by that
+    turn's single reply and this dispatch returns without running one.
+    ``batched_messages`` lists every persisted inbound a batcher flush
+    covers, so a claimed batch is folded in whole; it defaults to
+    ``[message]``.
     """
     user_id = user.id
     pipeline_error: Exception | None = None
     timed_out = False
     gate = get_approval_gate()
 
+    # Webchat requests (``request_id``) own an SSE response future that
+    # expects its own reply, so only messaging-channel dispatches can be
+    # folded into a turn that is already running.
+    fold_entry: PendingInbound | None = None
+    if channel and not request_id:
+        fold_entry = PendingInbound(
+            user_id=user_id,
+            session_id=session.session_id,
+            channel=channel,
+            messages=list(batched_messages) if batched_messages else [message],
+            media_urls=list(media_urls),
+            downloaded_media=list(downloaded_media or []),
+            download_media=download_media,
+        )
+
     async def _interrupt_stale_approval() -> None:
         """Resolve a stale approval gate so the previous pipeline releases the lock."""
         try:
             while True:
                 await asyncio.sleep(0.5)
+                if fold_entry is not None and fold_entry.consumed.is_set():
+                    # The running turn is answering this message, so an
+                    # approval it asks for next is current, not stale.
+                    return
                 if gate.has_pending(user_id):
                     logger.info(
                         "New message queued for user %s; resolving stale approval as INTERRUPTED",
@@ -378,49 +407,72 @@ async def _dispatch_to_pipeline(
         except asyncio.CancelledError:
             return
 
+    async def _run_locked() -> None:
+        nonlocal user, session, pipeline_error
+        async with user_locks.acquire(user_id):
+            interrupt_task.cancel()
+            if fold_entry is not None:
+                # From here on this dispatch is the running turn and must
+                # not be claimed by its own drain.
+                midturn_inbox.unregister(fold_entry)
+            try:
+                # Defensive User reload: pull the latest row so any
+                # writes from a previous pipeline that was holding
+                # the lock (e.g. via ingestion or admin updates)
+                # land on this turn.
+                async with db_session_async() as db:
+                    fresh = (
+                        await db.execute(select(User).filter_by(id=user_id))
+                    ).scalar_one_or_none()
+                    if fresh is not None:
+                        db.expunge(fresh)
+                        user = fresh
+                # Reload session messages from DB so we see any
+                # messages persisted by a previous pipeline that
+                # was holding the lock (e.g. tool interactions
+                # from an interrupted approval).
+                fresh_session = await get_session_store(user_id).load_session_async(
+                    session.session_id
+                )
+                if fresh_session is not None:
+                    session = fresh_session
+                await handle_inbound_message(
+                    user=user,
+                    session=session,
+                    message=message,
+                    media_urls=media_urls,
+                    downloaded_media=downloaded_media,
+                    channel=channel,
+                    request_id=request_id,
+                    download_media=download_media,
+                )
+            except Exception as exc:
+                pipeline_error = exc
+
+    folded = False
     try:
         async with asyncio.timeout(settings.agent_processing_timeout_seconds):
             interrupt_task = asyncio.create_task(_interrupt_stale_approval())
             try:
-                async with user_locks.acquire(user_id):
-                    interrupt_task.cancel()
-                    try:
-                        # Defensive User reload: pull the latest row so any
-                        # writes from a previous pipeline that was holding
-                        # the lock (e.g. via ingestion or admin updates)
-                        # land on this turn.
-                        async with db_session_async() as db:
-                            fresh = (
-                                await db.execute(select(User).filter_by(id=user_id))
-                            ).scalar_one_or_none()
-                            if fresh is not None:
-                                db.expunge(fresh)
-                                user = fresh
-                        # Reload session messages from DB so we see any
-                        # messages persisted by a previous pipeline that
-                        # was holding the lock (e.g. tool interactions
-                        # from an interrupted approval).
-                        fresh_session = await get_session_store(user_id).load_session_async(
-                            session.session_id
-                        )
-                        if fresh_session is not None:
-                            session = fresh_session
-                        await handle_inbound_message(
-                            user=user,
-                            session=session,
-                            message=message,
-                            media_urls=media_urls,
-                            downloaded_media=downloaded_media,
-                            channel=channel,
-                            request_id=request_id,
-                            download_media=download_media,
-                        )
-                    except Exception as exc:
-                        pipeline_error = exc
+                if fold_entry is None:
+                    await _run_locked()
+                else:
+                    midturn_inbox.register(fold_entry)
+                    folded = not await run_unless_folded(_run_locked(), fold_entry.consumed)
             finally:
                 interrupt_task.cancel()
+                if fold_entry is not None:
+                    midturn_inbox.unregister(fold_entry)
     except TimeoutError:
         timed_out = True
+
+    if folded:
+        logger.info(
+            "Message seq %d for user %s was folded into the running turn",
+            message.seq,
+            user_id,
+        )
+        return
 
     # Error fallback runs outside both the timeout and lock scopes so it
     # is never cut short by the same timeout that killed the pipeline.
@@ -568,6 +620,7 @@ class MessageBatcher:
             request_id=state.request_id,
             downloaded_media=all_downloaded or None,
             download_media=state.download_media,
+            batched_messages=[entry.message for entry in state.entries],
         )
 
 

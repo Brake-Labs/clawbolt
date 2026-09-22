@@ -27,7 +27,8 @@ from backend.app.agent.events import (
     ToolExecutionStartEvent,
     TurnStartEvent,
 )
-from backend.app.agent.messages import AgentMessage
+from backend.app.agent.messages import AgentMessage, UserMessage
+from backend.app.agent.midturn import PendingInbound, midturn_inbox
 from backend.app.agent.onboarding import (
     OnboardingSubscriber,
     build_onboarding_system_prompt,
@@ -74,6 +75,9 @@ MEDIA_DOWNLOAD_PARTIAL_ERROR = (
     "I couldn't download {failed} of the {total} attachments you sent. "
     "I'll work with the ones that came through."
 )
+# Prefixed to a message folded into a running turn (see ``midturn.py``) so
+# the model answers it in the reply it is already writing.
+FOLDED_MESSAGE_NOTE = "[Sent while you were working on this turn. Cover it in your reply.]"
 VISION_UNAVAILABLE_NOTE = (
     "Vision analysis was unavailable for the attached media. "
     "The user may have sent a photo or document that could "
@@ -183,6 +187,18 @@ async def prepare_media(
     turns. The agent drives all save/organize decisions via tools, so no
     auto-save happens here.
     """
+    downloaded_media = await download_and_stage_media(user, message, media_urls, download_media)
+    storage = await init_storage(user)
+    return downloaded_media, storage
+
+
+async def download_and_stage_media(
+    user: User,
+    message: StoredMessage,
+    media_urls: list[tuple[str, str]],
+    download_media: Callable[[str], Awaitable[DownloadedMedia]] | None = None,
+) -> list[DownloadedMedia]:
+    """Download *media_urls* and stage the bytes so tools can reach them by handle."""
     downloaded_media: list[DownloadedMedia] = []
     logger.debug(
         "Preparing media for user %s, message seq=%d: %d attachment(s)",
@@ -201,9 +217,7 @@ async def prepare_media(
                 logger.debug("Downloaded media %s (%s)", file_id, _mime_type)
             except Exception:
                 logger.exception("Failed to download media: %s", file_id)
-
-    storage = await init_storage(user)
-    return downloaded_media, storage
+    return downloaded_media
 
 
 async def build_message_context(
@@ -269,6 +283,7 @@ async def run_agent(
     session_id: str = "",
     request_id: str = "",
     llm_override: UserLLMOverride | None = None,
+    drain_inbound: Callable[[], Awaitable[list[UserMessage]]] | None = None,
 ) -> AgentResponse:
     """Initialize agent with tools and process the message.
 
@@ -314,6 +329,7 @@ async def run_agent(
         excluded_tool_names=disabled_sub_tools or None,
         request_id=request_id,
         llm_override=llm_override,
+        drain_inbound=drain_inbound,
     )
 
     tools, specialist_summaries = await assemble_turn_tools(
@@ -466,8 +482,22 @@ async def build_context_step(ctx: PipelineContext) -> PipelineContext:
 
 async def load_history_step(ctx: PipelineContext) -> PipelineContext:
     """Load conversation history and set up onboarding."""
+    history_session = ctx.session
+    current_seq = ctx.message.seq
+    if current_seq and any(m.seq > current_seq for m in ctx.session.messages):
+        # Rows persisted after this turn's message, while it waited on the
+        # user lock. Later inbounds are not history: the turn folds them in.
+        # Later outbounds (the previous turn's reply) are. The loader treats
+        # the last row as the current message, so it goes last.
+        earlier = [
+            m
+            for m in ctx.session.messages
+            if m.seq < current_seq
+            or (m.seq > current_seq and m.direction == MessageDirection.OUTBOUND)
+        ]
+        history_session = ctx.session.model_copy(update={"messages": [*earlier, ctx.message]})
     ctx.conversation_history = await load_conversation_history(
-        ctx.session, tz_name=ctx.user.timezone
+        history_session, tz_name=ctx.user.timezone
     )
     ctx.is_onboarding = is_onboarding_needed(ctx.user)
     # Pass user (inbound) message count so the onboarding subscriber's
@@ -485,6 +515,79 @@ async def load_history_step(ctx: PipelineContext) -> PipelineContext:
     ctx.event_subscribers.append(onboarding_sub)
     ctx._onboarding_sub = onboarding_sub
     return ctx
+
+
+async def _fold_entry_messages(ctx: PipelineContext, entry: PendingInbound) -> list[UserMessage]:
+    """Run one claimed dispatch through the media pipeline, as its own turn would.
+
+    Earlier messages of a batched dispatch contribute their text; the last
+    one carries the batch's merged media, mirroring ``MessageBatcher``.
+    Failures degrade to the raw text rather than losing the message, since
+    the claim already stopped it from running a turn of its own.
+    """
+    folded: list[UserMessage] = []
+    *earlier, last = entry.messages
+    for msg in earlier:
+        content = msg.processed_context or msg.body
+        if content.strip():
+            folded.append(UserMessage(content=f"{FOLDED_MESSAGE_NOTE}\n\n{content}", seq=msg.seq))
+    try:
+        for media in entry.downloaded_media:
+            await media_staging.stage(
+                ctx.user.id, media.original_url, media.content, media.mime_type
+            )
+        downloaded = list(entry.downloaded_media) + await download_and_stage_media(
+            ctx.user, last, entry.media_urls, entry.download_media
+        )
+        content = await build_message_context(
+            ctx.session, last, ctx.user, entry.media_urls, downloaded
+        )
+        # Tools that read this list at call time see the folded media. File
+        # tools snapshot it when built, so they reach folded media only by
+        # its staged handle.
+        ctx.downloaded_media.extend(downloaded)
+    except Exception:
+        logger.exception(
+            "Failed to process folded message seq %d for user %s; using raw text",
+            last.seq,
+            ctx.user.id,
+        )
+        content = last.body
+        if entry.media_urls:
+            content += f"\n\n[System note: {MEDIA_DOWNLOAD_ERROR}]"
+    if content.strip():
+        folded.append(UserMessage(content=f"{FOLDED_MESSAGE_NOTE}\n\n{content}", seq=last.seq))
+    return folded
+
+
+def _make_inbound_drain(
+    ctx: PipelineContext,
+) -> Callable[[], Awaitable[list[UserMessage]]] | None:
+    """Build the hook the agent loop calls to fold in newly arrived messages.
+
+    ``None`` for webchat turns (``request_id``): see ``midturn.py`` for why
+    only messaging-channel dispatches fold.
+    """
+    if not ctx.channel or ctx.request_id:
+        return None
+
+    async def _drain() -> list[UserMessage]:
+        entries = midturn_inbox.claim(ctx.user.id, ctx.session.session_id, ctx.channel)
+        if not entries:
+            return []
+        logger.info(
+            "Folding %d mid-turn message(s) (seqs %s) into the turn for seq %d, user %s",
+            sum(len(e.messages) for e in entries),
+            [m.seq for e in entries for m in e.messages],
+            ctx.message.seq,
+            ctx.user.id,
+        )
+        folded: list[UserMessage] = []
+        for entry in entries:
+            folded.extend(await _fold_entry_messages(ctx, entry))
+        return folded
+
+    return _drain
 
 
 async def run_agent_step(ctx: PipelineContext) -> PipelineContext:
@@ -514,6 +617,7 @@ async def run_agent_step(ctx: PipelineContext) -> PipelineContext:
         session_id=ctx.session.session_id,
         request_id=ctx.request_id,
         llm_override=override,
+        drain_inbound=_make_inbound_drain(ctx),
     )
     return ctx
 

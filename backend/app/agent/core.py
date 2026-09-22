@@ -200,8 +200,14 @@ class ClawboltAgent:
         excluded_tool_names: set[str] | None = None,
         request_id: str = "",
         llm_override: UserLLMOverride | None = None,
+        drain_inbound: Callable[[], Awaitable[list[UserMessage]]] | None = None,
     ) -> None:
         self.user = user
+        # Returns user messages that arrived for this session since the turn
+        # started (see ``backend/app/agent/midturn.py``). Called before every
+        # LLM call so one reply covers everything the user sent. None for
+        # turns that must not absorb inbound traffic (heartbeats, webchat).
+        self._drain_inbound = drain_inbound
         self._channel = channel
         self._publish_outbound = publish_outbound
         self._chat_id = chat_id
@@ -1420,6 +1426,22 @@ class ClawboltAgent:
             trimmed_count=trimmed_count,
         )
 
+    async def _fold_pending_inbound(self, messages: list[AgentMessage]) -> int:
+        """Append user messages that arrived mid-turn; return how many.
+
+        A drain failure is logged and treated as nothing pending: the turn
+        still answers what it already has.
+        """
+        if self._drain_inbound is None:
+            return 0
+        try:
+            folded = await self._drain_inbound()
+        except Exception:
+            logger.exception("Failed to drain mid-turn messages for user %s", self.user.id)
+            return 0
+        messages.extend(folded)
+        return len(folded)
+
     async def process_message(
         self,
         message_context: str,
@@ -1519,6 +1541,10 @@ class ClawboltAgent:
             # after the first.
             tool_schemas = self._get_or_build_tool_schemas()
             self._log_tool_prefix_stability(_round)
+            # Messages the user sent while this turn was running (e.g. an
+            # iMessage caption delivered separately from its photo) join
+            # before the next LLM call instead of starting a second turn.
+            await self._fold_pending_inbound(messages)
             await self._emit(TurnStartEvent(round_number=_round, message_count=len(messages)))
             response = await self._call_llm_with_retry(
                 messages, tool_schemas, max_tokens=max_tokens
@@ -1595,6 +1621,24 @@ class ClawboltAgent:
                 return await _abort_without_persisting(response)
 
             if not parsed_raw:
+                # A message that landed during this LLM call makes the draft
+                # stale: it answers without what the user just added. Drop
+                # the unsent draft and run another round with the new
+                # message in context, so the user gets one reply. On the
+                # last round there is no room for that, so the message stays
+                # queued and gets its own turn.
+                if _round < MAX_TOOL_ROUNDS - 1:
+                    folded_count = await self._fold_pending_inbound(messages)
+                    if folded_count:
+                        logger.info(
+                            "Round %d: discarding draft reply to fold %d new message(s)",
+                            _round,
+                            folded_count,
+                        )
+                        await self._emit(
+                            TurnEndEvent(round_number=_round, has_more_tool_calls=True)
+                        )
+                        continue
                 reply_text = get_response_text(response)
                 # Capture thinking from the final response only. Earlier
                 # rounds produced tool calls and their thinking justifies

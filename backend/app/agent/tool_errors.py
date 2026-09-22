@@ -49,8 +49,9 @@ _ERROR_KIND_HINTS: dict[ToolErrorKind, str] = {
         "[The user changed the subject instead of responding to the approval prompt."
         " Do not retry this tool. In one short sentence, tell the user you are"
         " skipping the specific action they did not approve (name it) and that"
-        " they can ask for it again later. Then end your turn."
-        " The user's new message is being handled separately.]"
+        " they can ask for it again later. If the user's new message follows"
+        " this result, answer it in the same reply. Otherwise end your turn;"
+        " it is handled separately.]"
     ),
 }
 
