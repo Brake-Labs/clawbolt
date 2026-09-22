@@ -175,18 +175,19 @@ MAX_TOKEN_ACCOUNTING_DIVERGENCE = 1.15
 # Share of the turns a run tried to read an incumbent decision for that may
 # be confounded before the tiers comparing two real decisions stop blocking.
 # Two confounders are measured per run, and each is held to this separately:
-# ``turns_incumbent_unavailable`` (the record could not be read back, so the
-# turn is in no comparison) and ``turns_flattened_rounds`` (the reading
-# dropped a call the scored decision might have been made alongside).
+# ``turns_incumbent_unavailable``, where the record could not be read back at
+# all, and ``turns_flattened_rounds``, where it could but the divergence the
+# run scored may be the missing round boundary rather than the candidate.
 #
 # This is what replaced gating those tiers on the mode. Both compare two real
-# decisions taken at the same point in the turn, so what actually threatens
-# them is not the incumbent being unmeasured, it is the *sample* being
-# unrepresentative of the turns it was drawn from. A fifth of the sample is
-# where a 100% rate could still be a 75% rate, which is on the other side of
-# every ceiling here; below it no plausible correction to the confounded
-# turns moves a blocking rate back under its ceiling. Above it the finding is
-# filed as withheld, which makes the run inconclusive rather than approving.
+# decisions taken at the same point in the turn, so what threatens them is
+# not the incumbent being unmeasured, it is the *sample* being
+# unrepresentative of the turns it was drawn from. At a fifth, reading every
+# confounded turn in the candidate's favor still leaves four fifths of the
+# measured rate standing, and the ceilings the two tiers block at are 10% and
+# a 10% net preference: nothing below this line is close enough to its
+# ceiling for that correction to clear it. Above it the finding is filed as
+# withheld, which makes the run inconclusive rather than approving.
 MAX_CONFOUNDED_TURN_RATE = 0.20
 
 # Extra rounds a replay may spend on lookups before its decision is scored.
@@ -249,6 +250,20 @@ def replayable_lookup(
     stayed on the first recorded call, and every lookup-then-act turn then
     read as the candidate acting where production had only looked something
     up. An identical candidate scored ``do_not_switch``.
+
+    **One exception, and it is not fixable here.** ``call_model`` spends
+    ``MAX_REPLAY_READ_ROUNDS`` in rounds and sees a response's calls
+    together; ``tool_interactions_json`` is one flat list with no round
+    boundaries, so the historic walk spends the same budget in calls. On a
+    turn where production asked for several things at once the two land on
+    different decisions: a lookup and a write in one response is scored whole
+    on the candidate's side and as the write alone on the record's, and four
+    lookups batched two to a round leave the replay at the write and the walk
+    out of budget on the fourth lookup. ``turns_flattened_rounds`` counts the
+    turns where this bit and the report says so.
+    ``tests/multi_user/test_llm_eval_decision_parity.py`` drives both paths
+    over one record and pins these two cases, so neither walk moves without
+    the divergence moving with it.
     """
     tool = tools_by_name.get(name)
     if tool is None or is_mutating_call(tool, arguments):
@@ -757,15 +772,15 @@ class RunAggregate:
     comparable, so they are in no rate's denominator.
     """
     turns_flattened_rounds: int = 0
-    """Turns where reading the recorded calls as rounds dropped a call.
+    """Diverging turns whose recorded calls could not be split into rounds.
 
     ``tool_interactions_json`` holds one flat list per outbound row, so a
     turn that recorded several calls may have asked for them all at once.
     They are read as separate rounds (see ``sampling.HistoricDecision``),
     and on these turns that reading could understate what the incumbent
-    asked for in one breath. Counted only where a call the scored decision
-    might have been made alongside was dropped, not on every multi-call
-    turn: a leading lookup is shown on both sides either way.
+    asked for in one breath. Counted only where the two sides diverged,
+    which is where the reading could have produced the divergence; see
+    ``_flattening_could_have_decided``.
     """
     configuration_drift: str = ""
     """What is known about which model actually answered the sampled turns.
@@ -855,9 +870,8 @@ class RunAggregate:
             "turn(s) had no incumbent decision to read": (
                 self.turns_incumbent_unavailable / attempted
             ),
-            "turn(s) dropped a call the incumbent may have asked for in the same round": (
-                self.turns_flattened_rounds / attempted
-            ),
+            "diverging turn(s) may be diverging only because the record lost its "
+            "round boundaries": (self.turns_flattened_rounds / attempted),
         }
 
     @property
@@ -976,6 +990,24 @@ def sign_test_p(excess: int, deficit: int) -> float:
     return sum(comb(n, k) for k in range(excess, n + 1)) / 2**n
 
 
+def _flattening_could_have_decided(comparison: TurnComparison) -> bool:
+    """Whether reading the record as rounds could have changed this turn's verdict.
+
+    Only where the two sides were scored as diverging. There, the divergence
+    may be the missing round boundary rather than the models: the candidate
+    that asked for a lookup and a write in one response is scored on both,
+    while the record's flat list is walked call by call and scores the write
+    alone (see ``replayable_lookup``). Where they landed on the same call, or
+    both answered in prose, the grouping the record lost is not something any
+    tier scores, so the ambiguity had no verdict to change.
+
+    Without this the warning fired on nearly every acting turn, a plain
+    lookup-then-write included, which is the commonest multi-call shape there
+    is. A caveat attached to most of the report is one nobody reads.
+    """
+    return comparison.agreement not in (AgreementClass.IDENTICAL, AgreementClass.BOTH_REPLIED)
+
+
 def aggregate(
     comparisons: list[TurnComparison],
     targets: RunTargets | None = None,
@@ -1018,7 +1050,12 @@ def aggregate(
         failed = bool(comparison.candidate.error or comparison.baseline.error)
         if unavailable:
             agg.turns_incumbent_unavailable += 1
-        elif not failed and comparison.sample.historic_calls_flattened and not measured:
+        elif (
+            not failed
+            and not measured
+            and comparison.sample.historic_calls_flattened
+            and _flattening_could_have_decided(comparison)
+        ):
             # Only over the turns that were actually compared, so this and
             # ``turns_incumbent_unavailable`` share the denominator
             # ``blocking_comparable`` divides them by.
@@ -1384,11 +1421,12 @@ def _decide(agg: RunAggregate) -> None:
 
     if agg.turns_flattened_rounds:
         agg.warnings.append(
-            f"On {agg.turns_flattened_rounds} turn(s) the transcript records more calls "
-            f"after the incumbent's scored one in the same flat list, so whether it asked "
-            f"for them in one round or several is not recoverable. They are read as "
-            f"separate rounds, which understates any turn where the incumbent in fact "
-            f"asked for more in one breath."
+            f"On {agg.turns_flattened_rounds} of the turns counted as divergences, the "
+            f"transcript records several tool calls in one flat list, so whether the "
+            f"incumbent asked for them in one round or several is not recoverable. They "
+            f"are read as separate rounds, which understates any turn where the incumbent "
+            f"in fact asked for more in one breath, and the divergence on these turns may "
+            f"be that reading rather than the candidate."
         )
 
     unresolved = agg.safety_counts.get(str(SafetyFinding.UNRESOLVED_TOOL_NAME), 0)

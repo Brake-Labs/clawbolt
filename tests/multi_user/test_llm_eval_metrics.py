@@ -864,6 +864,70 @@ def test_a_confounded_sample_withholds_the_block_and_answers_inconclusive() -> N
     assert any("had no incumbent decision to read" in r for r in agg.reasons)
 
 
+def test_a_flattened_turn_the_two_sides_agreed_on_is_not_counted() -> None:
+    """The warning fired on nearly every acting turn, so nobody read it.
+
+    A lookup-then-write turn records two calls in one flat list, and both
+    sides land on the write anyway. Whether production asked for them in one
+    breath or two is not something any tier scores, so there was no verdict
+    for the ambiguity to change.
+    """
+    comparisons = [_identical_turn(i) for i in range(1, 21)]
+    flattened = [
+        TurnComparison(
+            sample=ReplaySample(
+                seq=seq,
+                timestamp="2026-05-01T12:00:00+00:00",
+                message_context="invoice Acme",
+                historic_calls_flattened=True,
+            ),
+            baseline=_call(
+                ToolCall(name="send_message", arguments={"recipient": "a", "body": "b"})
+            ),
+            candidate=_call(
+                ToolCall(name="send_message", arguments={"recipient": "a", "body": "b"})
+            ),
+            agreement=AgreementClass.IDENTICAL,
+        )
+        for seq in range(21, 31)
+    ]
+
+    agg = metrics.aggregate([*comparisons, *flattened], incumbent_source=IncumbentSource.HISTORIC)
+    assert agg.turns_flattened_rounds == 0
+    assert not any("one flat list" in w for w in agg.warnings)
+
+
+def test_a_flattened_turn_scored_as_a_divergence_is_counted() -> None:
+    """There the missing round boundary may be the divergence itself.
+
+    A candidate that asked for the lookup and the write in one response is
+    scored on both; the record has no boundary, so the walk skips the lookup
+    and scores the write alone. The two then differ over a turn on which they
+    may have done the same thing.
+    """
+    comparisons = [_identical_turn(i) for i in range(1, 21)]
+    comparisons += [
+        TurnComparison(
+            sample=ReplaySample(
+                seq=seq,
+                timestamp="2026-05-01T12:00:00+00:00",
+                message_context="invoice Acme",
+                historic_calls_flattened=True,
+            ),
+            baseline=_call(
+                ToolCall(name="send_message", arguments={"recipient": "a", "body": "b"})
+            ),
+            candidate=_call(ToolCall(name="lookup", arguments={"query": "Acme"})),
+            agreement=AgreementClass.DIFFERENT_TOOLS,
+        )
+        for seq in range(21, 24)
+    ]
+
+    agg = metrics.aggregate(comparisons, incumbent_source=IncumbentSource.HISTORIC)
+    assert agg.turns_flattened_rounds == 3
+    assert any("one flat list" in w for w in agg.warnings)
+
+
 def test_a_flattened_sample_withholds_the_block_too() -> None:
     """The other confounder, counted the same way.
 

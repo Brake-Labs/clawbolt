@@ -372,13 +372,11 @@ class HistoricDecision:
     One thing the transcript cannot give back. ``tool_interactions_json``
     holds one flat, ordered list per outbound row, so a turn that recorded
     three calls could have asked for all three at once or for one at a time
-    across three rounds. ``flattened`` says the reading dropped calls the
-    scored decision might have been made alongside: calls left *after* the
-    scored one in the same list. Leading lookups are excluded, because those
-    are carried on ``lookups`` and shown to the judge on both sides, so the
-    turn is read the same either way. Counted and surfaced rather than
-    assumed away, and narrow enough that a plain lookup-then-write turn, the
-    commonest multi-call shape there is, does not raise it.
+    across three rounds. ``flattened`` says the scored decision sits in such
+    a list. Whether the ambiguity changed anything depends on what the
+    candidate did on the same turn, so ``metrics.aggregate`` is what decides
+    whether to count it; this flag only says the record cannot answer the
+    question.
     """
 
     available: bool
@@ -511,13 +509,12 @@ def _historic_first_decision(
     return HistoricDecision(
         available=True,
         calls=(ToolCall(name=first.name, arguments=first.arguments),),
-        # Unscored calls follow the scored one in the same flat list, so
-        # whether the decision was this call alone or this call and its
-        # neighbours in one round is not recoverable. A dropped *leading*
-        # lookup is not that: it is carried in ``lookups`` and shown on both
-        # sides, so a turn whose only unscored calls are skipped lookups was
-        # read faithfully however production batched them.
-        flattened=len(remaining) > 1,
+        # The scored call shares a flat list with others, so whether the
+        # decision was this call alone or this call and its neighbours in one
+        # round is not recoverable. Whether that mattered depends on what the
+        # candidate did on the same turn, which only ``metrics.aggregate``
+        # can see; this says the ambiguity exists.
+        flattened=len(recorded) > 1,
         lookups=tuple(lookups),
     )
 

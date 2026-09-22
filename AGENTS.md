@@ -224,31 +224,38 @@ docstring is where the mode is explained: what `historic` measures, the four
 things it cannot control, why no run in it clears a candidate outright, and
 what it can still reject one on. Everything else that touches the mode points
 there. `historic`, the default, never calls the incumbent and halves the bill;
-`replay` calls it live on every turn. Choose `replay` when the prompt or tool schema has changed
-since the turns happened, when the incumbent has never run them, or to
-calibrate a model against itself; `divergence_noise_floor` ignores a historic
-run for that reason.
+`replay` calls it live on every turn. Choose `replay` when the prompt or tool
+schema has changed since the turns happened, when the incumbent has never run
+them, or to calibrate a model against itself; `divergence_noise_floor` ignores
+a historic run for that reason.
 
 One property makes `historic` honest rather than merely cheap, and it is one
 edit away from breaking:
 
-- **Both sides are scored at the same point in the turn.**
-  `metrics.replayable_lookup` decides whether a single call is a lookup the
-  replay can answer from the record. `execution.call_model` applies it to the
-  candidate's rounds; `sampling._historic_first_decision` applies it to the
-  recorded calls, skipping the same leading lookups under the same
+- **Both sides are scored at the same point in the turn, except on a batched
+  round.** `metrics.replayable_lookup` decides whether a single call is a
+  lookup the replay can answer from the record. `execution.call_model` applies
+  it to the candidate's rounds; `sampling._historic_first_decision` applies it
+  to the recorded calls, skipping the same leading lookups under the same
   `MAX_REPLAY_READ_ROUNDS` bound. Two readings of that rule is the bug this
   mode shipped with: the candidate was scored on the write it made after a
   lookup and the incumbent on the lookup itself, so a candidate that
   reproduced production exactly came back `do_not_switch` at a 100% silent
-  no-op rate. Whatever is scored on one side has a counterpart on the other,
-  the skipped lookups included, which is also what keeps the two responses
-  structurally indistinguishable in `judge._judge_prompt`. Two things are
-  withheld from that prompt in this mode, both of which mark the recorded side
-  on sight rather than by its content: the live turn's own tool calls, since
-  the incumbent's side is the head of that list, and prose alongside a tool
-  call, which only an elicited decision can carry. The judge defaults to the
-  incumbent model, so either one is a self-preference channel.
+  no-op rate. The exception is where the budget is counted: rounds on the
+  candidate's side, calls on the record's, because `tool_interactions_json`
+  is flat and has no round boundaries to recover. A turn where production
+  asked for several things at once therefore does score the two sides on
+  different decisions, which `turns_flattened_rounds` counts and
+  `tests/multi_user/test_llm_eval_decision_parity.py` pins by driving both
+  paths over one record. Outside that, whatever is scored on one side has a
+  counterpart on the other, the skipped lookups included, which is also what
+  keeps the two responses structurally indistinguishable in
+  `judge._judge_prompt`. Two things are withheld from that prompt in this
+  mode, both of which mark the recorded side on sight rather than by its
+  content: the live turn's own tool calls, since the incumbent's side is the
+  head of that list, and prose alongside a tool call, which only an elicited
+  decision can carry. The judge defaults to the incumbent model, so either one
+  is a self-preference channel.
 
 Three invariants, each of which the feature is worthless without:
 
