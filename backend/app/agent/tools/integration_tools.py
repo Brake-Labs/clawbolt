@@ -145,9 +145,10 @@ def create_integration_tools(ctx: ToolContext) -> list[Tool]:
         if action == "status":
             return await _handle_status(user_id, default_registry)
 
-        if target is None:
+        refusal = _manage_integration_precheck({"action": action, "target": target})
+        if refusal is not None or target is None:
             return ToolResult(
-                content=_missing_target_message(action),
+                content=refusal or _missing_target_message(action),
                 is_error=True,
                 error_kind=ToolErrorKind.VALIDATION,
             )
