@@ -105,7 +105,7 @@ class Settings(BaseSettings):
     inbound_recovery_lookback_minutes: int = Field(default=30, ge=0)
     # Retry recent pending compactions at startup. Zero disables recovery.
     compaction_retry_lookback_minutes: int = Field(default=10_080, ge=0)
-    max_tool_rounds: int = Field(default=10, ge=1)
+    max_tool_rounds: int = Field(default=15, ge=1)
     max_input_tokens: int = Field(default=600_000, ge=1)
     # Primary trim governor. Trigger above the target to provide hysteresis.
     context_trim_target_tokens: int = Field(default=120_000, ge=1)
@@ -610,7 +610,7 @@ def log_config_warnings(s: Settings | None = None) -> list[str]:
     warnings: list[str] = []
 
     if s.max_tool_rounds > 50:
-        warnings.append(f"max_tool_rounds={s.max_tool_rounds} is unusually high (default: 10)")
+        warnings.append(f"max_tool_rounds={s.max_tool_rounds} is unusually high (default: 15)")
     if s.message_batch_window_ms > 10_000:
         warnings.append(
             f"message_batch_window_ms={s.message_batch_window_ms} is unusually high (default: 1500)"
