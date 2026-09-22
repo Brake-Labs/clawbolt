@@ -299,7 +299,7 @@ def build_time_user_context(user: User, now: datetime.datetime | None = None) ->
     does not affect system prompt cache keys.
 
     ``now`` overrides the clock. Live turns leave it None and get wall time.
-    The model-swap replay passes the timestamp of the turn it is replaying,
+    The model comparison replay passes the timestamp of the turn it replays,
     because a turn is read alongside a history whose rows carry their own
     absolute date markers: told it is Wednesday while reading a conversation
     that ended the previous Friday, a model resolves "this past week" to a

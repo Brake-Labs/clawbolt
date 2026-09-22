@@ -1353,10 +1353,10 @@ class ClawboltAgent:
         """Build the exact message list a turn sends to the LLM, pre-flight.
 
         Extracted from ``process_message`` so the offline model-comparison
-        replay (``backend/app/services/llm_eval``) constructs its prompts
-        through this same path. A second implementation would silently make
-        every evaluation score a prompt no user ever received, so the assembly
-        deliberately exists in exactly one place.
+        replay (``backend/app/services/model_comparison``) constructs its
+        prompts through this same path. A second implementation would silently
+        report on prompts no user ever received, so the assembly deliberately
+        exists in one place.
 
         ``now`` overrides the clock stamped onto the current turn. Live turns
         leave it None and get wall time; the replay passes the timestamp of

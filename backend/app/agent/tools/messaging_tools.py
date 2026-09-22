@@ -25,8 +25,8 @@ class SendMediaReplyParams(BaseModel):
 def media_url_error(media_url: str) -> str | None:
     """Why ``send_media_reply`` would refuse *media_url*, or None if it would send.
 
-    Shared by the tool body and its ``precheck`` so the model-swap evaluator
-    sees the same refusal production applies: an empty or ``about:blank`` URL
+    Shared by the tool body and its ``precheck`` so the model comparison
+    report sees the refusal production applies: an empty or ``about:blank`` URL
     sends nothing, and counting it as a message to the user reports a write
     that never happens.
     """

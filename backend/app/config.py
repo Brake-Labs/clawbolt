@@ -124,21 +124,21 @@ class Settings(BaseSettings):
     # "auto" stamps supported Anthropic cache breakpoints; "never" disables them.
     llm_prompt_cache: Literal["auto", "never"] = "auto"
 
-    # Model-swap evaluator (admin console, multi_user only). A run replays a
-    # user's recent turns through their current model and a candidate, so it
-    # issues two LLM calls per turn plus one judge call per divergence.
-    # Concurrency is deliberately modest: the run competes with live user
-    # traffic for the same provider rate limit, and a stalled evaluation is
+    # Model comparison (admin console, multi_user only). A run replays a
+    # user's recent turns through a candidate model, one LLM call per turn
+    # plus up to three more where the turn continues through recorded
+    # lookups. Concurrency is deliberately modest: the run competes with live
+    # user traffic for the same provider rate limit, and a slow comparison is
     # cheaper than a rate-limited inbound message.
-    llm_eval_concurrency: int = Field(default=4, ge=1, le=32)
+    model_comparison_concurrency: int = Field(default=4, ge=1, le=32)
     # Ceiling on turns an operator can request in one run, so a stray value in
     # the admin form cannot start a several-thousand-call job.
-    llm_eval_max_samples: int = Field(default=200, ge=1, le=1000)
-    # Ceiling on evaluations in flight across all users. One run per user is
+    model_comparison_max_samples: int = Field(default=200, ge=1, le=1000)
+    # Ceiling on comparisons in flight across all users. One run per user is
     # enforced separately; without this, N users means N times
-    # ``llm_eval_concurrency`` calls at the same gateway, competing with the
-    # live inbound path for one rate limit.
-    llm_eval_max_concurrent_runs: int = Field(default=2, ge=1, le=20)
+    # ``model_comparison_concurrency`` calls at the same gateway, competing
+    # with the live inbound path for one rate limit.
+    model_comparison_max_concurrent_runs: int = Field(default=2, ge=1, le=20)
 
     # Conversation & memory
     conversation_history_limit: int = Field(default=500, ge=1)

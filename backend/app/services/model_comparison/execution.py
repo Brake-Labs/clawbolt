@@ -1,4 +1,4 @@
-"""Model dispatch for the evaluator.
+"""Model dispatch for the model comparison replay.
 
 Mirrors ``ClawboltAgent._call_llm_with_retry`` in everything that shapes the
 request (cache breakpoints, system-prompt caching, tool caching, thinking
@@ -33,8 +33,6 @@ from backend.app.agent.messages import (
 )
 from backend.app.agent.tools.base import Tool
 from backend.app.config import settings
-from backend.app.services.llm_eval import metrics
-from backend.app.services.llm_eval.types import ModelCallResult, RecordedToolResult, ToolCall
 from backend.app.services.llm_service import (
     LLMTarget,
     apply_history_cache_breakpoint,
@@ -42,6 +40,12 @@ from backend.app.services.llm_service import (
     apply_tool_caching,
     fit_max_tokens_to_reasoning,
     prepare_system_with_caching,
+)
+from backend.app.services.model_comparison import checks
+from backend.app.services.model_comparison.types import (
+    ModelCallResult,
+    RecordedToolResult,
+    ToolCall,
 )
 
 logger = logging.getLogger(__name__)
@@ -87,10 +91,10 @@ def _needs_truncation_retry(result: ModelCallResult, max_tokens: int) -> bool:
     )
 
 
-# Extra rounds a replay may spend on lookups before its decision is scored.
+# Extra rounds a replay may spend on lookups before its decision is recorded.
 # Production runs up to ``MAX_TOOL_ROUNDS``, but a lookup-then-act turn needs
-# one or two, and every round is another paid call on both sides. A model
-# still looking things up after this many is scored on the lookup it asked for.
+# one or two, and every round is another paid call. A model still looking
+# things up after this many is reported on the lookup it asked for.
 MAX_REPLAY_READ_ROUNDS = 3
 
 
@@ -104,33 +108,32 @@ async def call_model(
     tools_by_name: dict[str, Tool] | None = None,
     recorded: Sequence[RecordedToolResult] = (),
 ) -> ModelCallResult:
-    """Replay one turn through one model and return the decision to score.
+    """Replay one turn through one model and return the decision it made.
 
     Provider errors are captured onto the result rather than raised: one
     model failing on one turn is a data point about that model, not a
     reason to abandon a run that may be 90 turns deep.
 
-    *reasoning_effort* is per side and recorded on the run. The two models in
-    a comparison need not share one: effort is not portable across families,
-    so forcing the candidate to the incumbent's setting measures the setting
-    rather than the candidate, and can be rejected outright by a model whose
-    endpoint spells reasoning differently.
+    *reasoning_effort* is recorded on the run rather than read at call time,
+    so a mid-run change to the deployment setting cannot redefine what was
+    measured.
 
-    **Lookups.** Production looks things up before it writes, so scoring only
-    a model's first call penalized a model that did the same against one that
-    guessed an ID and wrote. When every call in a response is read-only and
-    matches a call the live turn made (*recorded*, from
-    ``ReplaySample.historic_tool_results``), the recorded result is fed back
-    and the model is asked again, for up to ``MAX_REPLAY_READ_ROUNDS`` extra
-    rounds. Nothing is executed: a write, a read the live turn never made, or
-    a read with different arguments ends the replay, and that response is the
-    decision scored. Without *tools_by_name* the replay is single-round.
+    **Lookups.** Production looks things up before it writes, so stopping at
+    a model's first call would report a miss for every lookup-then-write turn
+    and would rank a model that guessed an ID and wrote above one that looked
+    it up. When every call in a response is read-only and matches a call the
+    live turn made (*recorded*, from ``ReplaySample.production_tool_calls``),
+    the recorded result is fed back and the model is asked again, for up to
+    ``MAX_REPLAY_READ_ROUNDS`` extra rounds. Nothing is executed: a write, a
+    read the live turn never made, or a read with different arguments ends
+    the replay, and that response is the decision recorded. Without
+    *tools_by_name* the replay is single-round.
 
     Two budget rules keep the replay from charging a model for limits
     production does not impose. A thinking budget at or above ``max_tokens``
-    raises ``max_tokens`` to fit it (``fit_max_tokens_to_reasoning``, which the
-    live loop applies too), and a reply truncated with no tool call is retried at a doubled budget the way
-    the live loop retries it.
+    raises ``max_tokens`` to fit it (``fit_max_tokens_to_reasoning``, which
+    the live loop applies too), and a reply truncated with no tool call is
+    retried at a doubled budget the way the live loop retries it.
     """
     reasoning = target.reasoning_kwargs(reasoning_effort)
     base_budget = fit_max_tokens_to_reasoning(
@@ -169,20 +172,25 @@ def replayable_lookups(
     same arguments (compared after the params model fills defaults). One call
     that would need a live tool, a write included, ends the replay: a partial
     round cannot be answered without executing something.
+
+    This is the one place a replay produces a tool result, and it produces it
+    by copying a string out of the user's own transcript. No tool object is
+    invoked here, and nothing in this module can invoke one: it holds
+    ``Tool`` values only to read ``params_model`` and the read-only tag.
     """
     if result.error or not result.tool_calls or result.stop_reason == "max_tokens":
         return None
     fed: list[RecordedToolResult] = []
     for call in result.tool_calls:
         tool = tools_by_name.get(call.name)
-        if tool is None or metrics.is_mutating_call(tool, call.arguments):
+        if tool is None or checks.is_mutating_call(tool, call.arguments):
             return None
-        wanted = metrics.normalized_args(tool, call.arguments)
+        wanted = checks.normalized_args(tool, call.arguments)
         match = next(
             (
                 r
                 for r in recorded
-                if r.name == call.name and metrics.normalized_args(tool, r.arguments) == wanted
+                if r.name == call.name and checks.normalized_args(tool, r.arguments) == wanted
             ),
             None,
         )
@@ -210,7 +218,7 @@ def _lookup_round_messages(
     """
     requests = [
         ToolCallRequest(
-            id=call.id or f"eval_replay_{round_number}_{index}",
+            id=call.id or f"replay_{round_number}_{index}",
             name=call.name,
             arguments=call.arguments,
         )
@@ -242,7 +250,7 @@ async def _decide(
     while _needs_truncation_retry(result, budget):
         budget = min(budget * 2, _MAX_TOKENS_CEILING)
         logger.info(
-            "Eval call for %s truncated with no tool call; retrying at %d",
+            "Comparison call for %s truncated with no tool call; retrying at %d",
             target.describe(),
             budget,
         )
@@ -296,7 +304,7 @@ async def _dispatch(
             ),
         )
     except AnyLLMError as exc:
-        logger.warning("Eval call failed for %s: %s", target.describe(), exc)
+        logger.warning("Comparison call failed for %s: %s", target.describe(), exc)
         return ModelCallResult(
             provider=target.provider,
             model=target.model,
@@ -304,7 +312,7 @@ async def _dispatch(
             error=f"{type(exc).__name__}: {exc}",
         )
     except Exception as exc:
-        logger.exception("Unexpected eval call failure for %s", target.describe())
+        logger.exception("Unexpected comparison call failure for %s", target.describe())
         return ModelCallResult(
             provider=target.provider,
             model=target.model,
