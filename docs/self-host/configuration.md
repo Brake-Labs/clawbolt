@@ -283,7 +283,7 @@ When `GOOGLE_CALENDAR_CLIENT_ID` and `GOOGLE_CALENDAR_CLIENT_SECRET` are set, us
 | `GMAIL_CLIENT_ID` | | OAuth client ID from the Google Cloud console |
 | `GMAIL_CLIENT_SECRET` | | OAuth client secret from the Google Cloud console |
 
-Use a separate Google OAuth client from Calendar/Drive so the `gmail.readonly` and `gmail.send` scopes can be approved on their own (Google's verification process treats each OAuth client independently). When both variables are set, users can connect Gmail via `manage_integration(action='connect', target='gmail')` or the Tools page. Once connected, the agent gains four tools: `gmail_search`, `gmail_get_message`, `gmail_list_recent`, and `gmail_send`. All four default to `ask` permission so the user is prompted before any inbox read or outbound send.
+Use a separate Google OAuth client from Calendar/Drive so the `gmail.readonly` and `gmail.send` scopes can be approved on their own (Google's verification process treats each OAuth client independently). When both variables are set, users can connect Gmail via `manage_integration(action='connect', target='gmail')` or the Tools page. Once connected, the agent gains five tools: `gmail_search`, `gmail_get_message`, `gmail_open_attachment`, `gmail_list_recent`, and `gmail_send`. All five default to `ask` permission so the user is prompted before any inbox read or outbound send. `gmail_open_attachment` treats an attachment like a file the user sent in chat: PDFs are read as text, and images can be analyzed or saved to Drive. Attachments larger than `MAX_MEDIA_SIZE_BYTES` are refused.
 
 ## CompanyCam
 
