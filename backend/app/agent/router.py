@@ -483,14 +483,19 @@ async def build_context_step(ctx: PipelineContext) -> PipelineContext:
 async def load_history_step(ctx: PipelineContext) -> PipelineContext:
     """Load conversation history and set up onboarding."""
     history_session = ctx.session
-    if ctx.message.seq and any(m.seq > ctx.message.seq for m in ctx.session.messages):
-        # Inbounds persisted after this turn's message (while it waited on
-        # the user lock) are not history. The loader treats the last row as
-        # the current message, so leaving them in would show this message
-        # twice and drop the newest; the turn folds them in instead.
-        history_session = ctx.session.model_copy(
-            update={"messages": [m for m in ctx.session.messages if m.seq <= ctx.message.seq]}
-        )
+    current_seq = ctx.message.seq
+    if current_seq and any(m.seq > current_seq for m in ctx.session.messages):
+        # Rows persisted after this turn's message, while it waited on the
+        # user lock. Later inbounds are not history: the turn folds them in.
+        # Later outbounds (the previous turn's reply) are. The loader treats
+        # the last row as the current message, so it goes last.
+        earlier = [
+            m
+            for m in ctx.session.messages
+            if m.seq < current_seq
+            or (m.seq > current_seq and m.direction == MessageDirection.OUTBOUND)
+        ]
+        history_session = ctx.session.model_copy(update={"messages": [*earlier, ctx.message]})
     ctx.conversation_history = await load_conversation_history(
         history_session, tz_name=ctx.user.timezone
     )
@@ -537,8 +542,9 @@ async def _fold_entry_messages(ctx: PipelineContext, entry: PendingInbound) -> l
         content = await build_message_context(
             ctx.session, last, ctx.user, entry.media_urls, downloaded
         )
-        # Same list object the tool context holds, so tools that look up
-        # this turn's attachments see the folded ones too.
+        # Tools that read this list at call time see the folded media. File
+        # tools snapshot it when built, so they reach folded media only by
+        # its staged handle.
         ctx.downloaded_media.extend(downloaded)
     except Exception:
         logger.exception(

@@ -15,7 +15,7 @@ import pytest
 from any_llm.types.messages import MessageResponse
 from pydantic import BaseModel
 
-from backend.app.agent.approval import ApprovalDecision, get_approval_gate
+from backend.app.agent.approval import ApprovalDecision, PermissionLevel, get_approval_gate
 from backend.app.agent.concurrency import user_locks
 from backend.app.agent.core import ClawboltAgent
 from backend.app.agent.dto import SessionState, StoredMessage
@@ -26,8 +26,10 @@ from backend.app.agent.ingestion import (
 )
 from backend.app.agent.messages import UserMessage
 from backend.app.agent.midturn import midturn_inbox
+from backend.app.agent.router import PipelineContext, load_history_step
 from backend.app.agent.session_db import get_session_store
-from backend.app.agent.tools.base import Tool, ToolResult
+from backend.app.agent.tool_errors import _ERROR_KIND_HINTS
+from backend.app.agent.tools.base import Tool, ToolErrorKind, ToolResult
 from backend.app.bus import OutboundMessage, message_bus
 from backend.app.media.download import DownloadedMedia
 from backend.app.models import User
@@ -454,3 +456,106 @@ async def test_agent_survives_drain_failure(test_user: User) -> None:
         )
     assert response.reply_text == "still replies"
     assert not response.is_error_fallback
+
+
+# ---------------------------------------------------------------------------
+# History and approval interplay
+# ---------------------------------------------------------------------------
+
+
+async def test_history_keeps_reply_persisted_while_message_waited(test_user: User) -> None:
+    """The previous turn's reply, persisted after this turn's message while it
+    waited on the lock, stays in history. Later inbounds do not: they fold."""
+    rows = [
+        StoredMessage(direction="inbound", body="first question", seq=1),
+        StoredMessage(direction="inbound", body=PHOTO_TEXT, seq=2),
+        StoredMessage(direction="outbound", body="answer to the first question", seq=3),
+        StoredMessage(direction="inbound", body=CAPTION_TEXT, seq=4),
+    ]
+    ctx = PipelineContext(
+        user=test_user,
+        session=SessionState(session_id="sess-fold", user_id=test_user.id, messages=rows),
+        message=rows[1],
+        media_urls=[],
+    )
+    ctx = await load_history_step(ctx)
+    contents = [str(m.content) for m in ctx.conversation_history]
+    assert any("first question" in c for c in contents)
+    assert any("answer to the first question" in c for c in contents)
+    assert not any(PHOTO_TEXT in c for c in contents)
+    assert not any(CAPTION_TEXT in c for c in contents)
+
+
+async def test_message_that_interrupts_approval_is_answered_in_same_turn(
+    test_user: User,
+) -> None:
+    """A new request sent instead of answering an approval prompt interrupts
+    the approval and folds into the same turn, whose interrupted-tool hint
+    must not tell the model the request is handled elsewhere."""
+
+    class _NoParams(BaseModel):
+        pass
+
+    async def risky() -> ToolResult:
+        return ToolResult(content="done")
+
+    async def fake_assemble(*_args: Any, **_kwargs: Any) -> tuple[list[Tool], list[Any]]:
+        return [Tool(name="risky", description="Risky", function=risky, params_model=_NoParams)], []
+
+    calls: list[list[dict[str, Any]]] = []
+
+    async def fake_llm(**kwargs: Any) -> MessageResponse:
+        calls.append(copy.deepcopy(kwargs["messages"]))
+        if len(calls) == 1:
+            return make_tool_call_response([{"name": "risky", "arguments": {}}])
+        if len(calls) == 2:
+            # Hold the post-interrupt draft until the new message's dispatch
+            # is waiting, so the turn folds it instead of racing past it.
+            await _await_inbox(test_user.id, 1)
+            return make_text_response(STALE_REPLY)
+        return make_text_response(COMBINED_REPLY)
+
+    gate = get_approval_gate()
+    with (
+        patch("backend.app.agent.core.amessages", side_effect=fake_llm),
+        patch("backend.app.agent.router.assemble_turn_tools", side_effect=fake_assemble),
+        patch.object(
+            ClawboltAgent,
+            "_get_tool_permission",
+            new=AsyncMock(return_value=(PermissionLevel.ASK, None, "run risky")),
+        ),
+        patch(
+            "backend.app.agent.ingestion.classify_approval_response",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
+        first_task = asyncio.create_task(
+            process_inbound_from_bus(
+                InboundMessage(
+                    channel="telegram", sender_id=test_user.channel_identifier, text=PHOTO_TEXT
+                )
+            )
+        )
+        deadline = asyncio.get_running_loop().time() + 5
+        while not gate.has_pending(test_user.id):
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.005)
+        await asyncio.wait_for(
+            process_inbound_from_bus(
+                InboundMessage(
+                    channel="telegram", sender_id=test_user.channel_identifier, text=CAPTION_TEXT
+                )
+            ),
+            timeout=10,
+        )
+        await asyncio.wait_for(first_task, timeout=10)
+
+    final_call = repr(calls[-1])
+    assert CAPTION_TEXT in final_call
+    assert "Tool request interrupted" in final_call
+    hint = _ERROR_KIND_HINTS[ToolErrorKind.INTERRUPTED]
+    assert "answer it in the same reply" in hint
+    assert len(calls) == 3
+    replies = [r.content for r in _drain_replies()]
+    assert replies[-1] == COMBINED_REPLY
+    assert STALE_REPLY not in replies
