@@ -7,8 +7,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from backend.app.agent.concurrency import user_locks
 from backend.app.agent.dto import SessionState, StoredMessage
-from backend.app.agent.ingestion import InboundMessage, MessageBatcher, process_inbound_from_bus
+from backend.app.agent.ingestion import (
+    InboundMessage,
+    MessageBatcher,
+    _dispatch_to_pipeline,
+    process_inbound_from_bus,
+)
 from backend.app.bus import message_bus
 from backend.app.models import User
 
@@ -426,6 +432,137 @@ class TestProcessingTimeout:
                     found = True
                     break
             assert found
+
+
+def _drain_replies() -> list[str]:
+    """Return the non-typing outbound message contents and empty the bus."""
+    replies: list[str] = []
+    while not message_bus.outbound.empty():
+        outbound = message_bus.outbound.get_nowait()
+        if not outbound.is_typing_indicator:
+            replies.append(outbound.content)
+    return replies
+
+
+class TestProcessingTimeoutScope:
+    """The processing budget starts when the turn holds the lock, not while it waits."""
+
+    @pytest.mark.parametrize("channel", ["telegram", ""])
+    async def test_lock_wait_longer_than_timeout_does_not_count(self, channel: str) -> None:
+        """A dispatch queued behind a long turn still gets its full budget.
+
+        ``channel="telegram"`` takes the foldable ``run_unless_folded`` path,
+        ``channel=""`` the plain one. Nothing drains the inbox here, so the
+        queued dispatch is never folded and must run its own turn.
+        """
+        user_id = f"timeout-scope-wait-{channel or 'none'}"
+        user = User(id=user_id, channel_identifier="123", phone="")
+        session = SessionState(session_id="sess-1", user_id=user_id)
+        message = StoredMessage(direction="inbound", body="follow-up", seq=2)
+        _drain_replies()
+
+        ran = asyncio.Event()
+
+        async def quick_handler(**kwargs: object) -> None:
+            await asyncio.sleep(0.05)
+            ran.set()
+
+        with (
+            patch(
+                "backend.app.agent.ingestion.handle_inbound_message",
+                new_callable=AsyncMock,
+                side_effect=quick_handler,
+            ),
+            patch("backend.app.agent.ingestion.settings") as mock_settings,
+        ):
+            mock_settings.agent_processing_timeout_seconds = 0.2
+            # Stand in for a long turn holding the lock for longer than the
+            # queued dispatch's whole timeout.
+            async with user_locks.acquire(user_id):
+                dispatch = asyncio.create_task(
+                    _dispatch_to_pipeline(
+                        user=user, session=session, message=message, media_urls=[], channel=channel
+                    )
+                )
+                await asyncio.sleep(0.5)
+                assert not dispatch.done()
+                assert not ran.is_set()
+            await asyncio.wait_for(dispatch, timeout=2)
+
+        assert ran.is_set()
+        assert _drain_replies() == []
+
+    async def test_turn_longer_than_timeout_after_wait_still_times_out(self) -> None:
+        """Once the turn starts, it is bounded by the timeout and the fallback is sent."""
+        user_id = "timeout-scope-slow"
+        user = User(id=user_id, channel_identifier="123", phone="")
+        session = SessionState(session_id="sess-1", user_id=user_id)
+        message = StoredMessage(direction="inbound", body="slow", seq=2)
+        _drain_replies()
+
+        started = asyncio.Event()
+
+        async def slow_handler(**kwargs: object) -> None:
+            started.set()
+            await asyncio.sleep(10)
+
+        with (
+            patch(
+                "backend.app.agent.ingestion.handle_inbound_message",
+                new_callable=AsyncMock,
+                side_effect=slow_handler,
+            ),
+            patch("backend.app.agent.ingestion.settings") as mock_settings,
+        ):
+            mock_settings.agent_processing_timeout_seconds = 0.2
+            async with user_locks.acquire(user_id):
+                dispatch = asyncio.create_task(
+                    _dispatch_to_pipeline(
+                        user=user,
+                        session=session,
+                        message=message,
+                        media_urls=[],
+                        channel="telegram",
+                    )
+                )
+                await asyncio.sleep(0.3)
+            await asyncio.wait_for(dispatch, timeout=2)
+
+        assert started.is_set()
+        replies = _drain_replies()
+        assert len(replies) == 1
+        assert "something went wrong" in replies[0].lower()
+        assert not user_locks.acquire(user_id).locked()
+
+    async def test_timeout_error_raised_by_pipeline_is_a_pipeline_error(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A TimeoutError from inside the pipeline is not reported as the turn timing out."""
+        user_id = "timeout-scope-inner"
+        user = User(id=user_id, channel_identifier="123", phone="")
+        session = SessionState(session_id="sess-1", user_id=user_id)
+        message = StoredMessage(direction="inbound", body="hi", seq=2)
+        _drain_replies()
+
+        with (
+            patch(
+                "backend.app.agent.ingestion.handle_inbound_message",
+                new_callable=AsyncMock,
+                side_effect=TimeoutError("upstream call timed out"),
+            ),
+            patch("backend.app.agent.ingestion.settings") as mock_settings,
+            caplog.at_level("ERROR", logger="backend.app.agent.ingestion"),
+        ):
+            mock_settings.agent_processing_timeout_seconds = 600.0
+            await _dispatch_to_pipeline(
+                user=user, session=session, message=message, media_urls=[], channel="telegram"
+            )
+
+        replies = _drain_replies()
+        assert len(replies) == 1
+        assert "something went wrong" in replies[0].lower()
+        assert "Agent pipeline failed" in caplog.text
+        assert "timed out after" not in caplog.text
 
 
 class TestProcessInboundFallbackError:

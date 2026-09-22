@@ -98,7 +98,7 @@ class Settings(BaseSettings):
 
     # Agent loop
     approval_timeout_seconds: int = Field(default=120, ge=1)
-    agent_processing_timeout_seconds: float = Field(default=300.0, gt=0)
+    agent_processing_timeout_seconds: float = Field(default=600.0, gt=0)
     message_batch_window_ms: int = Field(default=1500, ge=100)
     # Redispatch recently persisted inbound messages that lack an outbound reply.
     # Zero disables startup recovery.
