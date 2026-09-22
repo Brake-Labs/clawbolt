@@ -14,13 +14,16 @@ import uuid
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from backend.app.agent.dto import StoredMessage
 from backend.app.agent.messages import AssistantMessage, UserMessage
 from backend.app.agent.session_db import reset_session_stores
+from backend.app.agent.tools.base import Tool, ToolResult, ToolTags
 from backend.app.config import settings
 from backend.app.models import ChatSession, Message, User
+from backend.app.services.llm_eval.execution import MAX_REPLAY_READ_ROUNDS
 from backend.app.services.llm_eval.sampling import (
     ReplayFixture,
     _historic_first_decision,
@@ -557,24 +560,58 @@ def test_a_corrupt_timestamp_does_not_hand_out_a_batch_exemption() -> None:
 
 
 # ---------------------------------------------------------------------------
-# The turn's first decision, which is what a historic run compares against
+# The decision a historic run scores, taken where the replay takes the
+# candidate's
 # ---------------------------------------------------------------------------
 
 
-_LOOKUP_THEN_WRITE = json.dumps(
-    [
-        {"tool_call_id": "t1", "name": "qb_find", "args": {"q": "Acme Plumbing"}, "result": "1186"},
-        {"tool_call_id": "t2", "name": "qb_send", "args": {"invoice_id": "1186"}, "result": "ok"},
-    ]
+class _FindParams(BaseModel):
+    q: str
+
+
+class _SendParams(BaseModel):
+    invoice_id: str
+
+
+async def _never(**_kwargs: object) -> ToolResult:  # pragma: no cover - never invoked
+    raise AssertionError("a replay must never execute a tool")
+
+
+_TOOLS = {
+    "qb_find": Tool(
+        name="qb_find",
+        description="find",
+        function=_never,
+        params_model=_FindParams,
+        tags={ToolTags.READ_ONLY},
+    ),
+    # Untagged, so mutating: a write is never fed back, whoever made it.
+    "qb_send": Tool(name="qb_send", description="send", function=_never, params_model=_SendParams),
+}
+
+
+def _interactions(*calls: tuple[str, dict[str, object]]) -> str:
+    return json.dumps(
+        [
+            {"tool_call_id": f"t{i}", "name": name, "args": args, "result": "ok"}
+            for i, (name, args) in enumerate(calls, start=1)
+        ]
+    )
+
+
+_LOOKUP_THEN_WRITE = _interactions(
+    ("qb_find", {"q": "Acme Plumbing"}), ("qb_send", {"invoice_id": "1186"})
 )
 
 
-def test_the_first_decision_is_the_first_recorded_call_with_its_arguments() -> None:
-    """The opening move, arguments included, not the reply it ended on.
+def test_the_scored_decision_skips_the_lookups_the_replay_would_feed_back() -> None:
+    """Both sides are scored at the same point in the turn, or neither is.
 
-    The replay scores the candidate's first decision, so this is the only
-    like-for-like incumbent side. Comparing the reply instead reads every
-    lookup-then-act turn as the candidate acting where the incumbent talked.
+    ``execution.call_model`` advances the candidate past a read-only call the
+    live turn also made and scores the first response that would need a live
+    tool. Reading the incumbent's side as the literal first recorded call
+    scores the two sides on different rounds, so a candidate that reproduces
+    the turn exactly reads as acting where the incumbent looked something up.
     """
     rows = [
         _row(1, "inbound", "invoice Acme for the stalls", BASE_TIME),
@@ -586,12 +623,104 @@ def test_the_first_decision_is_the_first_recorded_call_with_its_arguments() -> N
             tools=_LOOKUP_THEN_WRITE,
         ),
     ]
-    decision = _historic_first_decision(rows, 0)
+    decision = _historic_first_decision(rows, 0, _TOOLS)
     assert decision.available
-    assert [(c.name, c.arguments) for c in decision.calls] == [("qb_find", {"q": "Acme Plumbing"})]
+    assert [(c.name, c.arguments) for c in decision.calls] == [("qb_send", {"invoice_id": "1186"})]
+    # What it had read by then, so the judge can be shown this side's
+    # lookups exactly as it is shown the candidate's.
+    assert [(item.name, item.result) for item in decision.lookups] == [("qb_find", "ok")]
     # Two calls in one flat list: whether they were one round or two is not
     # recoverable, and the run says so rather than assuming.
     assert decision.flattened
+
+
+def test_a_turn_of_lookups_is_scored_on_the_prose_it_ended_on() -> None:
+    """The replay would have fed the lookup back and asked again.
+
+    What came back is the reply the turn ended on, so that is the decision,
+    with the lookup recorded ahead of it. Scoring the lookup itself reads a
+    candidate that answered the question as a silent no-op.
+    """
+    rows = [
+        _row(1, "inbound", "what do we owe Acme", BASE_TIME),
+        _row(
+            2,
+            "outbound",
+            "You owe them 1186.",
+            BASE_TIME + _dt.timedelta(seconds=7),
+            tools=_interactions(("qb_find", {"q": "Acme Plumbing"})),
+        ),
+    ]
+    decision = _historic_first_decision(rows, 0, _TOOLS)
+    assert decision.available
+    assert decision.calls == ()
+    assert decision.text == "You owe them 1186."
+    assert [item.name for item in decision.lookups] == ["qb_find"]
+    assert not decision.flattened
+
+
+def test_a_lookup_this_schema_no_longer_has_is_itself_the_decision() -> None:
+    """The replay stops at a call it cannot answer, so the reading does too.
+
+    A tool that has left the schema cannot be fed back, so the candidate
+    would be scored on that call. Skipping it on the incumbent side would
+    once again score the two sides on different rounds.
+    """
+    rows = [
+        _row(1, "inbound", "invoice Acme", BASE_TIME),
+        _row(
+            2,
+            "outbound",
+            "sent it",
+            BASE_TIME + _dt.timedelta(seconds=9),
+            tools=_LOOKUP_THEN_WRITE,
+        ),
+    ]
+    decision = _historic_first_decision(rows, 0, {"qb_send": _TOOLS["qb_send"]})
+    assert [c.name for c in decision.calls] == ["qb_find"]
+    assert decision.lookups == ()
+
+
+def test_the_skipping_stops_at_the_replays_round_budget() -> None:
+    """A replay scores whatever the model asked for once its rounds run out."""
+    rows = [
+        _row(1, "inbound", "check them all", BASE_TIME),
+        _row(
+            2,
+            "outbound",
+            "here they are",
+            BASE_TIME + _dt.timedelta(seconds=9),
+            tools=_interactions(
+                *(("qb_find", {"q": f"customer {i}"}) for i in range(MAX_REPLAY_READ_ROUNDS + 1))
+            ),
+        ),
+    ]
+    decision = _historic_first_decision(rows, 0, _TOOLS)
+    assert len(decision.lookups) == MAX_REPLAY_READ_ROUNDS
+    assert [(c.name, c.arguments) for c in decision.calls] == [
+        ("qb_find", {"q": f"customer {MAX_REPLAY_READ_ROUNDS}"})
+    ]
+
+
+def test_lookups_with_nothing_recorded_after_them_are_unavailable() -> None:
+    """The turn spent itself looking things up and wrote down no answer.
+
+    What it decided next was never recorded, so there is nothing comparable
+    to score. Reporting the lookup as the decision would score the two sides
+    on different rounds, and reporting empty prose would read as a turn that
+    answered with nothing.
+    """
+    rows = [
+        _row(1, "inbound", "what do we owe Acme", BASE_TIME),
+        _row(
+            2,
+            "outbound",
+            "",
+            BASE_TIME + _dt.timedelta(seconds=7),
+            tools=_interactions(("qb_find", {"q": "Acme Plumbing"})),
+        ),
+    ]
+    assert not _historic_first_decision(rows, 0, _TOOLS).available
 
 
 def test_a_turn_that_called_nothing_has_its_prose_as_its_first_decision() -> None:
@@ -599,16 +728,17 @@ def test_a_turn_that_called_nothing_has_its_prose_as_its_first_decision() -> Non
         _row(1, "inbound", "just checking in", BASE_TIME),
         _row(2, "outbound", "all good", BASE_TIME + _dt.timedelta(seconds=4)),
     ]
-    decision = _historic_first_decision(rows, 0)
+    decision = _historic_first_decision(rows, 0, _TOOLS)
     assert decision.available
     assert decision.calls == ()
+    assert decision.text == "all good"
     assert not decision.flattened
 
 
 def test_an_unanswered_turn_has_no_first_decision() -> None:
     """Distinct from "answered with nothing", which is a decision."""
     rows = [_row(1, "inbound", "are you there", BASE_TIME)]
-    assert not _historic_first_decision(rows, 0).available
+    assert not _historic_first_decision(rows, 0, _TOOLS).available
 
 
 def test_unparseable_interactions_make_the_first_decision_unavailable() -> None:
@@ -621,10 +751,52 @@ def test_unparseable_interactions_make_the_first_decision_unavailable() -> None:
         _row(1, "inbound", "invoice Acme", BASE_TIME),
         _row(2, "outbound", "sent", BASE_TIME + _dt.timedelta(seconds=5), tools="{not json"),
     ]
-    assert not _historic_first_decision(rows, 0).available
+    assert not _historic_first_decision(rows, 0, _TOOLS).available
 
 
-def test_select_samples_carries_the_first_decision_onto_the_sample() -> None:
+def test_an_empty_interaction_list_is_a_decision_not_a_loss() -> None:
+    """``[ ]`` is a turn that called nothing, which is a comparable decision.
+
+    Matching the raw text against ``"[]"`` read any other spelling of the
+    empty list as a record that did not survive, which drops a perfectly
+    comparable turn out of every paired comparison.
+    """
+    rows = [
+        _row(1, "inbound", "just checking in", BASE_TIME),
+        _row(2, "outbound", "all good", BASE_TIME + _dt.timedelta(seconds=4), tools="[ ]"),
+    ]
+    decision = _historic_first_decision(rows, 0, _TOOLS)
+    assert decision.available
+    assert decision.calls == ()
+
+
+def test_a_lost_first_interaction_does_not_promote_the_second() -> None:
+    """Part of the record gone is unavailable, not "it opened with the write".
+
+    ``_parse_tool_interactions`` drops the entries that fail validation and
+    keeps the rest, so a corrupt first entry left the turn's *second* call
+    standing as its opening move. On a lookup-then-write turn that reports
+    the incumbent as having opened with the write.
+    """
+    rows = [
+        _row(1, "inbound", "invoice Acme", BASE_TIME),
+        _row(
+            2,
+            "outbound",
+            "sent",
+            BASE_TIME + _dt.timedelta(seconds=5),
+            tools=json.dumps(
+                [
+                    {"name": 5, "args": "not a mapping"},
+                    {"name": "qb_send", "args": {"invoice_id": "1186"}},
+                ]
+            ),
+        ),
+    ]
+    assert not _historic_first_decision(rows, 0, _TOOLS).available
+
+
+def test_select_samples_carries_the_decision_onto_the_sample() -> None:
     rows = [
         _row(1, "inbound", "invoice Acme for the stalls", BASE_TIME),
         _row(
@@ -636,9 +808,11 @@ def test_select_samples_carries_the_first_decision_onto_the_sample() -> None:
         ),
     ]
     fixture = ReplayFixture(user=User(id="u"), rows=rows)
+    fixture.tools_by_name = _TOOLS
     sample = select_samples(fixture, 1)[0]
     assert sample.historic_decision_available
     assert [(c.name, c.arguments) for c in sample.historic_first_calls] == [
-        ("qb_find", {"q": "Acme Plumbing"})
+        ("qb_send", {"invoice_id": "1186"})
     ]
+    assert [item.name for item in sample.historic_decision_lookups] == ["qb_find"]
     assert sample.historic_calls_flattened

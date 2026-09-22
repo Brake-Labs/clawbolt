@@ -28,6 +28,7 @@ from backend.app.services.llm_eval.judge import (
     _SYSTEM_PROMPT,
     JudgeOutcome,
     _describe,
+    _judge_prompt,
     build_judge_context,
     candidate_in_slot_a,
     judge_turn,
@@ -343,3 +344,87 @@ def test_the_transcript_keeps_the_newest_messages_within_budget() -> None:
     assert "old 0 " not in context.transcript
     assert context.transcript.startswith("[earlier conversation omitted]")
     assert len(context.transcript) < 30000
+
+
+# ---------------------------------------------------------------------------
+# A decision read out of the transcript must not be identifiable
+# ---------------------------------------------------------------------------
+#
+# The blinding is what stops the judge flattering the model it is: the
+# default judge is the incumbent itself. In historic mode three things used
+# to mark the incumbent's side on sight, none of them about its content.
+
+_BLOCK_LABELS = ("Lookups made first", "Tool calls", "Reply text")
+
+
+def _blocks(section: str) -> list[str]:
+    """Which labelled blocks a rendered response carries, in order."""
+    return [
+        label
+        for label in _BLOCK_LABELS
+        if any(line.startswith(label) for line in section.splitlines())
+    ]
+
+
+def _responses(prompt: str) -> tuple[str, str]:
+    after_a = prompt.split("--- Response A ---")[1]
+    first, second = after_a.split("--- Response B ---")
+    return first, second
+
+
+def test_a_decision_with_no_prose_renders_no_reply_line() -> None:
+    """Regression: an empty reply printed ``(empty)``.
+
+    A decision read out of the transcript never carries prose alongside a
+    tool call, because the row holds the turn's final reply and its calls in
+    one flat list. Printing a placeholder made that side say ``(empty)`` on
+    every acting turn while the candidate's said whatever it said.
+    """
+    rendered = _describe(BASELINE)
+    assert "(empty)" not in rendered
+    assert "Reply text" not in rendered
+    assert _blocks(rendered) == ["Tool calls"]
+
+
+def test_a_historic_turn_shows_two_structurally_identical_responses() -> None:
+    """Same blocks, in the same order, for a side that was read and one that ran."""
+    lookup = RecordedToolResult(
+        name="qb_find", arguments={"q": "Acme Plumbing"}, result="invoice 1186"
+    )
+    historic = ModelCallResult(
+        provider="anthropic",
+        model="incumbent",
+        tool_calls=[ToolCall(name="qb_send", arguments={"invoice_id": "1186"})],
+        replayed_lookups=[lookup],
+    )
+    candidate = ModelCallResult(
+        provider="anthropic",
+        model="candidate",
+        tool_calls=[ToolCall(name="qb_send", arguments={"invoice_id": "1187"})],
+        replayed_lookups=[lookup],
+    )
+    sample = ReplaySample(
+        seq=SEQ_CANDIDATE_IS_A,
+        timestamp="",
+        message_context=TURN_TEXT,
+        historic_tool_names=["qb_find", "qb_send"],
+    )
+    prompt = _judge_prompt(sample, candidate, historic, None, historic_side_shown=True)
+    first, second = _responses(prompt)
+    assert _blocks(first) == _blocks(second) == ["Lookups made first", "Tool calls"]
+    # And the live turn's own calls are withheld: the historic side is
+    # literally the head of that list, so printing it names which is which.
+    assert "The live assistant's tool calls" not in prompt
+    assert "incumbent" not in prompt
+
+
+def test_a_replayed_turn_still_gets_the_live_turns_calls_as_context() -> None:
+    """Both sides ran, so the list identifies neither and is worth having."""
+    sample = ReplaySample(
+        seq=SEQ_CANDIDATE_IS_A,
+        timestamp="",
+        message_context=TURN_TEXT,
+        historic_tool_names=["qb_find", "qb_send"],
+    )
+    prompt = _judge_prompt(sample, CANDIDATE, BASELINE, None)
+    assert "The live assistant's tool calls" in prompt

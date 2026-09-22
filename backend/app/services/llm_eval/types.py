@@ -39,20 +39,41 @@ class IncumbentSource(StrEnum):
     HISTORIC = "historic"
     """Do not call the incumbent; read its decision out of the transcript.
 
-    The default, and what halves a run's provider bill: the incumbent's
-    answer to a turn was already bought once, when the turn happened. The
-    incumbent side is that turn's *first decision*, reconstructed from the
-    tool calls production recorded for it, which is the same thing the
-    replay scores on the candidate side.
+    This docstring is where the mode is explained. Everything else that
+    touches it (the migration, the models, the schemas, ``runner``,
+    ``metrics``, the admin console, AGENTS.md) points here rather than
+    restating it.
 
-    It is not a replay, and four things it cannot control are reported
-    rather than papered over. That turn ran under the system prompt and tool
-    schema of the day, not today's. It may have run on a different model,
-    endpoint or reasoning effort than the run's stated incumbent. A turn
-    whose recorded interactions did not survive has no reconstructable
-    decision and leaves the paired comparisons entirely. And the incumbent
-    made no call here, so its tokens, latency, cost and safety record were
-    never measured and are reported as unavailable rather than as zero.
+    The default, and what halves a run's provider bill: the incumbent's
+    answer to a turn was already bought once, when the turn happened.
+
+    **Scored at the same point in the turn as the candidate.** The replay
+    advances the candidate past responses whose calls are all replayable
+    lookups and scores the first one that would need a live tool, so
+    ``sampling`` walks the recorded calls by that same rule
+    (``metrics.replayable_lookup``, bounded by
+    ``execution.MAX_REPLAY_READ_ROUNDS``): leading lookups are skipped and
+    the next recorded call is the incumbent's decision. Any other reading
+    compares two different rounds of the same turn.
+
+    Four things it cannot control, reported rather than papered over:
+
+    - That turn ran under the system prompt and tool schema of the day, not
+      today's.
+    - It may have run on a different model, endpoint or reasoning effort
+      than the run's stated incumbent. ``runner.historic_configuration_drift``
+      reads ``llm_usage_logs`` over the sampled window and says so.
+    - A turn with no reconstructable decision is ``TurnSource.UNAVAILABLE``
+      and leaves every paired comparison, rather than reading as "the agent
+      did nothing", which is the reading that exempts a candidate's write
+      from ``UNREQUESTED_MUTATION``.
+    - The incumbent made no call, so its tokens, latency, cost and safety
+      record were never measured. They are reported as unavailable, not as
+      zero (``SideComparison.comparable``, ``pricing_unknown_reason``), and
+      a comparison that cannot be made fairly cannot decide a run: no run in
+      this mode returns ``safe_to_switch``, and none blocks a switch on the
+      safety, silent-no-op or judge-preference tests either. It reports what
+      it saw and says a replay run is what settles the claim.
     """
 
     REPLAY = "replay"
@@ -326,24 +347,38 @@ class ReplaySample:
     one of these gets its recorded result back instead of a live call.
     """
     historic_first_calls: tuple[ToolCall, ...] = ()
-    """The live turn's *first* decision, as tool calls with their arguments.
+    """The live turn's scored decision, as tool calls with their arguments.
 
     Not the same thing as ``historic_tool_names``, which is every call the
-    turn made across every round. The replay scores the candidate on its
-    first decision, so the only like-for-like incumbent side is the live
-    turn's first one; comparing it against ``historic_reply``, which is the
-    prose the user saw after every round had run, would score a summary
-    against a tool call.
+    turn made across every round, and not ``historic_reply``, which is the
+    prose the user saw after every round had run. Reconstructed at the point
+    in the turn the replay scores the candidate at: see
+    ``sampling.HistoricDecision``.
 
-    Empty when the turn called nothing, in which case its first decision was
-    ``historic_reply``. See ``historic_decision_available`` for the case
-    where there is no first decision to read at all.
+    Empty when the decision was prose, which ``historic_decision_text``
+    carries. See ``historic_decision_available`` for the case where there is
+    no decision to read at all.
+    """
+    historic_decision_lookups: tuple[RecordedToolResult, ...] = ()
+    """Recorded lookups the replay would have fed back before that decision.
+
+    The incumbent's counterpart to ``ModelCallResult.replayed_lookups``, and
+    what the judge prompt shows for this side so the two responses are not
+    told apart by which of them lists lookups.
+    """
+    historic_decision_text: str = ""
+    """The prose belonging to the scored round, empty when it has none.
+
+    An outbound row holds the turn's final reply and its calls in one flat
+    list, so a decision that opened with a call has no recorded text of its
+    own: it carries none rather than the reply written after it.
     """
     historic_decision_available: bool = True
-    """Whether a first decision could be reconstructed for this turn.
+    """Whether a decision could be reconstructed for this turn.
 
-    False when the turn was never answered, or when an outbound row carried
-    tool interactions that did not parse. Those turns leave every paired
+    False when the turn was never answered, when an outbound row carried
+    tool interactions that did not parse, or when the turn spent itself on
+    lookups and recorded no prose after them. Those turns leave every paired
     comparison instead of being read as "the agent did nothing", which is
     what an unparseable row would otherwise look like.
     """
@@ -352,9 +387,9 @@ class ReplaySample:
 
     ``tool_interactions_json`` stores one flat, ordered list per outbound
     row, so a turn that recorded several calls could have made them in one
-    round or in several. The first call is taken as the first decision, and
-    turns in this state are counted and surfaced, because on one of them the
-    incumbent may have asked for more in its first breath than this says.
+    round or in several. Turns in this state are counted and surfaced,
+    because on one of them the incumbent may have asked for more in one
+    breath than the reconstruction reads.
     """
     batched_messages: tuple[str, ...] = ()
     """Earlier messages of the batch this turn closes, oldest first.
@@ -411,16 +446,6 @@ class ModelCallResult:
 
     Production retries a reply cut off at ``max_tokens`` with no tool call,
     so the replay does too, and the usage above includes the spent attempts.
-    """
-    unrecorded_tool_arguments: int = 0
-    """Tool calls here whose arguments are not known.
-
-    Only ever non-zero on a decision read out of the transcript
-    (``IncumbentSource.HISTORIC``), where a turn can carry a tool name with
-    no surviving interaction record. Such a call is stored with empty
-    arguments, which is not the same as a call made with none: anything that
-    inspects arguments (the args validator, the fabricated-ID check, whether
-    two decisions used the same arguments) has to treat it as unknown.
     """
 
     @property

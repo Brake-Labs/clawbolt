@@ -216,7 +216,15 @@ def _dump(arguments: dict[str, Any]) -> str:
 
 
 def _describe(call: ModelCallResult) -> str:
-    """Render one model's decision for the judge, without naming the model."""
+    """Render one model's decision for the judge, without naming the model.
+
+    Every block here is conditional on the decision carrying that thing, so
+    the shape of a rendered response says nothing about which side produced
+    it. The reply line used to print ``(empty)`` when a decision carried no
+    prose, and a decision read out of the transcript never carries prose
+    alongside a tool call, so in historic mode that line marked the
+    incumbent on every acting turn.
+    """
     parts: list[str] = []
     if call.replayed_lookups:
         lines = [
@@ -235,7 +243,8 @@ def _describe(call: ModelCallResult) -> str:
         parts.append("Tool calls:\n" + "\n".join(lines))
     else:
         parts.append("Tool calls: none")
-    parts.append(f"Reply text:\n{_truncate(call.text, _MAX_TEXT_CHARS) or '(empty)'}")
+    if call.text.strip():
+        parts.append(f"Reply text:\n{_truncate(call.text, _MAX_TEXT_CHARS)}")
     return "\n\n".join(parts)
 
 
@@ -244,13 +253,23 @@ def _judge_prompt(
     first: ModelCallResult,
     second: ModelCallResult,
     context: JudgeContext | None,
+    *,
+    historic_side_shown: bool = False,
 ) -> str:
+    """The judge's prompt for one turn, with neither side identifiable.
+
+    *historic_side_shown* says one of the two responses was read out of the
+    live turn rather than elicited. The live turn's own tool calls are then
+    withheld: they are context on a replayed run, but here the historic side
+    is literally the head of that list, and naming it hands the judge the
+    answer to which response is which.
+    """
     sections: list[str] = []
     if context is not None and context.current_time:
         sections.append(context.current_time)
     if context is not None and context.transcript:
         sections.append(f"Recent conversation, oldest first:\n{context.transcript}")
-    if sample.historic_tool_names:
+    if sample.historic_tool_names and not historic_side_shown:
         sections.append(
             "The live assistant's tool calls for this turn, in order (context, not an "
             f"answer key): {', '.join(sample.historic_tool_names)}"
@@ -365,6 +384,7 @@ async def judge_turn(
     *,
     target: LLMTarget,
     context: JudgeContext | None = None,
+    historic_side_shown: bool = False,
 ) -> JudgeOutcome:
     """Adjudicate one divergence. Never raises; failures return a verdict.
 
@@ -372,11 +392,15 @@ async def judge_turn(
     parameter, so it is unaffected by either side's effort setting. A judge
     whose own reasoning budget moved with the run would score two runs
     differently for reasons that have nothing to do with the candidates.
+
+    *historic_side_shown* blinds the parts of the prompt that would
+    otherwise identify a decision read out of the transcript. See
+    ``_judge_prompt``.
     """
     candidate_is_a = candidate_in_slot_a(sample)
     first, second = (candidate, baseline) if candidate_is_a else (baseline, candidate)
 
-    prompt = _judge_prompt(sample, first, second, context)
+    prompt = _judge_prompt(sample, first, second, context, historic_side_shown=historic_side_shown)
 
     try:
         response = await _ask_judge(target, prompt)

@@ -24,6 +24,7 @@ samples actually ran with.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -50,6 +51,8 @@ from backend.app.bus import OutboundMessage
 from backend.app.config import settings
 from backend.app.enums import MessageDirection
 from backend.app.models import User
+from backend.app.services.llm_eval import metrics
+from backend.app.services.llm_eval.execution import MAX_REPLAY_READ_ROUNDS
 from backend.app.services.llm_eval.types import RecordedToolResult, ReplaySample, ToolCall
 
 logger = logging.getLogger(__name__)
@@ -296,16 +299,18 @@ def _historic_response(rows: list[StoredMessage], start: int) -> tuple[str, list
     so a row whose ``tool_interactions_json`` is malformed degrades to "no
     tools" here exactly as it does in the prompt.
     """
-    reply_parts: list[str] = []
+    answered = _response_rows(rows, start)
     tool_names: list[str] = []
-    for row in _response_rows(rows, start):
+    for row in answered:
         for msg in _stored_messages_to_agent_messages([row]):
             if isinstance(msg, AssistantMessage):
                 tool_names.extend(tc.name for tc in msg.tool_calls)
-        text = row.llm_reply_text or row.body
-        if text:
-            reply_parts.append(text)
-    return "\n\n".join(reply_parts), tool_names
+    return _reply_text(answered), tool_names
+
+
+def _reply_text(answered: list[StoredMessage]) -> str:
+    """The prose the turn ended on, across every outbound row it wrote."""
+    return "\n\n".join(text for row in answered if (text := row.llm_reply_text or row.body))
 
 
 def _response_rows(rows: list[StoredMessage], start: int) -> list[StoredMessage]:
@@ -347,57 +352,160 @@ def _historic_tool_results(rows: list[StoredMessage], start: int) -> tuple[Recor
 
 @dataclass(frozen=True)
 class HistoricDecision:
-    """The live turn's first decision, as far as the transcript preserves it.
+    """The decision the live turn is scored on, as the transcript preserves it.
 
-    What the evaluator scores on the candidate side is its *first* decision:
-    the first response that would need a live tool, or its prose when it
-    asks for none. ``IncumbentSource.HISTORIC`` needs the same thing on the
-    incumbent side, and neither ``historic_reply`` nor ``historic_tool_names``
-    is it. The reply is what the user saw after every round had run, and the
-    names are every call the whole turn made.
+    Scored at the point in the turn the replay scores the candidate at. The
+    candidate is advanced past every response whose calls are all replayable
+    lookups (``metrics.replayable_lookup``, up to ``MAX_REPLAY_READ_ROUNDS``
+    rounds) and scored on the first response that would need a live tool, so
+    the recorded turn is walked by the same rule: its leading replayable
+    lookups are skipped into ``lookups`` and the next recorded call is
+    ``calls``. Taking the literal first recorded call instead read every
+    lookup-then-act turn as the candidate acting where production talked.
+
+    ``text`` is the prose that belongs to the scored round, which the
+    transcript only preserves when the round is the last one: an outbound row
+    carries the turn's final reply and its calls in one flat list, so a
+    decision that opened with a call has no recorded text of its own and
+    carries none rather than borrowing the reply written after it.
 
     One thing the transcript cannot give back. ``tool_interactions_json``
     holds one flat, ordered list per outbound row, so a turn that recorded
     three calls could have asked for all three at once or for one at a time
-    across three rounds. The first recorded call is taken as the first
-    decision and ``flattened`` says the reading was ambiguous, which is
-    counted and surfaced rather than assumed away.
+    across three rounds. ``flattened`` says the scored decision sits in such
+    a list, which is counted and surfaced rather than assumed away.
     """
 
     available: bool
     calls: tuple[ToolCall, ...]
     flattened: bool
+    lookups: tuple[RecordedToolResult, ...] = ()
+    """Recorded lookups skipped before the scored decision, in order.
 
-
-def _historic_first_decision(rows: list[StoredMessage], start: int) -> HistoricDecision:
-    """Reconstruct the first decision of the turn whose batch begins at *start*.
-
-    Unavailable in two cases, both of which read as "the agent did nothing"
-    if they are not distinguished, which is the reading that would charge a
-    candidate with an unrequested mutation on a turn production also wrote
-    on. The turn was never answered, so there is no decision of any kind to
-    read. Or an outbound row carried tool interactions that did not parse,
-    so calls were made and their record is gone.
+    The incumbent's counterpart to ``ModelCallResult.replayed_lookups``:
+    what it had read by the time it made the decision being scored. Carried
+    so the judge prompt can show a "lookups made first" block for this side
+    too, which is otherwise a structural tell for which response is which.
     """
-    answered = _response_rows(rows, start)
-    if not answered:
-        return HistoricDecision(available=False, calls=(), flattened=False)
-    calls: list[ToolCall] = []
+    text: str = ""
+
+
+def _recorded_entry_count(raw: str) -> int:
+    """How many interactions the row claims, before any of them are validated.
+
+    ``_parse_tool_interactions`` drops the entries that fail validation and
+    keeps the rest, so a shorter list back is the only sign that part of the
+    record is gone. Counting the raw entries is what lets the caller tell
+    "this turn called nothing" from "this turn's first call did not survive",
+    which are the same empty list otherwise. A payload that is not a JSON
+    list answers -1, which no parse result can equal, so it reads as lost
+    rather than as empty.
+    """
+    if not raw or not raw.strip():
+        return 0
+    try:
+        entries = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return -1
+    return len(entries) if isinstance(entries, list) else -1
+
+
+_UNAVAILABLE = HistoricDecision(available=False, calls=(), flattened=False)
+
+
+def _recorded_calls(answered: list[StoredMessage]) -> list[RecordedToolResult] | None:
+    """Every call the turn recorded, in order, or None when part of it is gone.
+
+    A record that did not survive whole is not a decision: dropping the
+    entries that failed validation leaves the *next* call standing as the
+    turn's opening move, which on a lookup-then-write turn reports the
+    incumbent as having opened with the write.
+    """
+    recorded: list[RecordedToolResult] = []
     for row in answered:
-        raw = row.tool_interactions_json
-        parsed = _parse_tool_interactions(raw)
-        if raw and raw.strip() not in ("", "[]") and not parsed:
+        parsed = _parse_tool_interactions(row.tool_interactions_json)
+        if _recorded_entry_count(row.tool_interactions_json) != len(parsed):
             logger.warning(
                 "Unparseable tool interactions on seq %d; its first decision is unavailable",
                 row.seq,
             )
-            return HistoricDecision(available=False, calls=(), flattened=False)
-        calls.extend(ToolCall(name=item.name, arguments=item.args) for item in parsed)
-    if not calls:
-        # The turn answered in prose, so its first decision was that prose,
-        # which the sample already carries as ``historic_reply``.
-        return HistoricDecision(available=True, calls=(), flattened=False)
-    return HistoricDecision(available=True, calls=(calls[0],), flattened=len(calls) > 1)
+            return None
+        recorded.extend(
+            RecordedToolResult(
+                name=item.name,
+                arguments=item.args,
+                result=item.result,
+                is_error=item.is_error,
+            )
+            for item in parsed
+        )
+    return recorded
+
+
+def _historic_first_decision(
+    rows: list[StoredMessage], start: int, tools_by_name: dict[str, Tool]
+) -> HistoricDecision:
+    """Reconstruct the scored decision of the turn whose batch begins at *start*.
+
+    Walks the recorded calls by the rule ``execution.call_model`` walks the
+    candidate's rounds by: leading replayable lookups are skipped, at most
+    ``MAX_REPLAY_READ_ROUNDS`` of them, and the next recorded call is the
+    decision. A lookup the replay could not have fed back (its tool has left
+    the schema, or the same call is not in the record) stops the walk and is
+    itself the decision, exactly as it would end the replay.
+
+    A turn whose calls are all skipped lookups decided whatever came after
+    them, which is the prose the turn ended on.
+
+    Unavailable in three cases, each of which reads as "the agent did
+    nothing" if it is not distinguished, and that reading is what would
+    charge a candidate with an unrequested mutation on a turn production
+    also wrote on. The turn was never answered. An outbound row carried tool
+    interactions that did not survive parsing. Or the turn spent itself on
+    lookups and recorded no prose after them, so what it decided next was
+    never written down and there is nothing comparable to score.
+    """
+    answered = _response_rows(rows, start)
+    if not answered:
+        return _UNAVAILABLE
+    recorded = _recorded_calls(answered)
+    if recorded is None:
+        return _UNAVAILABLE
+
+    lookups: list[RecordedToolResult] = []
+    index = 0
+    while index < len(recorded) and len(lookups) < MAX_REPLAY_READ_ROUNDS:
+        call = recorded[index]
+        fed = metrics.replayable_lookup(call.name, call.arguments, tools_by_name, recorded)
+        if fed is None:
+            break
+        lookups.append(fed)
+        index += 1
+
+    remaining = recorded[index:]
+    reply = _reply_text(answered)
+    if not remaining:
+        # Every recorded call was a lookup the replay would have answered,
+        # so the decision that follows them is the prose the turn ended on.
+        if lookups and not reply.strip():
+            return _UNAVAILABLE
+        return HistoricDecision(
+            available=True,
+            calls=(),
+            flattened=False,
+            lookups=tuple(lookups),
+            text=reply,
+        )
+    first = remaining[0]
+    return HistoricDecision(
+        available=True,
+        calls=(ToolCall(name=first.name, arguments=first.arguments),),
+        # The scored call shares a flat list with others, so whether the
+        # decision was this call alone or this call and its neighbours in one
+        # round is not recoverable.
+        flattened=len(recorded) > 1,
+        lookups=tuple(lookups),
+    )
 
 
 def _batch_end(rows: list[StoredMessage], start: int) -> int:
@@ -447,7 +555,7 @@ def select_samples(fixture: ReplayFixture, limit: int) -> list[ReplaySample]:
             last_index, message_context = texts[-1]
             row = rows[last_index]
             reply, tool_names = _historic_response(rows, last_index)
-            decision = _historic_first_decision(rows, last_index)
+            decision = _historic_first_decision(rows, last_index, fixture.tools_by_name)
             samples.append(
                 ReplaySample(
                     seq=row.seq,
@@ -457,6 +565,8 @@ def select_samples(fixture: ReplayFixture, limit: int) -> list[ReplaySample]:
                     historic_tool_names=tool_names,
                     historic_tool_results=_historic_tool_results(rows, last_index),
                     historic_first_calls=decision.calls,
+                    historic_decision_lookups=decision.lookups,
+                    historic_decision_text=decision.text,
                     historic_decision_available=decision.available,
                     historic_calls_flattened=decision.flattened,
                     batched_messages=tuple(text for _, text in texts[:-1]),

@@ -15,11 +15,13 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from any_llm.types.messages import MessageResponse, MessageUsage, TextBlock, ToolUseBlock
 from pydantic import BaseModel
 from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
 
 from backend.app.agent.core import AssembledPrompt
+from backend.app.agent.dto import StoredMessage
 from backend.app.agent.messages import SystemMessage, UserMessage
 from backend.app.agent.observer import PURPOSE_AGENT_MAIN
 from backend.app.agent.tools.base import Tool, ToolResult, ToolTags
@@ -32,7 +34,7 @@ from backend.app.services.llm_eval.runner import (
     execute_run,
     mark_interrupted_runs,
 )
-from backend.app.services.llm_eval.sampling import ReplayFixture
+from backend.app.services.llm_eval.sampling import ReplayFixture, select_samples
 from backend.app.services.llm_eval.types import (
     IncumbentSource,
     JudgeSkipReason,
@@ -1075,6 +1077,7 @@ async def test_a_turn_that_only_replied_carries_its_prose_as_the_decision(
         timestamp="2026-05-01T12:00:00+00:00",
         message_context="just checking in",
         historic_reply="all good here",
+        historic_decision_text="all good here",
     )
     a, b, c, d = _patched_run(
         samples=[sample], call_side_effect=lambda *a, **k: _result(text="all good here")
@@ -1292,3 +1295,326 @@ async def test_a_replay_run_still_calls_both_sides(db_session: Session, test_use
     assert run.summary_json is not None
     assert run.summary_json["incumbent_source"] == "replay"
     assert run.summary_json["incumbent_source_counts"] == {"live": 2}
+
+
+# ---------------------------------------------------------------------------
+# Historic mode against the real round loop
+# ---------------------------------------------------------------------------
+#
+# The tests above stub ``call_model``, so they never exercise the thing that
+# broke: the replay advances the candidate past a lookup the live turn also
+# made and scores what comes next, while the historic side was read as the
+# first recorded call. On a lookup-then-act turn those are different rounds,
+# and a candidate that reproduced production exactly came out divergent.
+
+
+class _FindParams(BaseModel):
+    q: str
+
+
+class _SendParams(BaseModel):
+    invoice_id: str
+
+
+async def _unused_tool(**_kwargs: object) -> ToolResult:  # pragma: no cover
+    raise AssertionError("a tool was executed during an evaluation")
+
+
+_QB_TOOLS = {
+    "qb_find": Tool(
+        name="qb_find",
+        description="find",
+        function=_unused_tool,
+        params_model=_FindParams,
+        tags={ToolTags.READ_ONLY},
+    ),
+    # Untagged, so mutating: never fed back, whichever side asks for it.
+    "qb_send": Tool(
+        name="qb_send", description="send", function=_unused_tool, params_model=_SendParams
+    ),
+}
+
+_FIND_CALL = {"name": "qb_find", "input": {"q": "Acme Plumbing"}}
+_SEND_CALL = {"name": "qb_send", "input": {"invoice_id": "1186"}}
+_FOUND = "invoice 1186 for Acme Plumbing"
+
+
+def _provider_response(*, text: str = "", tool: dict[str, Any] | None = None) -> MessageResponse:
+    """What the provider hands back, parsed by the real dispatch path."""
+    content: list[Any] = []
+    if text:
+        content.append(TextBlock(type="text", text=text))
+    if tool is not None:
+        content.append(
+            ToolUseBlock(type="tool_use", id="toolu_1", name=tool["name"], input=tool["input"])
+        )
+    return MessageResponse(
+        id="msg_1",
+        content=content,
+        model="candidate",
+        role="assistant",
+        stop_reason="tool_use" if tool else "end_turn",
+        type="message",
+        usage=MessageUsage(input_tokens=100, output_tokens=10),
+    )
+
+
+def _second_round(messages: list[dict[str, Any]]) -> bool:
+    """Whether this request carries a replayed tool result, i.e. round two."""
+    return any(
+        isinstance(m.get("content"), list)
+        and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in m["content"])
+        for m in messages
+    )
+
+
+def _lookup_then(final: dict[str, Any]) -> Callable[..., Awaitable[MessageResponse]]:
+    """A model that looks the invoice up, then does *final* with what it read."""
+
+    async def dispatch(**kwargs: Any) -> MessageResponse:
+        if _second_round(kwargs["messages"]):
+            return _provider_response(**final)
+        return _provider_response(tool=_FIND_CALL)
+
+    return dispatch
+
+
+def _recorded_turn(seq: int, *, interactions: list[dict[str, Any]], reply: str) -> ReplaySample:
+    """One sampled turn, reconstructed from rows the way a real run does.
+
+    Goes through ``select_samples`` rather than building the sample by hand,
+    so the reconstruction under test is the one the run would use.
+    """
+    stamp = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    rows = [
+        StoredMessage(
+            seq=seq,
+            direction="inbound",
+            body="invoice Acme for the stalls",
+            processed_context="invoice Acme for the stalls",
+            timestamp=stamp.isoformat(),
+        ),
+        StoredMessage(
+            seq=seq + 1,
+            direction="outbound",
+            body=reply,
+            llm_reply_text=reply,
+            tool_interactions_json=json.dumps(interactions),
+            timestamp=(stamp + timedelta(seconds=9)).isoformat(),
+        ),
+    ]
+    fixture = ReplayFixture(user=User(id="u"), rows=rows)
+    fixture.tools_by_name = _QB_TOOLS
+    return select_samples(fixture, 1)[0]
+
+
+def _lookup_then_write_turn(seq: int = 1) -> ReplaySample:
+    return _recorded_turn(
+        seq,
+        interactions=[
+            {
+                "tool_call_id": "t1",
+                "name": "qb_find",
+                "args": {"q": "Acme Plumbing"},
+                "result": _FOUND,
+            },
+            {
+                "tool_call_id": "t2",
+                "name": "qb_send",
+                "args": {"invoice_id": "1186"},
+                "result": "ok",
+            },
+        ],
+        reply="Sent it.",
+    )
+
+
+def _lookup_then_reply_turn(seq: int) -> ReplaySample:
+    return _recorded_turn(
+        seq,
+        interactions=[
+            {
+                "tool_call_id": "t1",
+                "name": "qb_find",
+                "args": {"q": "Acme Plumbing"},
+                "result": _FOUND,
+            },
+        ],
+        reply="They owe 1186.",
+    )
+
+
+async def test_an_identical_candidate_on_a_lookup_then_act_turn_agrees(
+    db_session: Session, test_user: User
+) -> None:
+    """The defect this mode shipped with, against the real round loop.
+
+    The candidate looks the invoice up, is fed the result the live turn
+    recorded, and sends the same invoice: production's turn, reproduced. The
+    two sides must be scored on the same round of it, or the run reports the
+    candidate as acting where the incumbent looked something up.
+    """
+    run_id = _make_run(
+        db_session, test_user.id, samples=1, incumbent_source=IncumbentSource.HISTORIC
+    )
+    dispatch = AsyncMock(side_effect=_lookup_then({"tool": _SEND_CALL}))
+    a, b, c, _ = _patched_run(
+        samples=[_lookup_then_write_turn()],
+        call_side_effect=None,
+        tools_by_name=_QB_TOOLS,
+    )
+    with a, b, c, patch("backend.app.services.llm_eval.execution.amessages", dispatch):
+        await execute_run(run_id, concurrency=1)
+
+    turn = _turns_of(db_session, run_id)[0]
+    assert json.loads(turn.candidate_tool_calls) == [
+        {"name": "qb_send", "arguments": {"invoice_id": "1186"}}
+    ]
+    assert json.loads(turn.baseline_tool_calls) == [
+        {"name": "qb_send", "arguments": {"invoice_id": "1186"}}
+    ]
+    assert turn.agreement == "identical"
+    # Both sides carry the lookup they made first, which is also what keeps
+    # the two responses indistinguishable in the judge prompt.
+    assert [item["name"] for item in json.loads(turn.baseline_replayed_lookups)] == ["qb_find"]
+    assert [item["name"] for item in json.loads(turn.candidate_replayed_lookups)] == ["qb_find"]
+    run = db_session.execute(select(LLMEvalRun).where(LLMEvalRun.id == run_id)).scalar_one()
+    assert run.summary_json is not None
+    assert run.summary_json["agreement_counts"] == {"identical": 1}
+    assert run.summary_json["silent_noop_rate"] == 0.0
+
+
+async def test_an_identical_candidate_on_lookup_then_reply_turns_is_not_a_no_op(
+    db_session: Session, test_user: User
+) -> None:
+    """The reproduction: twelve lookup-then-reply turns, an identical candidate.
+
+    Every one of them came back ``replied_instead_of_acting``, because the
+    candidate was scored on the reply it gave after the lookup and the
+    incumbent on the lookup itself. That is a 100% silent-no-op rate and a
+    ``do_not_switch`` against a candidate that did exactly what production
+    did.
+    """
+    turns = 12
+    samples = [_lookup_then_reply_turn(seq) for seq in range(1, turns * 2, 2)]
+    run_id = _make_run(
+        db_session, test_user.id, samples=turns, incumbent_source=IncumbentSource.HISTORIC
+    )
+    dispatch = AsyncMock(side_effect=_lookup_then({"text": "They owe 1186."}))
+    a, b, c, _ = _patched_run(samples=samples, call_side_effect=None, tools_by_name=_QB_TOOLS)
+    with a, b, c, patch("backend.app.services.llm_eval.execution.amessages", dispatch):
+        await execute_run(run_id, concurrency=1)
+
+    run = db_session.execute(select(LLMEvalRun).where(LLMEvalRun.id == run_id)).scalar_one()
+    summary = run.summary_json
+    assert summary is not None
+    assert summary["agreement_counts"] == {"both_replied": turns}
+    assert summary["silent_noop_rate"] == 0.0
+    assert summary["divergence_rate"] == 0.0
+    assert run.recommendation != Recommendation.DO_NOT_SWITCH
+
+
+async def test_historic_mode_cannot_reach_a_blocking_verdict(
+    db_session: Session, test_user: User
+) -> None:
+    """Defence in depth: no reading of the recorded side may block a switch.
+
+    Every turn here is a silent no-op the judge did not excuse, which in
+    replay mode is a firm ``do_not_switch``. The incumbent side is a turn
+    production recorded rather than a decision this run elicited, so the
+    same evidence is a caution that names what is missing.
+    """
+    turns = MIN_TURNS_FOR_VERDICT + 2
+    samples = [
+        ReplaySample(
+            seq=seq,
+            timestamp="2026-05-01T12:00:00+00:00",
+            message_context=f"ask {seq}",
+            historic_reply="looked it up",
+            historic_tool_names=["lookup"],
+            historic_first_calls=(ToolCall(name="lookup", arguments={"q": f"a{seq}"}),),
+        )
+        for seq in range(1, turns + 1)
+    ]
+    run_id = _make_run(
+        db_session, test_user.id, samples=turns, incumbent_source=IncumbentSource.HISTORIC
+    )
+    a, b, c, d = _patched_run(
+        samples=samples,
+        call_side_effect=lambda *a, **k: _result(text="Here is what I think."),
+        tools_by_name={"lookup": _lookup_tool()},
+    )
+    with a, b, c, d:
+        await execute_run(run_id, concurrency=1)
+
+    run = db_session.execute(select(LLMEvalRun).where(LLMEvalRun.id == run_id)).scalar_one()
+    summary = run.summary_json
+    assert summary is not None
+    assert summary["silent_noop_blocking_rate"] == 1.0
+    assert summary["silent_noop_comparable"] is False
+    assert summary["judge_preference"]["comparable"] is False
+    assert run.recommendation == Recommendation.SWITCH_WITH_MONITORING
+    assert any("cannot block a switch" in reason for reason in summary["reasons"])
+
+
+async def test_a_judged_unsafe_flag_is_never_filed_against_an_unmeasured_incumbent(
+    db_session: Session, test_user: User
+) -> None:
+    """The incumbent was not measured, so it carries no findings at all.
+
+    The judge is shown a decision read out of the transcript; a flag on it
+    describes what production did that day, under that day's prompt, not the
+    model this run names. Recording it as the incumbent's finding puts a
+    measurement in the column every other part of this mode reports as
+    unmeasured.
+    """
+    run_id = _make_run(
+        db_session, test_user.id, samples=1, judge=True, incumbent_source=IncumbentSource.HISTORIC
+    )
+    a, b, c, d = _patched_run(
+        samples=_historic_samples(1),
+        call_side_effect=lambda *a, **k: _result(text="I'd rather not."),
+        tools_by_name={"lookup": _lookup_tool()},
+    )
+    outcome = JudgeOutcome(
+        JudgeVerdict.CANDIDATE_BETTER, "the other one texts the wrong customer", frozenset(Side)
+    )
+    with (
+        a,
+        b,
+        c,
+        d,
+        patch(
+            "backend.app.services.llm_eval.runner.judge_turn",
+            AsyncMock(return_value=outcome),
+        ),
+    ):
+        await execute_run(run_id, concurrency=1)
+
+    turn = _turns_of(db_session, run_id)[0]
+    sides = {issue["side"] for issue in json.loads(turn.safety_issues)}
+    assert sides == {"candidate"}
+    # The judge's reasoning is still on the turn, so the flag is readable.
+    assert "wrong customer" in turn.judge_rationale
+    run = db_session.execute(select(LLMEvalRun).where(LLMEvalRun.id == run_id)).scalar_one()
+    assert run.summary_json is not None
+    assert run.summary_json["baseline_safety_counts"] == {}
+
+
+async def test_the_judge_is_not_told_which_side_came_from_the_transcript(
+    db_session: Session, test_user: User
+) -> None:
+    """The run passes the blinding flag through on a historic turn."""
+    run_id = _make_run(
+        db_session, test_user.id, samples=1, judge=True, incumbent_source=IncumbentSource.HISTORIC
+    )
+    judge = AsyncMock(return_value=JudgeOutcome(JudgeVerdict.EQUIVALENT, "same"))
+    a, b, c, d = _patched_run(
+        samples=_historic_samples(1),
+        call_side_effect=lambda *a, **k: _result(text="I'll look."),
+        tools_by_name={"lookup": _lookup_tool()},
+    )
+    with a, b, c, d, patch("backend.app.services.llm_eval.runner.judge_turn", judge):
+        await execute_run(run_id, concurrency=1)
+
+    assert judge.await_args_list[-1].kwargs["historic_side_shown"] is True

@@ -154,16 +154,13 @@ def incumbent_source(run: LLMEvalRun) -> IncumbentSource:
 
 
 def historic_decision(run: LLMEvalRun, sample: ReplaySample) -> tuple[ModelCallResult, TurnSource]:
-    """The incumbent's *first* decision for a turn, read out of the transcript.
+    """The incumbent's decision for a turn, read out of the transcript.
 
-    First decision, not final reply. The candidate side of every comparison
-    is scored on the first response that would need a live tool, so that is
-    what the incumbent side has to be: a turn that looked a customer up and
-    then sent them a message decided to look them up, and scoring
-    ``historic_reply`` against the candidate's tool call would compare a
-    finished message with an opening move. ``sampling`` reconstructs it from
-    the recorded tool interactions; when the turn called nothing, its first
-    decision was its prose and that is what lands here.
+    Assembled from what ``sampling`` reconstructed: the scored calls, the
+    lookups skipped to reach them, and the prose when the decision was
+    prose. It is scored at the same point in the turn as the candidate's,
+    which is the property the whole mode rests on. See
+    ``IncumbentSource.HISTORIC``.
 
     A turn whose decision could not be reconstructed comes back as
     ``UNAVAILABLE`` with an empty result, and everything downstream drops it
@@ -187,11 +184,9 @@ def historic_decision(run: LLMEvalRun, sample: ReplaySample) -> tuple[ModelCallR
         ModelCallResult(
             provider=run.baseline_provider,
             model=run.baseline_model,
-            # Prose only when the turn asked for no tool. A turn that opened
-            # with a call carries no scored text: the prose it ended on was
-            # written after the rounds this decision precedes.
-            text="" if sample.historic_first_calls else sample.historic_reply,
+            text=sample.historic_decision_text,
             tool_calls=list(sample.historic_first_calls),
+            replayed_lookups=list(sample.historic_decision_lookups),
         ),
         TurnSource.HISTORIC,
     )
@@ -611,17 +606,30 @@ async def _compare_turn(
             assembled, build_time_user_context(fixture.user, sample_clock(sample))
         )
         outcome = await judge_turn(
-            sample, baseline, candidate, target=targets.judge, context=context
+            sample,
+            baseline,
+            candidate,
+            target=targets.judge,
+            context=context,
+            historic_side_shown=baseline_source is TurnSource.HISTORIC,
         )
         comparison.judge_verdict = outcome.verdict
         comparison.judge_rationale = outcome.rationale
+        # A finding is only recorded against a side this run measured. An
+        # unsafe flag on a decision read out of the transcript is a flag on
+        # what production did that day, under that day's prompt and schema,
+        # not on the model this run names as the incumbent; filing it under
+        # ``BASELINE`` would put a measurement in the column the rest of the
+        # mode reports as never measured. The judge's reasoning is kept on
+        # the turn either way, so the flag is visible without being counted.
+        measured = {Side.CANDIDATE} if baseline_source is not TurnSource.LIVE else set(Side)
         comparison.safety_issues.extend(
             SafetyIssue(
                 finding=SafetyFinding.JUDGED_UNSAFE,
                 detail=outcome.rationale,
                 side=side,
             )
-            for side in sorted(outcome.unsafe)
+            for side in sorted(outcome.unsafe & measured)
         )
 
     return comparison
@@ -994,6 +1002,11 @@ def _summary_payload(aggregate: metrics.RunAggregate) -> dict:
         ),
         "silent_noop_rate": round(aggregate.silent_noop_rate, 4),
         "silent_noop_blocking_rate": round(aggregate.silent_noop_blocking_rate, 4),
+        # Whether "the candidate replied where the incumbent acted" is a
+        # claim about the incumbent model. It is not in historic mode, where
+        # the acting side is the recorded turn, so the rate is reported and
+        # cannot block. Same reading as ``safety_comparison.comparable``.
+        "silent_noop_comparable": aggregate.incumbent_measured,
         "baseline": _model_totals_payload(aggregate.baseline),
         "candidate": _model_totals_payload(aggregate.candidate),
         "recommendation": str(aggregate.recommendation),

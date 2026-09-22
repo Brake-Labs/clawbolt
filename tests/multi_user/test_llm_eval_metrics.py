@@ -29,6 +29,7 @@ from backend.app.models import User
 from backend.app.services.llm_eval import metrics
 from backend.app.services.llm_eval.types import (
     AgreementClass,
+    IncumbentSource,
     JudgeVerdict,
     ModelCallResult,
     Recommendation,
@@ -786,6 +787,44 @@ def test_silent_noops_the_judge_scored_against_the_candidate_still_block() -> No
     assert agg.silent_noop_blocking_rate > metrics.MAX_SILENT_NOOP_RATE
     assert agg.recommendation == Recommendation.DO_NOT_SWITCH
     assert any("where acting was the better call" in r for r in agg.reasons)
+
+
+# ---------------------------------------------------------------------------
+# Historic mode blocks nothing it cannot compare fairly
+# ---------------------------------------------------------------------------
+
+
+def test_historic_mode_cannot_block_on_silent_no_ops() -> None:
+    """The acting side is a recorded turn, not a decision this run elicited.
+
+    Defence in depth behind the reconstruction: even a reading that lined the
+    two sides up wrongly must not be able to produce ``do_not_switch``, since
+    "the candidate is worse than the model it replaces" is a claim about a
+    model this run never asked. The rate is still computed and still shown.
+    """
+    comparisons = [_noop_turn(i, JudgeVerdict.CANDIDATE_WORSE) for i in range(1, 7)]
+    comparisons += [_identical_turn(i) for i in range(7, 21)]
+
+    agg = metrics.aggregate(comparisons, incumbent_source=IncumbentSource.HISTORIC)
+    assert agg.silent_noop_blocking_rate > metrics.MAX_SILENT_NOOP_RATE
+    assert agg.recommendation != Recommendation.DO_NOT_SWITCH
+    assert any("cannot block a switch" in r for r in agg.reasons)
+    assert any("where acting was the better call" in r for r in agg.reasons)
+
+
+def test_historic_mode_cannot_block_on_the_judges_preference() -> None:
+    """Same rule for the quality tier, and the payload says the claim is out."""
+    comparisons = [_comparison(i, verdict=JudgeVerdict.CANDIDATE_WORSE) for i in range(20)]
+    comparisons += [_comparison(i, verdict=JudgeVerdict.EQUIVALENT) for i in range(20, 40)]
+
+    replayed = metrics.aggregate(comparisons)
+    assert replayed.recommendation is Recommendation.DO_NOT_SWITCH
+    assert metrics.judge_preference(replayed).payload()["comparable"] is True
+
+    agg = metrics.aggregate(comparisons, incumbent_source=IncumbentSource.HISTORIC)
+    assert agg.recommendation != Recommendation.DO_NOT_SWITCH
+    assert any("judge preferred the recorded turn" in r for r in agg.reasons)
+    assert metrics.judge_preference(agg).payload()["comparable"] is False
 
 
 # ---------------------------------------------------------------------------
