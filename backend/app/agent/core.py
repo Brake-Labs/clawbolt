@@ -114,6 +114,7 @@ from backend.app.services.llm_service import (
     apply_history_cache_breakpoint,
     apply_in_turn_cache_breakpoint,
     apply_tool_caching,
+    fit_max_tokens_to_reasoning,
     prepare_system_with_caching,
 )
 from backend.app.services.llm_usage import log_llm_usage
@@ -550,7 +551,6 @@ class ClawboltAgent:
         appropriate logging so the caller can produce a user-facing message.
         """
         await self._send_typing_indicator()
-        effective_max_tokens = max_tokens or settings.llm_max_tokens_agent
         system_str, msg_dicts = messages_to_messages_api(messages)
         target = await self._resolve_target()
         effective_model = target.model
@@ -567,6 +567,12 @@ class ClawboltAgent:
             tool_schemas = apply_tool_caching(tool_schemas, target)
         tool_count = len(tool_schemas) if tool_schemas else 0
         reasoning = target.reasoning_kwargs(settings.reasoning_effort)
+        # Anthropic requires a thinking budget below ``max_tokens``, and the
+        # agent's default is smaller than the medium-and-up budgets. The eval
+        # replay applies the same fit, so both send the same request.
+        effective_max_tokens = fit_max_tokens_to_reasoning(
+            max_tokens or settings.llm_max_tokens_agent, reasoning
+        )
         # The payload observer records the Anthropic-shaped budget only;
         # an effort-shaped endpoint has no dict to report.
         thinking = reasoning.get("thinking")

@@ -128,8 +128,8 @@ async def call_model(
 
     Two budget rules keep the replay from charging a model for limits
     production does not impose. A thinking budget at or above ``max_tokens``
-    raises ``max_tokens`` to fit it (``fit_max_tokens_to_reasoning``), and a
-    reply truncated with no tool call is retried at a doubled budget the way
+    raises ``max_tokens`` to fit it (``fit_max_tokens_to_reasoning``, which the
+    live loop applies too), and a reply truncated with no tool call is retried at a doubled budget the way
     the live loop retries it.
     """
     reasoning = target.reasoning_kwargs(reasoning_effort)

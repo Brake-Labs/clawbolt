@@ -2576,3 +2576,40 @@ async def test_hygiene_only_compaction_skips_empty_memory(
 
     assert memory_update == ""
     mock_llm.assert_not_called()
+
+
+@pytest.mark.parametrize(("effort", "fits"), [("high", True), ("auto", False)])
+async def test_compaction_max_tokens_makes_room_for_the_thinking_budget(
+    test_user: UserData, effort: str, fits: bool
+) -> None:
+    """A thinking budget must stay below ``max_tokens``, as in the agent loop."""
+    mock_response = make_text_response(json.dumps({"memory_update": "", "summary": ""}))
+    messages: list[AgentMessage] = [UserMessage(content="test")]
+
+    with (
+        patch(
+            "backend.app.agent.compaction.amessages_streamed", return_value=mock_response
+        ) as mock_llm,
+        patch("backend.app.agent.compaction.settings") as mock_settings,
+    ):
+        mock_settings.compaction_enabled = True
+        mock_settings.compaction_model = ""
+        mock_settings.compaction_provider = ""
+        mock_settings.compaction_max_tokens = 300
+        mock_settings.compaction_event_snapshot_max_bytes_per_file = 100_000
+        mock_settings.llm_model = "claude-sonnet-4-5"
+        mock_settings.llm_provider = "anthropic"
+        mock_settings.llm_api_base = None
+        mock_settings.llm_endpoint = ""
+        mock_settings.vision_endpoint = ""
+        mock_settings.heartbeat_endpoint = ""
+        mock_settings.compaction_endpoint = ""
+        mock_settings.reasoning_effort = effort
+        await compact_session(test_user.id, messages)
+
+    kwargs = mock_llm.call_args.kwargs
+    if fits:
+        assert kwargs["max_tokens"] > kwargs["thinking"]["budget_tokens"]
+    else:
+        assert "thinking" not in kwargs
+        assert kwargs["max_tokens"] == 300

@@ -64,7 +64,11 @@ from backend.app.enums import MessageDirection
 from backend.app.logging_utils import mask_pii
 from backend.app.models import User
 from backend.app.services.llm_endpoints import resolve_target, role_selection
-from backend.app.services.llm_service import amessages_streamed, prepare_system_with_caching
+from backend.app.services.llm_service import (
+    amessages_streamed,
+    fit_max_tokens_to_reasoning,
+    prepare_system_with_caching,
+)
 from backend.app.services.llm_usage import log_llm_usage
 
 if TYPE_CHECKING:
@@ -381,6 +385,10 @@ async def evaluate_heartbeat_need(
     heartbeat_tools = [HEARTBEAT_DECISION_TOOL]
     heartbeat_reasoning = target.reasoning_kwargs(settings.reasoning_effort)
     heartbeat_thinking = heartbeat_reasoning.get("thinking")
+    # A thinking budget must fit under ``max_tokens``. See ``fit_max_tokens_to_reasoning``.
+    heartbeat_max_tokens = fit_max_tokens_to_reasoning(
+        settings.llm_max_tokens_heartbeat, heartbeat_reasoning
+    )
     started_at = datetime.datetime.now(datetime.UTC)
     await emit_llm_request(
         LLMRequestPayload(
@@ -391,7 +399,7 @@ async def evaluate_heartbeat_need(
             request_id=None,
             model=model,
             provider=provider,
-            max_tokens=settings.llm_max_tokens_heartbeat,
+            max_tokens=heartbeat_max_tokens,
             thinking=heartbeat_thinking,
             system=heartbeat_system,
             messages=heartbeat_messages,
@@ -411,7 +419,7 @@ async def evaluate_heartbeat_need(
                 system=heartbeat_system,
                 messages=heartbeat_messages,
                 tools=heartbeat_tools,
-                max_tokens=settings.llm_max_tokens_heartbeat,
+                max_tokens=heartbeat_max_tokens,
                 **heartbeat_reasoning,
             )
             break
