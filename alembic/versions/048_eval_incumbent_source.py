@@ -3,18 +3,14 @@
 A run used to call both models on every sampled turn, so a hundred-turn run
 made two hundred live calls and every new candidate re-bought the incumbent's
 answers to the same turns. ``incumbent_source`` picks where they come from
-instead: ``historic`` (the new default) reconstructs each turn's first
-decision from the tool calls production recorded for it and never calls the
-incumbent, and ``replay`` is the old behavior, both sides live.
+instead; ``llm_eval.types.IncumbentSource`` is what each mode does and does
+not measure.
 
-The two counters are what keeps historic mode honest. A turn that was never
-answered, or whose recorded interactions did not parse, has no decision to
-compare against, so it is marked unavailable and dropped from every paired
-comparison rather than read as "the agent did nothing";
-``baseline_turns_unavailable`` is how many. And the model that answered a
-turn months ago is not necessarily the one the run names as the incumbent, so
-``historic_other_config_calls`` carries how many agent calls in this user's
-usage log, over the window the sampled turns fall in, ran on something else.
+The two counters are what keeps the new default honest:
+``baseline_turns_unavailable`` is how many sampled turns had no decision to
+read and left every comparison, and ``historic_other_config_calls`` how many
+agent calls in this user's usage log, over the window the sampled turns fall
+in, ran on a model the run does not name.
 
 Server defaults describe what old rows did: every existing run replayed, with
 nothing unavailable, and every existing turn was a live call.

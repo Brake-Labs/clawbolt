@@ -219,42 +219,41 @@ against the incumbent's. The admin console drives it;
 `routers/admin_llm_eval.py` owns the job lifecycle.
 
 **Where the incumbent's side comes from is chosen per run**
-(`types.IncumbentSource`, frozen onto `llm_eval_runs.incumbent_source`).
-`historic`, the default, never calls the incumbent: the incumbent's answer to
-each turn was bought once already, in production, and `sampling` reconstructs
-that turn's *first decision* from its recorded tool interactions. `replay`
-calls it live on every turn and doubles the bill. Choose `replay` when the
-prompt or tool schema has changed since the turns happened, when the incumbent
-has never run them, or to calibrate a model against itself; `divergence_noise_floor`
-ignores a historic run for that reason.
+(`types.IncumbentSource`, frozen onto `llm_eval_runs.incumbent_source`). Its
+docstring is where the mode is explained: what `historic` measures, the four
+things it cannot control, and why a run in it neither clears a candidate nor
+blocks one. Everything else that touches the mode points there. `historic`,
+the default, never calls the incumbent and halves the bill; `replay` calls it
+live on every turn. Choose `replay` when the prompt or tool schema has changed
+since the turns happened, when the incumbent has never run them, or to
+calibrate a model against itself; `divergence_noise_floor` ignores a historic
+run for that reason.
 
-Two things make `historic` honest rather than merely cheap, and both are easy
-to break:
+One property makes `historic` honest rather than merely cheap, and it is one
+edit away from breaking:
 
-- **First decision against first decision.** The candidate is scored on its
-  first response that would need a live tool, so the incumbent side has to be
-  the same thing: `ReplaySample.historic_first_calls`, not `historic_reply`,
-  which is the prose the user saw after every round had run. Comparing against
-  the reply reads every lookup-then-act turn as the candidate acting where the
-  incumbent talked.
-- **Nothing the incumbent was not asked may be reported as a zero.** It made
-  no call, so its safety findings, tokens, latency and cost were never
-  measured: `SideComparison.comparable` goes False, the safety sign test does
-  not run (a fabricated incumbent zero would block candidates at parity), cost
-  is marked `not_replayed`, and no run in this mode can return
-  `safe_to_switch`. A turn whose interactions did not parse is
-  `TurnSource.UNAVAILABLE` and leaves every paired comparison rather than
-  reading as "the agent did nothing", which is the reading that exempts a
-  candidate's write from `UNREQUESTED_MUTATION`. The run also reports which
-  models `llm_usage_logs` says actually answered over the sampled window,
-  because that turn may not have run on the model the report names.
+- **Both sides are scored at the same point in the turn.**
+  `metrics.replayable_lookup` decides whether a single call is a lookup the
+  replay can answer from the record. `execution.call_model` applies it to the
+  candidate's rounds; `sampling._historic_first_decision` applies it to the
+  recorded calls, skipping the same leading lookups under the same
+  `MAX_REPLAY_READ_ROUNDS` bound. Two readings of that rule is the bug this
+  mode shipped with: the candidate was scored on the write it made after a
+  lookup and the incumbent on the lookup itself, so a candidate that
+  reproduced production exactly came back `do_not_switch` at a 100% silent
+  no-op rate. Whatever is scored on one side has a counterpart on the other,
+  the skipped lookups included, which is also what keeps the two responses
+  structurally indistinguishable in `judge._judge_prompt`. The live turn's own
+  tool calls are withheld from that prompt in this mode, since the incumbent's
+  side is the head of that list.
 
 Three invariants, each of which the feature is worthless without:
 
 - **A replay never executes a tool.** Executing would text real customers and
   mutate real job records on every evaluation. A replay continues past a
-  lookup only when every call in the response is read-only
-  (`metrics.is_mutating_call`) and matches a call the live turn made; it then
+  lookup only when every call in the response is one `metrics.replayable_lookup`
+  answers, which means read-only (`is_mutating_call`) and matching a call the
+  live turn made; it then
   feeds back the result that turn recorded, for at most
   `MAX_REPLAY_READ_ROUNDS` extra rounds (`execution.call_model`). Anything
   else, a write included, is the decision scored. Feeding a recorded result is

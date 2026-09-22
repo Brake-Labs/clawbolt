@@ -74,26 +74,21 @@ class LLMEvalRun(Base):
     judge_provider: Mapped[str] = mapped_column(String(64), default="")
     judge_model: Mapped[str] = mapped_column(String(128), default="")
 
-    # Where the incumbent's decisions come from: ``historic`` reads each
-    # turn's first decision out of the transcript and never calls the model,
-    # ``replay`` calls it live on every turn. See
-    # ``llm_eval.types.IncumbentSource``. Runs recorded before the mode
-    # existed read as ``replay``, which is what they did.
+    # Where the incumbent's decisions come from, and what that mode does and
+    # does not measure: ``llm_eval.types.IncumbentSource``. Runs recorded
+    # before the mode existed read as ``replay``, which is what they did.
     incumbent_source: Mapped[str] = mapped_column(String(16), default="replay")
 
-    # Sampled turns whose incumbent side could not be reconstructed: never
-    # answered, or answered with tool interactions that did not survive.
-    # Counted as the run goes, and dropped from every paired comparison.
-    # Always zero in ``replay``, where the incumbent is asked directly.
+    # Sampled turns whose incumbent side could not be reconstructed, counted
+    # as the run goes and dropped from every paired comparison. Always zero
+    # in ``replay``, where the incumbent is asked directly.
     baseline_turns_unavailable: Mapped[int] = mapped_column(Integer, default=0)
 
     # Agent calls this user's history logged over the window the sampled
-    # turns fall in that did not run on this run's stated incumbent. A
-    # historic run compares against whatever model answered at the time,
-    # which is not necessarily the one named at the top of the report, and
-    # ``llm_usage_logs`` is the only record of which that was. Zero also
-    # means "checked and none", so the summary carries whether the check ran
-    # at all.
+    # turns fall in that did not run on this run's stated incumbent;
+    # ``llm_usage_logs`` is the only record of which model answered. Zero
+    # also means "checked and none", so the summary carries whether the
+    # check ran at all.
     historic_other_config_calls: Mapped[int] = mapped_column(Integer, default=0)
 
     requested_samples: Mapped[int] = mapped_column(Integer, default=0)
@@ -169,12 +164,11 @@ class LLMEvalTurnResult(Base):
         EncryptedString(table="llm_eval_turn_results", column="baseline_replayed_lookups"),
         default="",
     )
-    # Where this turn's incumbent decision came from: a ``live`` call, the
-    # ``historic`` transcript, or ``unavailable`` when the transcript held no
-    # decision to read. Recorded per turn, not per run, because a historic
-    # run cannot reconstruct every turn and the ones it could not are
-    # evidence in their own right. Rows written before the mode existed read
-    # as ``live``, which is what they were.
+    # Where this turn's incumbent decision came from
+    # (``llm_eval.types.TurnSource``). Recorded per turn, not per run,
+    # because a historic run cannot reconstruct every turn and the ones it
+    # could not are evidence in their own right. Rows written before the
+    # mode existed read as ``live``, which is what they were.
     baseline_source: Mapped[str] = mapped_column(String(16), default="live")
     baseline_stop_reason: Mapped[str] = mapped_column(String(64), default="")
     baseline_input_tokens: Mapped[int] = mapped_column(Integer, default=0)
