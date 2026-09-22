@@ -1,10 +1,15 @@
 """Gmail tools for the agent.
 
-Registers four tools (``gmail_search``, ``gmail_get_message``,
-``gmail_list_recent``, ``gmail_send``). All four default to ``ask`` permission
-because reading mail and sending mail are both privacy-sensitive: the user
-should explicitly allow each operation rather than letting the LLM act
-autonomously on their inbox.
+Registers five tools (``gmail_search``, ``gmail_get_message``,
+``gmail_open_attachment``, ``gmail_list_recent``, ``gmail_send``). All five
+default to ``ask`` permission because reading mail and sending mail are both
+privacy-sensitive: the user should explicitly allow each operation rather
+than letting the LLM act autonomously on their inbox.
+
+``gmail_open_attachment`` does not interpret attachments itself. It stages
+the bytes in ``media_staging`` and runs them through the same media pipeline
+as a file the user sent in chat, so a PDF comes back as extracted text and an
+image comes back as a handle for ``analyze_photo`` / ``upload_to_storage``.
 
 The factory mirrors ``calendar/factory.py`` and lives off the same shared
 ``oauth_service`` token store. The ``auth_check`` returns ``None`` (i.e. the
@@ -22,6 +27,7 @@ from typing import TYPE_CHECKING
 import httpx
 from pydantic import BaseModel, Field
 
+from backend.app.agent import media_staging
 from backend.app.agent.approval import ApprovalPolicy, PermissionLevel
 from backend.app.agent.saved_media import find_saved_file, read_saved_file_bytes
 from backend.app.agent.tools.base import Tool, ToolErrorKind, ToolReceipt, ToolResult, ToolTags
@@ -33,10 +39,13 @@ from backend.app.integrations._google_errors import (
 )
 from backend.app.integrations.gmail.service import (
     GmailAttachment,
+    GmailAttachmentInfo,
     GmailMessage,
     GmailMessageSummary,
     GmailService,
 )
+from backend.app.media.download import DownloadedMedia
+from backend.app.media.pipeline import process_message_media
 from backend.app.services.oauth import oauth_service
 from backend.app.services.storage_service import StorageBackend
 
@@ -82,6 +91,23 @@ class GmailGetMessageParams(BaseModel):
 
     message_id: str = Field(
         description="The Gmail message ID returned by gmail_search or gmail_list_recent.",
+    )
+
+
+class GmailOpenAttachmentParams(BaseModel):
+    """Parameters for the gmail_open_attachment tool."""
+
+    message_id: str = Field(
+        description="The Gmail message ID the attachment belongs to.",
+    )
+    attachment_id: str = Field(
+        description="The attachment_id listed under 'Attachments' by gmail_get_message.",
+    )
+    filename: str = Field(
+        description=(
+            "The attachment's filename as listed. Shown to the user in the "
+            "approval prompt; must match the attachment."
+        ),
     )
 
 
@@ -150,6 +176,53 @@ def _format_summary(s: GmailMessageSummary) -> str:
     return " | ".join(parts)
 
 
+def _format_size(num_bytes: int) -> str:
+    if num_bytes >= 1024 * 1024:
+        return f"{num_bytes / (1024 * 1024):.1f} MB"
+    if num_bytes >= 1024:
+        return f"{num_bytes / 1024:.0f} KB"
+    return f"{num_bytes} B"
+
+
+def _format_attachment(a: GmailAttachmentInfo) -> str:
+    inline = ", inline" if a.inline else ""
+    return (
+        f"{a.filename} ({a.mime_type}, {_format_size(a.size)}{inline}) [attachment_id: {a.part_id}]"
+    )
+
+
+def _find_attachment(m: GmailMessage, ref: str) -> GmailAttachmentInfo | None:
+    """Match *ref* against the part id, then Gmail's attachmentId, then filename."""
+    ref = ref.strip()
+    for a in m.attachments:
+        if a.part_id == ref:
+            return a
+    for a in m.attachments:
+        if a.gmail_attachment_id and a.gmail_attachment_id == ref:
+            return a
+    matches = [a for a in m.attachments if a.filename.lower() == ref.lower()]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _resolve_attachment_mime(a: GmailAttachmentInfo) -> str:
+    """Senders often label PDFs and photos ``application/octet-stream``."""
+    if a.mime_type and a.mime_type != "application/octet-stream":
+        return a.mime_type
+    guessed, _ = mimetypes.guess_type(a.filename)
+    return guessed or "application/octet-stream"
+
+
+_MAX_PROMPT_FILENAME_CHARS = 120
+
+
+def _describe_gmail_open_attachment(args: dict[str, object]) -> str:
+    # The filename comes from the email's sender. Strip control characters and
+    # cap it so it cannot reshape or flood the approval prompt.
+    raw = str(args.get("filename") or args.get("attachment_id") or "")
+    label = "".join(ch for ch in raw if ch.isprintable())[:_MAX_PROMPT_FILENAME_CHARS]
+    return f"Open attachment {label} from Gmail message {args.get('message_id', '')}"
+
+
 def _format_message(m: GmailMessage) -> str:
     lines = [
         f"From: {m.sender or '(unknown)'}",
@@ -167,6 +240,10 @@ def _format_message(m: GmailMessage) -> str:
         lines.append("Links found in body:")
         for url in m.links:
             lines.append(f"  - {url}")
+    if m.attachments:
+        lines.append("Attachments (open with gmail_open_attachment):")
+        for a in m.attachments:
+            lines.append(f"  - {_format_attachment(a)}")
     lines.append("")
     lines.append("Body:")
     lines.append(m.body or "(empty body)")
@@ -370,12 +447,16 @@ def _handle_http_error(exc: httpx.HTTPStatusError, action: str) -> ToolResult:
 def create_gmail_tools(
     service: GmailService,
     storage: StorageBackend | None = None,
+    user_id: str = "",
 ) -> list[Tool]:
     """Create Gmail tools bound to a service instance.
 
     *storage* is optional: when omitted (e.g. the user hasn't connected
     Drive), ``gmail_send`` rejects any request that includes attachments
     with a clear validation error instead of crashing.
+
+    *user_id* scopes the media staging entries ``gmail_open_attachment``
+    creates; without it that tool refuses to run.
     """
 
     async def _run_search(query: str, max_results: int, empty_msg: str) -> ToolResult:
@@ -426,6 +507,125 @@ def create_gmail_tools(
                 error_kind=ToolErrorKind.SERVICE,
             )
         return ToolResult(content=_format_message(msg))
+
+    async def gmail_open_attachment(
+        message_id: str, attachment_id: str, filename: str
+    ) -> ToolResult:
+        if not message_id.strip() or not attachment_id.strip() or not filename.strip():
+            return ToolResult(
+                content="message_id, attachment_id, and filename are all required.",
+                is_error=True,
+                error_kind=ToolErrorKind.VALIDATION,
+            )
+        if not user_id:
+            return ToolResult(
+                content="Cannot open attachments without a user context.",
+                is_error=True,
+                error_kind=ToolErrorKind.INTERNAL,
+            )
+        # Re-read the message rather than trusting ids from an earlier turn:
+        # Gmail mints a fresh attachmentId on every fetch, and the part
+        # listing is the source of truth for size and inline data.
+        try:
+            msg = await service.get_message(message_id)
+        except httpx.TimeoutException:
+            return ToolResult(
+                content="Gmail unavailable (timeout). Try again shortly.",
+                is_error=True,
+                error_kind=ToolErrorKind.SERVICE,
+            )
+        except httpx.HTTPStatusError as exc:
+            return _handle_http_error(exc, f"get message {message_id}")
+
+        attachment = _find_attachment(msg, attachment_id)
+        if attachment is None:
+            available = "; ".join(_format_attachment(a) for a in msg.attachments) or "none"
+            return ToolResult(
+                content=(
+                    f"No attachment {attachment_id!r} on message {message_id}. "
+                    f"Attachments: {available}"
+                ),
+                is_error=True,
+                error_kind=ToolErrorKind.NOT_FOUND,
+            )
+        if filename.strip().lower() != attachment.filename.lower():
+            return ToolResult(
+                content=(
+                    f"attachment_id {attachment_id!r} is {attachment.filename!r}, "
+                    f"not {filename!r}. Check the listing from gmail_get_message."
+                ),
+                is_error=True,
+                error_kind=ToolErrorKind.VALIDATION,
+            )
+
+        # Same ceiling as media a user sends in chat. Checked against
+        # Gmail's declared size first so an oversize file is never fetched.
+        limit = settings.max_media_size_bytes
+        too_large = ToolResult(
+            content=(
+                f"{attachment.filename} is too large to open "
+                f"({_format_size(attachment.size)}, limit {_format_size(limit)}). "
+                "Ask the user to open it in Gmail."
+            ),
+            is_error=True,
+            error_kind=ToolErrorKind.VALIDATION,
+        )
+        if attachment.size > limit:
+            return too_large
+
+        try:
+            content = await service.get_attachment_bytes(message_id, attachment)
+        except httpx.TimeoutException:
+            return ToolResult(
+                content="Gmail unavailable (timeout). Try again shortly.",
+                is_error=True,
+                error_kind=ToolErrorKind.SERVICE,
+            )
+        except httpx.HTTPStatusError as exc:
+            return _handle_http_error(exc, f"download attachment {attachment.filename}")
+        except ValueError as exc:
+            return ToolResult(
+                content=f"Could not decode {attachment.filename}: {exc}",
+                is_error=True,
+                error_kind=ToolErrorKind.SERVICE,
+            )
+        if len(content) > limit:
+            return too_large
+        if not content:
+            return ToolResult(
+                content=f"{attachment.filename} is empty.",
+                is_error=True,
+                error_kind=ToolErrorKind.NOT_FOUND,
+            )
+
+        # Stage and classify through the inbound media path so the file
+        # behaves as if the user had sent it in chat. The synthetic URL keys
+        # on the stable part id, so reopening the attachment reuses its handle.
+        mime_type = _resolve_attachment_mime(attachment)
+        original_url = f"gmail:{message_id}/{attachment.part_id}"
+        handle = await media_staging.stage(user_id, original_url, content, mime_type)
+        processed = await process_message_media(
+            "",
+            [
+                DownloadedMedia(
+                    content=content,
+                    mime_type=mime_type,
+                    original_url=original_url,
+                    filename=attachment.filename,
+                )
+            ],
+            user_id=user_id,
+        )
+        lines = [
+            f"Opened {attachment.filename} ({mime_type}, {_format_size(len(content))}) "
+            f"from Gmail message {message_id}.",
+            processed.combined_context,
+        ]
+        if handle:
+            lines.append(
+                f"To save it to the user's files: upload_to_storage(original_url={handle!r})"
+            )
+        return ToolResult(content="\n".join(lines))
 
     async def gmail_list_recent(max_results: int = 10) -> ToolResult:
         # Empty query lists in reverse-chronological order, matching the
@@ -518,8 +718,9 @@ def create_gmail_tools(
             tags={ToolTags.READ_ONLY},
             description=(
                 "Fetch the full body of a single Gmail message by its ID. "
-                "Returns headers, the plain-text body, and a deduplicated "
-                "list of URLs found in the body."
+                "Returns headers, the plain-text body, a deduplicated "
+                "list of URLs found in the body, and any attachments "
+                "(filename, type, size, attachment_id)."
             ),
             function=gmail_get_message,
             params_model=GmailGetMessageParams,
@@ -531,6 +732,27 @@ def create_gmail_tools(
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 description_builder=lambda args: f"Read Gmail message {args.get('message_id', '')}",
+            ),
+        ),
+        Tool(
+            name=ToolName.GMAIL_OPEN_ATTACHMENT,
+            tags={ToolTags.READ_ONLY},
+            description=(
+                "Open an attachment from a Gmail message as if the user had "
+                "sent the file in chat. A PDF returns its text; an image or "
+                "other file returns a media handle for analyze_photo or "
+                "upload_to_storage. Files over the media size limit are refused."
+            ),
+            function=gmail_open_attachment,
+            params_model=GmailOpenAttachmentParams,
+            usage_hint=(
+                "When the user asks about an emailed document or photo, open "
+                "it with gmail_open_attachment instead of asking them to "
+                "download and resend it."
+            ),
+            approval_policy=ApprovalPolicy(
+                default_level=PermissionLevel.ASK,
+                description_builder=_describe_gmail_open_attachment,
             ),
         ),
         Tool(
@@ -626,7 +848,7 @@ async def _gmail_factory(ctx: ToolContext) -> list[Tool]:
     # ``ctx.storage`` may be None when the user has not connected Drive;
     # gmail_send rejects attachment requests with a validation error in
     # that case so the rest of the Gmail tools still work.
-    return create_gmail_tools(service, storage=ctx.storage)
+    return create_gmail_tools(service, storage=ctx.storage, user_id=ctx.user.id)
 
 
 def _register() -> None:
@@ -650,6 +872,11 @@ def _register() -> None:
             SubToolInfo(
                 ToolName.GMAIL_GET_MESSAGE,
                 "Read the full body of a single Gmail message",
+                default_permission="ask",
+            ),
+            SubToolInfo(
+                ToolName.GMAIL_OPEN_ATTACHMENT,
+                "Open an attachment on a Gmail message (PDF text, photos)",
                 default_permission="ask",
             ),
             SubToolInfo(

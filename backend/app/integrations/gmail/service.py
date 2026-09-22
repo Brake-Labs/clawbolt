@@ -6,7 +6,7 @@ proactive token refresh, reactive 401 retry, and a refresh callback so the
 
 Why a hand-rolled client and not ``google-api-python-client``: the rest of
 this codebase is httpx-based, the surface area we need from Gmail is tiny
-(three reads + one write), and the official client drags in synchronous
+(four reads + one write), and the official client drags in synchronous
 discovery-document fetches we'd have to wrap to keep ``async``.
 """
 
@@ -58,6 +58,29 @@ class GmailMessageSummary:
 
 
 @dataclass
+class GmailAttachmentInfo:
+    """An attachment found on a received message.
+
+    ``part_id`` is the MIME part path (``"1"``, ``"2.1"``) and is what the
+    agent quotes back as the attachment id. Gmail's own ``attachmentId`` is
+    not stable: every ``messages.get`` mints a fresh value for the same part,
+    so it cannot survive a round trip through the conversation.
+
+    Small parts carry their bytes inline in the payload (``inline_data``);
+    larger ones only have ``gmail_attachment_id`` and are fetched with
+    ``messages.attachments.get``.
+    """
+
+    part_id: str
+    filename: str
+    mime_type: str
+    size: int
+    inline: bool = False
+    gmail_attachment_id: str = ""
+    inline_data: str = field(default="", repr=False)
+
+
+@dataclass
 class GmailMessage:
     """Full message returned by ``get_message``.
 
@@ -78,6 +101,7 @@ class GmailMessage:
     body: str
     links: list[str] = field(default_factory=list)
     rfc822_message_id: str = ""
+    attachments: list[GmailAttachmentInfo] = field(default_factory=list)
 
 
 @dataclass
@@ -278,7 +302,28 @@ class GmailService:
             body=body,
             links=links,
             rfc822_message_id=headers.get("message-id", ""),
+            attachments=_collect_attachments(payload),
         )
+
+    async def get_attachment_bytes(self, message_id: str, attachment: GmailAttachmentInfo) -> bytes:
+        """Return the decoded bytes of *attachment* on *message_id*.
+
+        Uses the inline payload data when Gmail included it, otherwise
+        fetches ``messages.attachments.get``.
+        """
+        data = attachment.inline_data
+        if not data:
+            if not attachment.gmail_attachment_id:
+                raise ValueError(f"Attachment {attachment.part_id} has no retrievable content")
+            resp = (
+                await self._request(
+                    "GET",
+                    f"/users/me/messages/{message_id}/attachments/{attachment.gmail_attachment_id}",
+                )
+                or {}
+            )
+            data = resp.get("data") or ""
+        return _b64url_decode(data)
 
     async def send_message(
         self,
@@ -379,7 +424,12 @@ def _extract_body(payload: dict[str, Any]) -> str:
 
 
 def _find_part(payload: dict[str, Any], mime_type: str) -> dict[str, Any] | None:
-    if payload.get("mimeType") == mime_type and payload.get("body", {}).get("data"):
+    # A named part is an attachment (a .txt or .html file), not the body.
+    if (
+        payload.get("mimeType") == mime_type
+        and payload.get("body", {}).get("data")
+        and not payload.get("filename")
+    ):
         return payload
     for part in payload.get("parts", []) or []:
         found = _find_part(part, mime_type)
@@ -388,15 +438,61 @@ def _find_part(payload: dict[str, Any], mime_type: str) -> dict[str, Any] | None
     return None
 
 
+def _b64url_decode(data: str) -> bytes:
+    """Decode Gmail's URL-safe base64, which comes without padding guarantees."""
+    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
+
+
+def _collect_attachments(payload: dict[str, Any]) -> list[GmailAttachmentInfo]:
+    """Walk a Gmail ``payload`` tree and return every attachment part.
+
+    A part is an attachment when it has a filename, or when it is a
+    non-text, non-container part with content (an unnamed image, say).
+    Text parts without a filename are the message body, even when Gmail
+    moved a long body behind an ``attachmentId``. An attachment's own
+    subparts (a forwarded ``message/rfc822``) are not listed separately.
+    """
+    found: list[GmailAttachmentInfo] = []
+
+    def walk(part: dict[str, Any]) -> None:
+        mime = (part.get("mimeType") or "").lower()
+        filename = part.get("filename") or ""
+        body = part.get("body", {}) or {}
+        has_content = bool(body.get("attachmentId") or body.get("data"))
+        is_body_text = not filename and mime.startswith("text/")
+        if has_content and not is_body_text and not mime.startswith("multipart/"):
+            part_id = part.get("partId") or ""
+            headers = _index_headers(part.get("headers", []) or [])
+            disposition = headers.get("content-disposition", "").lower()
+            inline = disposition.startswith("inline") or (
+                not disposition.startswith("attachment") and bool(headers.get("content-id"))
+            )
+            found.append(
+                GmailAttachmentInfo(
+                    part_id=part_id,
+                    filename=filename or f"part-{part_id or len(found) + 1}",
+                    mime_type=mime or "application/octet-stream",
+                    size=int(body.get("size") or 0),
+                    inline=inline,
+                    gmail_attachment_id=body.get("attachmentId") or "",
+                    inline_data=body.get("data") or "",
+                )
+            )
+            return
+        for child in part.get("parts", []) or []:
+            walk(child)
+
+    walk(payload)
+    return found
+
+
 def _decode_part_data(part: dict[str, Any]) -> str:
     body = part.get("body", {}) or {}
     data = body.get("data") or ""
     if not data:
         return ""
     try:
-        # Gmail uses URL-safe base64 with no padding guarantees.
-        padded = data + "=" * (-len(data) % 4)
-        raw = base64.urlsafe_b64decode(padded)
+        raw = _b64url_decode(data)
     except (ValueError, TypeError) as exc:
         logger.warning("Could not decode Gmail body part: %s", exc)
         return ""
@@ -486,6 +582,7 @@ def _build_rfc822(
 
 __all__ = [
     "GmailAttachment",
+    "GmailAttachmentInfo",
     "GmailMessage",
     "GmailMessageSummary",
     "GmailSendResult",

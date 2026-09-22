@@ -1,13 +1,20 @@
+import sys
+import time
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 from backend.app.agent import media_staging
+from backend.app.media import pdf as pdf_module
 from backend.app.media.download import DownloadedMedia
+from backend.app.media.pdf import PdfExtractionError, extract_pdf_text
 from backend.app.media.pipeline import (
     VISION_FALLBACK,
     process_message_media,
     run_vision_on_media,
 )
 from backend.app.models import User
+from tests.mocks.pdf import make_content_stream_bomb, make_text_pdf
 
 
 def _make_media(
@@ -113,3 +120,76 @@ async def test_image_document_classified_as_image(mock_vision: AsyncMock) -> Non
     assert len(result.media_results) == 1
     assert result.media_results[0].category == "image"
     assert mock_vision.await_count == 0
+
+
+async def test_pdf_text_is_extracted_into_context() -> None:
+    """A PDF reaches the agent as its text layer, not a placeholder."""
+    media = DownloadedMedia(
+        content=make_text_pdf("Inspection summary: replace GFCI outlet"),
+        mime_type="application/pdf",
+        original_url="https://example.com/report.pdf",
+        filename="report.pdf",
+    )
+    result = await process_message_media("", [media])
+    assert result.media_results[0].category == "pdf"
+    assert "replace GFCI outlet" in result.combined_context
+    assert "(PDF text, 1 page(s))" in result.combined_context
+
+
+async def test_scanned_pdf_reports_no_text_layer() -> None:
+    media = DownloadedMedia(
+        content=make_text_pdf(""),
+        mime_type="application/pdf",
+        original_url="https://example.com/scan.pdf",
+        filename="scan.pdf",
+    )
+    result = await process_message_media("", [media])
+    assert "has no text layer" in result.combined_context
+
+
+async def test_corrupt_pdf_reports_unreadable() -> None:
+    result = await process_message_media("", [_make_media("application/pdf")])
+    assert "PDF could not be read" in result.combined_context
+
+
+async def test_long_pdf_text_is_truncated() -> None:
+    text, pages = await extract_pdf_text(make_text_pdf("word " * 200, "more"), max_chars=100)
+    assert pages == 2
+    assert text.endswith("[...truncated]")
+    assert len(text) < 150
+
+
+async def test_pdf_that_parses_too_long_is_cut_off() -> None:
+    """A few-KB PDF whose pages share a large content stream would pin a CPU
+    for minutes; the worker is killed at the timeout instead."""
+    bomb = make_content_stream_bomb(2_000_000, pages=50)
+    assert len(bomb) < 20_000
+    started = time.monotonic()
+    with (
+        patch.object(pdf_module, "PDF_TIMEOUT_SECONDS", 1.0),
+        pytest.raises(PdfExtractionError, match="too long"),
+    ):
+        await extract_pdf_text(bomb)
+    assert time.monotonic() - started < 10
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_AS is enforced on Linux")
+async def test_pdf_that_needs_too_much_memory_is_refused() -> None:
+    bomb = make_content_stream_bomb(20_000_000)
+    with (
+        patch.object(pdf_module, "PDF_MAX_MEMORY_BYTES", 256 * 1024 * 1024),
+        pytest.raises(PdfExtractionError, match="too large or complex"),
+    ):
+        await extract_pdf_text(bomb)
+
+
+async def test_pdf_worker_failure_reaches_context_as_unreadable() -> None:
+    media = DownloadedMedia(
+        content=make_content_stream_bomb(2_000_000, pages=50),
+        mime_type="application/pdf",
+        original_url="https://example.com/bomb.pdf",
+        filename="bomb.pdf",
+    )
+    with patch.object(pdf_module, "PDF_TIMEOUT_SECONDS", 1.0):
+        result = await process_message_media("", [media])
+    assert "PDF could not be read" in result.combined_context

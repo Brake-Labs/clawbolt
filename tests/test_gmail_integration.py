@@ -11,8 +11,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
+from backend.app.agent import media_staging
 from backend.app.agent.approval import PermissionLevel
-from backend.app.agent.tools.base import Tool, ToolErrorKind
+from backend.app.agent.tools.base import Tool, ToolErrorKind, ToolTags
+from backend.app.agent.tools.media_tools import create_media_tools
 from backend.app.agent.tools.names import ToolName
 from backend.app.agent.tools.registry import ToolContext
 from backend.app.config import settings
@@ -40,6 +42,7 @@ from backend.app.services.oauth import (
     list_oauth_integrations,
 )
 from backend.app.services.storage_service import SavedFile, StorageBackend
+from tests.mocks.pdf import make_text_pdf
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -486,8 +489,8 @@ def gmail_tools() -> list[Tool]:
     return create_gmail_tools(service)
 
 
-def test_create_gmail_tools_returns_4_tools(gmail_tools: list[Tool]) -> None:
-    assert len(gmail_tools) == 4
+def test_create_gmail_tools_returns_5_tools(gmail_tools: list[Tool]) -> None:
+    assert len(gmail_tools) == 5
 
 
 def test_gmail_tool_names(gmail_tools: list[Tool]) -> None:
@@ -495,6 +498,7 @@ def test_gmail_tool_names(gmail_tools: list[Tool]) -> None:
     assert names == {
         ToolName.GMAIL_SEARCH,
         ToolName.GMAIL_GET_MESSAGE,
+        ToolName.GMAIL_OPEN_ATTACHMENT,
         ToolName.GMAIL_LIST_RECENT,
         ToolName.GMAIL_SEND,
     }
@@ -762,7 +766,7 @@ async def test_gmail_factory_returns_empty_when_user_not_connected() -> None:
         assert await _gmail_factory(_make_ctx()) == []
 
 
-async def test_gmail_factory_returns_4_tools_when_connected() -> None:
+async def test_gmail_factory_returns_5_tools_when_connected() -> None:
     token = MagicMock()
     token.access_token = "ax"
     token.refresh_token = "rx"
@@ -775,7 +779,7 @@ async def test_gmail_factory_returns_4_tools_when_connected() -> None:
         mock_settings.gmail_client_secret = "csec"
         mock_oauth.get_valid_token = AsyncMock(return_value=token)
         tools = await _gmail_factory(_make_ctx())
-    assert len(tools) == 4
+    assert len(tools) == 5
 
 
 async def test_gmail_auth_check_returns_none_when_unconfigured() -> None:
@@ -1253,3 +1257,374 @@ async def test_gmail_send_attachment_missing_file_returns_not_found() -> None:
     assert result.is_error is True
     assert result.error_kind == ToolErrorKind.NOT_FOUND
     mock_send.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Attachments: listing and gmail_open_attachment
+# ---------------------------------------------------------------------------
+
+
+def _b64_bytes(data: bytes) -> str:
+    # Gmail strips padding; the decoder must cope.
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+_PDF_BYTES = make_text_pdf("Inspection report: flue liner cracked")
+_PNG_BYTES = b"\x89PNG\r\n\x1a\nfake-image-bytes"
+
+
+def _attachment_message(
+    pdf_size: int | None = None,
+    pdf_mime: str = "application/pdf",
+) -> dict[str, Any]:
+    """A realistic nested payload.
+
+    multipart/mixed
+      0   multipart/related
+        0.0 multipart/alternative (text/plain, text/html body)
+        0.1 image/png, inline via Content-ID (signature logo, data in payload)
+      1   application/pdf, behind attachmentId
+      2   text/plain named notes.txt, data in payload
+    """
+    return {
+        "id": "msg-1",
+        "threadId": "thr-1",
+        "payload": {
+            "mimeType": "multipart/mixed",
+            "headers": [
+                {"name": "From", "value": "Alice <alice@example.com>"},
+                {"name": "Subject", "value": "Inspection report"},
+            ],
+            "parts": [
+                {
+                    "partId": "0",
+                    "mimeType": "multipart/related",
+                    "filename": "",
+                    "body": {"size": 0},
+                    "parts": [
+                        {
+                            "partId": "0.0",
+                            "mimeType": "multipart/alternative",
+                            "filename": "",
+                            "body": {"size": 0},
+                            "parts": [
+                                {
+                                    "partId": "0.0.0",
+                                    "mimeType": "text/plain",
+                                    "filename": "",
+                                    "body": {"size": 20, "data": _b64("Report attached.")},
+                                },
+                                {
+                                    "partId": "0.0.1",
+                                    "mimeType": "text/html",
+                                    "filename": "",
+                                    "body": {"size": 30, "data": _b64("<p>Report attached.</p>")},
+                                },
+                            ],
+                        },
+                        {
+                            "partId": "0.1",
+                            "mimeType": "image/png",
+                            "filename": "logo.png",
+                            "headers": [
+                                {"name": "Content-ID", "value": "<logo@example.com>"},
+                                {"name": "Content-Disposition", "value": "inline"},
+                            ],
+                            "body": {
+                                "size": len(_PNG_BYTES),
+                                "data": _b64_bytes(_PNG_BYTES),
+                            },
+                        },
+                    ],
+                },
+                {
+                    "partId": "1",
+                    "mimeType": pdf_mime,
+                    "filename": "inspection.pdf",
+                    "headers": [
+                        {"name": "Content-Disposition", "value": "attachment"},
+                    ],
+                    "body": {
+                        "size": pdf_size if pdf_size is not None else len(_PDF_BYTES),
+                        "attachmentId": "ANGjdJ-volatile-id",
+                    },
+                },
+                {
+                    "partId": "2",
+                    "mimeType": "text/plain",
+                    "filename": "notes.txt",
+                    "body": {"size": 11, "data": _b64("hello notes")},
+                },
+            ],
+        },
+    }
+
+
+def _fake_gmail_api(
+    message: dict[str, Any],
+    attachment_bytes: bytes = _PDF_BYTES,
+) -> tuple[Any, list[str]]:
+    """Route ``GmailService._request`` calls to canned responses."""
+    calls: list[str] = []
+
+    async def fake_request(
+        method: str,
+        path: str,
+        *,
+        json: dict[str, Any] | None = None,
+        params: dict[str, str] | None = None,
+    ) -> dict[str, Any] | None:
+        calls.append(path)
+        if "/attachments/" in path:
+            return {"size": len(attachment_bytes), "data": _b64_bytes(attachment_bytes)}
+        return message
+
+    return fake_request, calls
+
+
+async def test_get_message_lists_attachments_across_nested_parts() -> None:
+    service = _make_service()
+    fake, _ = _fake_gmail_api(_attachment_message())
+    with patch.object(service, "_request", side_effect=fake):
+        msg = await service.get_message("msg-1")
+
+    assert msg.body == "Report attached."
+    by_part = {a.part_id: a for a in msg.attachments}
+    assert set(by_part) == {"0.1", "1", "2"}
+    assert by_part["0.1"].inline is True
+    assert by_part["1"].inline is False
+    assert by_part["1"].filename == "inspection.pdf"
+    assert by_part["1"].gmail_attachment_id == "ANGjdJ-volatile-id"
+    assert by_part["1"].size == len(_PDF_BYTES)
+    assert by_part["2"].filename == "notes.txt"
+
+
+def test_named_text_attachment_is_not_mistaken_for_body() -> None:
+    payload = {
+        "mimeType": "multipart/mixed",
+        "parts": [
+            {"mimeType": "text/plain", "filename": "notes.txt", "body": {"data": _b64("notes")}},
+            {"mimeType": "text/plain", "filename": "", "body": {"data": _b64("real body")}},
+        ],
+    }
+    assert _extract_body(payload) == "real body"
+
+
+async def test_gmail_get_message_tool_lists_attachments() -> None:
+    service = _make_service()
+    fake, _ = _fake_gmail_api(_attachment_message())
+    with patch.object(service, "_request", side_effect=fake):
+        tool = _get_tool(create_gmail_tools(service), ToolName.GMAIL_GET_MESSAGE)
+        result = await tool.function("msg-1")
+    assert "Attachments (open with gmail_open_attachment):" in result.content
+    assert "inspection.pdf (application/pdf, " in result.content
+    assert "[attachment_id: 1]" in result.content
+    assert "logo.png (image/png, 24 B, inline) [attachment_id: 0.1]" in result.content
+
+
+async def test_open_pdf_attachment_returns_extracted_text(test_user: User) -> None:
+    service = _make_service()
+    fake, calls = _fake_gmail_api(_attachment_message())
+    with patch.object(service, "_request", side_effect=fake):
+        tool = _get_tool(
+            create_gmail_tools(service, user_id=test_user.id), ToolName.GMAIL_OPEN_ATTACHMENT
+        )
+        result = await tool.function("msg-1", "1", "inspection.pdf")
+
+    assert result.is_error is False, result.content
+    assert "flue liner cracked" in result.content
+    assert "(PDF text, 1 page(s))" in result.content
+    assert calls[-1] == "/users/me/messages/msg-1/attachments/ANGjdJ-volatile-id"
+    handle = await media_staging.get_handle_for(test_user.id, "gmail:msg-1/1")
+    assert handle is not None
+    assert f"upload_to_storage(original_url={handle!r})" in result.content
+
+
+async def test_open_attachment_guesses_mime_for_octet_stream(test_user: User) -> None:
+    service = _make_service()
+    fake, _ = _fake_gmail_api(_attachment_message(pdf_mime="application/octet-stream"))
+    with patch.object(service, "_request", side_effect=fake):
+        tool = _get_tool(
+            create_gmail_tools(service, user_id=test_user.id), ToolName.GMAIL_OPEN_ATTACHMENT
+        )
+        result = await tool.function("msg-1", "1", "inspection.pdf")
+    assert "flue liner cracked" in result.content
+    assert await media_staging.get_mime_type(test_user.id, "gmail:msg-1/1") == "application/pdf"
+
+
+async def test_open_image_attachment_is_usable_by_analyze_photo(test_user: User) -> None:
+    """An inline image (data in the payload, no attachments.get call) is staged
+    under a handle that analyze_photo accepts, like a photo sent in chat."""
+    service = _make_service()
+    fake, calls = _fake_gmail_api(_attachment_message())
+    with patch.object(service, "_request", side_effect=fake):
+        tool = _get_tool(
+            create_gmail_tools(service, user_id=test_user.id), ToolName.GMAIL_OPEN_ATTACHMENT
+        )
+        result = await tool.function("msg-1", "0.1", "logo.png")
+
+    assert result.is_error is False, result.content
+    assert not any("/attachments/" in c for c in calls)
+    handle = await media_staging.get_handle_for(test_user.id, "gmail:msg-1/0.1")
+    assert handle is not None
+    assert f"call analyze_photo(handle={handle!r})" in result.content
+
+    analyze = _get_tool(
+        create_media_tools(test_user.id, "what is this?", {}), ToolName.ANALYZE_PHOTO
+    )
+    with patch(
+        "backend.app.media.pipeline.analyze_image",
+        new_callable=AsyncMock,
+        return_value="A company logo.",
+    ) as mock_vision:
+        described = await analyze.function(handle)
+    assert described.content == "A company logo."
+    assert mock_vision.await_args is not None
+    assert mock_vision.await_args.args[0] == _PNG_BYTES
+    assert mock_vision.await_args.args[1] == "image/png"
+
+
+async def test_reopening_attachment_reuses_handle(test_user: User) -> None:
+    service = _make_service()
+    fake, _ = _fake_gmail_api(_attachment_message())
+    with patch.object(service, "_request", side_effect=fake):
+        tool = _get_tool(
+            create_gmail_tools(service, user_id=test_user.id), ToolName.GMAIL_OPEN_ATTACHMENT
+        )
+        first = await tool.function("msg-1", "1", "inspection.pdf")
+        second = await tool.function("msg-1", "inspection.pdf", "inspection.pdf")
+    handle = await media_staging.get_handle_for(test_user.id, "gmail:msg-1/1")
+    assert handle is not None
+    assert handle in first.content
+    assert handle in second.content
+
+
+async def test_open_attachment_rejects_declared_oversize_without_fetching(
+    test_user: User,
+) -> None:
+    service = _make_service()
+    fake, calls = _fake_gmail_api(_attachment_message(pdf_size=30 * 1024 * 1024))
+    with (
+        patch.object(service, "_request", side_effect=fake),
+        patch.object(settings, "max_media_size_bytes", 20 * 1024 * 1024),
+    ):
+        tool = _get_tool(
+            create_gmail_tools(service, user_id=test_user.id), ToolName.GMAIL_OPEN_ATTACHMENT
+        )
+        result = await tool.function("msg-1", "1", "inspection.pdf")
+    assert result.is_error is True
+    assert result.error_kind == ToolErrorKind.VALIDATION
+    assert "too large" in result.content
+    assert "30.0 MB" in result.content
+    assert not any("/attachments/" in c for c in calls)
+    assert await media_staging.get_handle_for(test_user.id, "gmail:msg-1/1") is None
+
+
+async def test_open_attachment_rejects_oversize_payload_when_size_understated(
+    test_user: User,
+) -> None:
+    """Gmail's declared size is a hint; the decoded bytes are checked too."""
+    service = _make_service()
+    fake, _ = _fake_gmail_api(_attachment_message(pdf_size=10))
+    with (
+        patch.object(service, "_request", side_effect=fake),
+        patch.object(settings, "max_media_size_bytes", 100),
+    ):
+        tool = _get_tool(
+            create_gmail_tools(service, user_id=test_user.id), ToolName.GMAIL_OPEN_ATTACHMENT
+        )
+        result = await tool.function("msg-1", "1", "inspection.pdf")
+    assert result.is_error is True
+    assert result.error_kind == ToolErrorKind.VALIDATION
+    assert await media_staging.get_handle_for(test_user.id, "gmail:msg-1/1") is None
+
+
+async def test_open_attachment_unknown_id_lists_available(test_user: User) -> None:
+    service = _make_service()
+    fake, _ = _fake_gmail_api(_attachment_message())
+    with patch.object(service, "_request", side_effect=fake):
+        tool = _get_tool(
+            create_gmail_tools(service, user_id=test_user.id), ToolName.GMAIL_OPEN_ATTACHMENT
+        )
+        result = await tool.function("msg-1", "9", "inspection.pdf")
+    assert result.is_error is True
+    assert result.error_kind == ToolErrorKind.NOT_FOUND
+    assert "inspection.pdf" in result.content
+    assert "[attachment_id: 1]" in result.content
+
+
+async def test_open_attachment_requires_ids() -> None:
+    service = _make_service()
+    with patch.object(service, "_request", new_callable=AsyncMock) as mock_req:
+        tool = _get_tool(create_gmail_tools(service, user_id="u1"), ToolName.GMAIL_OPEN_ATTACHMENT)
+        result = await tool.function("msg-1", "  ", "inspection.pdf")
+    assert result.is_error is True
+    assert result.error_kind == ToolErrorKind.VALIDATION
+    mock_req.assert_not_called()
+
+
+async def test_open_attachment_requires_filename() -> None:
+    """Without a filename the approval prompt could only show an opaque id."""
+    service = _make_service()
+    with patch.object(service, "_request", new_callable=AsyncMock) as mock_req:
+        tool = _get_tool(create_gmail_tools(service, user_id="u1"), ToolName.GMAIL_OPEN_ATTACHMENT)
+        result = await tool.function("msg-1", "1", " ")
+    assert result.is_error is True
+    assert result.error_kind == ToolErrorKind.VALIDATION
+    mock_req.assert_not_called()
+
+
+def test_open_attachment_approval_prompt_sanitizes_filename() -> None:
+    tool = _get_tool(create_gmail_tools(_make_service()), ToolName.GMAIL_OPEN_ATTACHMENT)
+    assert tool.approval_policy is not None
+    assert tool.approval_policy.description_builder is not None
+    described = tool.approval_policy.description_builder(
+        {"message_id": "msg-1", "attachment_id": "1", "filename": "a\nb\x1b" + "x" * 500}
+    )
+    assert "\n" not in described
+    assert "\x1b" not in described
+    assert len(described) < 200
+
+
+async def test_open_attachment_rejects_mismatched_filename(test_user: User) -> None:
+    """The filename shown in the approval prompt must be the file that opens."""
+    service = _make_service()
+    fake, calls = _fake_gmail_api(_attachment_message())
+    with patch.object(service, "_request", side_effect=fake):
+        tool = _get_tool(
+            create_gmail_tools(service, user_id=test_user.id), ToolName.GMAIL_OPEN_ATTACHMENT
+        )
+        result = await tool.function("msg-1", "1", "harmless.jpg")
+    assert result.is_error is True
+    assert result.error_kind == ToolErrorKind.VALIDATION
+    assert not any("/attachments/" in c for c in calls)
+
+
+async def test_open_attachment_http_404_maps_to_not_found(test_user: User) -> None:
+    service = _make_service()
+    request = httpx.Request("GET", "https://gmail.googleapis.com/x")
+    err = httpx.HTTPStatusError(
+        "nf", request=request, response=httpx.Response(404, request=request)
+    )
+    with patch.object(service, "get_message", new_callable=AsyncMock, side_effect=err):
+        tool = _get_tool(
+            create_gmail_tools(service, user_id=test_user.id), ToolName.GMAIL_OPEN_ATTACHMENT
+        )
+        result = await tool.function("gone", "1", "inspection.pdf")
+    assert result.error_kind == ToolErrorKind.NOT_FOUND
+
+
+def test_open_attachment_approval_is_ask_and_names_the_file() -> None:
+    tool = _get_tool(create_gmail_tools(_make_service()), ToolName.GMAIL_OPEN_ATTACHMENT)
+    assert ToolTags.READ_ONLY in tool.tags
+    assert tool.approval_policy is not None
+    assert tool.approval_policy.default_level == PermissionLevel.ASK
+    assert tool.approval_policy.description_builder is not None
+    desc = tool.approval_policy.description_builder(
+        {"message_id": "msg-1", "attachment_id": "1", "filename": "inspection.pdf"}
+    )
+    assert desc == "Open attachment inspection.pdf from Gmail message msg-1"
+    fallback = tool.approval_policy.description_builder(
+        {"message_id": "msg-1", "attachment_id": "1"}
+    )
+    assert fallback == "Open attachment 1 from Gmail message msg-1"

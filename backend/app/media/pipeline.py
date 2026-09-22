@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from backend.app.agent import media_staging
 from backend.app.media.download import DownloadedMedia, classify_media
+from backend.app.media.pdf import PdfExtractionError, extract_pdf_text
 from backend.app.media.vision import analyze_image
 
 logger = logging.getLogger(__name__)
@@ -56,13 +57,16 @@ async def _process_single_media(
     """Classify a staged media item for the combined context.
 
     Vision is NOT run here. The agent invokes ``analyze_photo(handle)`` when
-    it decides a photo description is worth the call.
+    it decides a photo description is worth the call. PDFs are cheap to read
+    locally, so their text layer is extracted inline.
     """
     category = classify_media(media.mime_type)
     logger.debug("Media classified: %s -> %s", media.mime_type, category)
 
     if category == "image":
         extracted_text = ""
+    elif category == "pdf":
+        extracted_text = await _describe_pdf(media.content)
     else:
         logger.info("Skipping unsupported media type: %s", media.mime_type)
         extracted_text = f"[{category.title()} file - processing not available]"
@@ -74,6 +78,18 @@ async def _process_single_media(
         extracted_text=extracted_text,
         handle=handle,
     )
+
+
+async def _describe_pdf(content: bytes) -> str:
+    """Return the PDF's text, or a bracketed note when there is none."""
+    try:
+        text, pages = await extract_pdf_text(content)
+    except PdfExtractionError as exc:
+        logger.info("PDF text extraction failed: %s", exc)
+        return f"[PDF could not be read: {exc}]"
+    if not text:
+        return f"[PDF, {pages} page(s), has no text layer (likely a scan)]"
+    return f"(PDF text, {pages} page(s))\n{text}"
 
 
 async def process_message_media(

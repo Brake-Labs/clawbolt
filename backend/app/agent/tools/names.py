@@ -42,6 +42,7 @@ class ToolName:
     # Gmail
     GMAIL_SEARCH = "gmail_search"
     GMAIL_GET_MESSAGE = "gmail_get_message"
+    GMAIL_OPEN_ATTACHMENT = "gmail_open_attachment"
     GMAIL_LIST_RECENT = "gmail_list_recent"
     GMAIL_SEND = "gmail_send"
 

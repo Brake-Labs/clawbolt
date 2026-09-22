@@ -27,6 +27,8 @@ dependencies = [
     "Pillow>=10.0",
     "simpleeval>=1.0",
     "genai-prices>=0.0.57,<0.1",
+    # Text extraction for PDFs the user sends or opens from Gmail.
+    "pypdf>=6.18.1",
 ]
 
 [project.optional-dependencies]
