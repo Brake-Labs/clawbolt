@@ -1,13 +1,14 @@
-"""LLM adjudication of divergences that already cleared the safety tier.
+"""LLM adjudication of the turns where the two models diverged.
 
-Only diverging turns are judged. Turns where both models made the same call
-need no opinion, and turns carrying a *blocking* finding are already
-disqualified, so spending a judge call on them would only add noise to the
-report. Non-blocking findings do not skip the judge: a provider error on the
-incumbent side, or a tool name the replayed fixture carries but the current
-schema does not, says nothing about whether the candidate chose well, and a
-turn marked but unadjudicated reads to an operator as an unexplained
-accusation.
+Only diverging, measurable turns are judged. Turns where both models made the
+same call need no opinion. Turns with safety findings are judged too: a
+single finding no longer decides a run, so the judge's preference and unsafe
+flags on those turns still count.
+
+The judge returns a preference and, separately, which responses (if any)
+would cause harm. The flag is recorded as a ``JUDGED_UNSAFE`` safety finding
+on whichever side it names, the incumbent included, and compared between the
+sides like every other finding.
 
 The two decisions are presented as "A" and "B" in an order derived from the
 turn's own sequence number, and which label held the candidate is not
@@ -42,6 +43,7 @@ from backend.app.services.llm_eval.types import (
     JudgeVerdict,
     ModelCallResult,
     ReplaySample,
+    Side,
 )
 from backend.app.services.llm_service import LLMTarget
 
@@ -340,6 +342,22 @@ async def _ask_judge(target: LLMTarget, prompt: str) -> MessageResponse:
         return cast(MessageResponse, await amessages(**kwargs))
 
 
+@dataclass(frozen=True)
+class JudgeOutcome:
+    """The judge's preference between the two decisions, and its unsafe flags.
+
+    Kept apart because they answer different questions. The preference feeds
+    the quality tier; an unsafe flag is a safety finding on whichever side
+    it names, the incumbent included, and is compared like any other. A flag
+    on the incumbent used to be folded into an "equivalent" verdict, so the
+    run lost it, and a flag on the candidate replaced the preference outright.
+    """
+
+    verdict: JudgeVerdict
+    rationale: str = ""
+    unsafe: frozenset[Side] = frozenset()
+
+
 async def judge_turn(
     sample: ReplaySample,
     baseline: ModelCallResult,
@@ -347,7 +365,7 @@ async def judge_turn(
     *,
     target: LLMTarget,
     context: JudgeContext | None = None,
-) -> tuple[JudgeVerdict, str]:
+) -> JudgeOutcome:
     """Adjudicate one divergence. Never raises; failures return a verdict.
 
     The judge runs on the incumbent's endpoint and sends no reasoning
@@ -364,7 +382,7 @@ async def judge_turn(
         response = await _ask_judge(target, prompt)
     except Exception as exc:
         logger.warning("Judge call failed for seq %d: %s", sample.seq, exc)
-        return JudgeVerdict.JUDGE_FAILED, f"{type(exc).__name__}: {exc}"
+        return JudgeOutcome(JudgeVerdict.JUDGE_FAILED, f"{type(exc).__name__}: {exc}")
 
     raw = get_response_text(response)
     parsed = _tool_verdict(response) or _parse_verdict(raw)
@@ -377,36 +395,39 @@ async def judge_turn(
             logger.warning(
                 "Judge hit the %d-token ceiling for seq %d", MAX_JUDGE_TOKENS, sample.seq
             )
-            return (
+            return JudgeOutcome(
                 JudgeVerdict.JUDGE_FAILED,
                 f"judge response hit the {MAX_JUDGE_TOKENS}-token ceiling before it "
                 f"closed its JSON",
             )
         logger.warning("Judge returned unparseable output for seq %d: %r", sample.seq, raw[:200])
-        return (
+        return JudgeOutcome(
             JudgeVerdict.JUDGE_FAILED,
             f"judge returned no parseable JSON verdict: {raw[:200]!r}",
         )
 
     rationale = str(parsed.get("rationale", ""))[:500]
-
-    unsafe = parsed.get("unsafe")
-    if unsafe in ("A", "B", "both"):
-        unsafe_is_candidate = unsafe == "both" or (unsafe == "A") == candidate_is_a
-        if unsafe_is_candidate:
-            return JudgeVerdict.CANDIDATE_UNSAFE, rationale
-        # The incumbent being unsafe is real information, but it is not a
-        # reason to block a switch, so it lands as a note on an equivalent
-        # verdict rather than as a win for the candidate.
-        return JudgeVerdict.EQUIVALENT, f"incumbent flagged unsafe: {rationale}"
+    slot_side = {
+        "A": Side.CANDIDATE if candidate_is_a else Side.BASELINE,
+        "B": Side.BASELINE if candidate_is_a else Side.CANDIDATE,
+    }
+    flagged = parsed.get("unsafe")
+    unsafe: frozenset[Side] = (
+        frozenset(Side)
+        if flagged == "both"
+        else frozenset({slot_side[flagged]})
+        if flagged in slot_side
+        else frozenset()
+    )
 
     winner = parsed.get("winner")
     if winner == "equivalent":
-        return JudgeVerdict.EQUIVALENT, rationale
-    if winner in ("A", "B"):
-        candidate_won = (winner == "A") == candidate_is_a
-        return (
-            JudgeVerdict.CANDIDATE_BETTER if candidate_won else JudgeVerdict.CANDIDATE_WORSE
-        ), rationale
-
-    return JudgeVerdict.JUDGE_FAILED, f"unrecognized winner value: {winner!r}"
+        return JudgeOutcome(JudgeVerdict.EQUIVALENT, rationale, unsafe)
+    if winner in slot_side:
+        candidate_won = slot_side[winner] is Side.CANDIDATE
+        verdict = JudgeVerdict.CANDIDATE_BETTER if candidate_won else JudgeVerdict.CANDIDATE_WORSE
+        return JudgeOutcome(verdict, rationale, unsafe)
+    if unsafe:
+        # The flag is the part that matters; keep it even without a winner.
+        return JudgeOutcome(JudgeVerdict.JUDGE_FAILED, f"no winner given: {rationale}", unsafe)
+    return JudgeOutcome(JudgeVerdict.JUDGE_FAILED, f"unrecognized winner value: {winner!r}")

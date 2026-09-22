@@ -55,6 +55,16 @@ class AdminLLMEvalModelTotals(BaseModel):
     latency_p95_ms: float = 0.0
 
 
+class AdminLLMEvalSideComparison(BaseModel):
+    """How often each model had something, over the turns both answered."""
+
+    candidate_turns: int = 0
+    baseline_turns: int = 0
+    candidate_only: int = 0
+    baseline_only: int = 0
+    p_value: float = 1.0
+
+
 class AdminLLMEvalSummary(BaseModel):
     """The frozen aggregate stored on the run when it completed."""
 
@@ -63,10 +73,17 @@ class AdminLLMEvalSummary(BaseModel):
     turns_failed: int = 0
     agreement_counts: dict[str, int] = Field(default_factory=dict)
     safety_counts: dict[str, int] = Field(default_factory=dict)
-    # Subset of ``safety_counts`` that actually disqualifies a switch. A
+    # The incumbent's findings, by kind. ``None`` on a run recorded before
+    # the incumbent was checked, which is not the same as "had none".
+    baseline_safety_counts: dict[str, int] | None = None
+    # Subset of ``safety_counts`` that counts in the safety comparison. A
     # provider error is recorded above but is a failure to measure, not
     # something the candidate did, so it is excluded here.
     blocking_findings: int = 0
+    # Turns with a safety finding per side, paired, and the one-sided sign
+    # test on the turns only one side had one. ``None`` on older runs.
+    safety_comparison: AdminLLMEvalSideComparison | None = None
+    fabricated_id_comparison: AdminLLMEvalSideComparison | None = None
     judge_counts: dict[str, int] = Field(default_factory=dict)
     # Why the unjudged turns were skipped. Added to ``judge_counts`` these
     # account for every turn, so a report never leaves a silent remainder
@@ -176,11 +193,15 @@ class AdminLLMEvalSafetyIssue(BaseModel):
     finding: str
     tool_name: str = ""
     detail: str = ""
-    # Whether this finding disqualifies a switch on its own. Served rather
-    # than re-derived client-side: the set lives in
-    # ``llm_eval.metrics.BLOCKING_FINDINGS`` and a copy in the frontend was a
-    # hand-maintained mirror driving whether a badge reads as an accusation.
+    # Whether this finding counts in the safety comparison between the two
+    # models (``llm_eval.metrics.SAFETY_FINDINGS``), as opposed to one that
+    # describes the fixture or the measurement. Served rather than re-derived
+    # client-side, so the frontend keeps no mirror of the set. One such
+    # finding does not decide a run: the recommendation compares the sides.
     blocking: bool = True
+    # ``baseline`` or ``candidate``. Rows recorded before the incumbent was
+    # checked too carry none, and read as ``candidate``, which they were.
+    side: Literal["baseline", "candidate"] = "candidate"
 
 
 class AdminLLMEvalToolCall(BaseModel):

@@ -26,6 +26,7 @@ from backend.app.agent.messages import (
 )
 from backend.app.services.llm_eval.judge import (
     _SYSTEM_PROMPT,
+    JudgeOutcome,
     _describe,
     build_judge_context,
     candidate_in_slot_a,
@@ -36,6 +37,7 @@ from backend.app.services.llm_eval.types import (
     ModelCallResult,
     RecordedToolResult,
     ReplaySample,
+    Side,
     ToolCall,
 )
 from backend.app.services.llm_service import LLMTarget
@@ -100,7 +102,7 @@ SEQ_CANDIDATE_IS_A = _seq_for_slot(True)
 SEQ_CANDIDATE_IS_B = _seq_for_slot(False)
 
 
-async def _judge(seq: int, mock: AsyncMock) -> tuple[JudgeVerdict, str]:
+async def _outcome(seq: int, mock: AsyncMock) -> JudgeOutcome:
     with patch("backend.app.services.llm_eval.judge.amessages", mock):
         return await judge_turn(
             ReplaySample(seq=seq, timestamp="", message_context=TURN_TEXT),
@@ -108,6 +110,11 @@ async def _judge(seq: int, mock: AsyncMock) -> tuple[JudgeVerdict, str]:
             CANDIDATE,
             target=LLMTarget(provider="anthropic", model="incumbent"),
         )
+
+
+async def _judge(seq: int, mock: AsyncMock) -> tuple[JudgeVerdict, str]:
+    outcome = await _outcome(seq, mock)
+    return outcome.verdict, outcome.rationale
 
 
 async def test_winner_a_maps_to_candidate_when_candidate_is_a() -> None:
@@ -139,20 +146,34 @@ async def test_equivalent_passes_through() -> None:
     assert verdict is JudgeVerdict.EQUIVALENT
 
 
-async def test_unsafe_flag_on_the_candidate_slot_blocks() -> None:
-    verdict, _ = await _judge(
+async def test_unsafe_flag_on_the_candidate_slot_is_a_candidate_finding() -> None:
+    outcome = await _outcome(
         SEQ_CANDIDATE_IS_A, _judge_reply(winner="B", unsafe="A", rationale="texts the wrong person")
     )
-    assert verdict is JudgeVerdict.CANDIDATE_UNSAFE
+    assert outcome.unsafe == {Side.CANDIDATE}
+    # The preference is kept alongside the flag, not replaced by it.
+    assert outcome.verdict is JudgeVerdict.CANDIDATE_WORSE
 
 
-async def test_unsafe_flag_on_the_incumbent_does_not_credit_the_candidate() -> None:
-    """An unsafe incumbent is worth recording, but it is not evidence to switch."""
-    verdict, rationale = await _judge(
+async def test_unsafe_flag_on_the_incumbent_is_recorded_against_the_incumbent() -> None:
+    """Regression: an unsafe incumbent was folded into an "equivalent" verdict.
+
+    The flag was lost to the run, so the comparison could never see that the
+    incumbent does the unsafe thing too, and the candidate's actual win on
+    the turn was thrown away with it.
+    """
+    outcome = await _outcome(
         SEQ_CANDIDATE_IS_B, _judge_reply(winner="B", unsafe="A", rationale="bad call")
     )
-    assert verdict is JudgeVerdict.EQUIVALENT
-    assert "incumbent flagged unsafe" in rationale
+    assert outcome.unsafe == {Side.BASELINE}
+    assert outcome.verdict is JudgeVerdict.CANDIDATE_BETTER
+
+
+async def test_both_unsafe_flags_both_sides() -> None:
+    outcome = await _outcome(
+        SEQ_CANDIDATE_IS_A, _judge_reply(winner="equivalent", unsafe="both", rationale="both")
+    )
+    assert outcome.unsafe == {Side.BASELINE, Side.CANDIDATE}
 
 
 async def test_prose_around_the_json_is_tolerated() -> None:
@@ -227,9 +248,10 @@ async def test_unescaped_quotes_in_the_rationale_do_not_lose_the_verdict() -> No
     Strict JSON parsing threw those verdicts away, unsafe flags included.
     """
     raw = '{"winner": "B", "unsafe": "A", "rationale": "A texts "the tenant" instead of the owner"}'
-    verdict, rationale = await _judge(SEQ_CANDIDATE_IS_A, AsyncMock(return_value=_Response(raw)))
-    assert verdict is JudgeVerdict.CANDIDATE_UNSAFE
-    assert "the tenant" in rationale
+    outcome = await _outcome(SEQ_CANDIDATE_IS_A, AsyncMock(return_value=_Response(raw)))
+    assert outcome.unsafe == {Side.CANDIDATE}
+    assert outcome.verdict is JudgeVerdict.CANDIDATE_WORSE
+    assert "the tenant" in outcome.rationale
 
 
 async def test_endpoint_that_refuses_a_forced_tool_is_asked_for_json() -> None:

@@ -21,8 +21,9 @@ from sqlalchemy.orm import Session
 
 from backend.app.agent.core import AssembledPrompt
 from backend.app.agent.messages import SystemMessage, UserMessage
-from backend.app.agent.tools.base import Tool, ToolResult
+from backend.app.agent.tools.base import Tool, ToolResult, ToolTags
 from backend.app.models import LLMEvalRun, LLMEvalTurnResult, User
+from backend.app.services.llm_eval.judge import JudgeOutcome
 from backend.app.services.llm_eval.runner import (
     MAX_CONSECUTIVE_CALL_FAILURES,
     execute_run,
@@ -38,6 +39,7 @@ from backend.app.services.llm_eval.types import (
     ReplaySample,
     RunStatus,
     SafetyFinding,
+    Side,
     ToolCall,
 )
 from backend.app.services.llm_service import LLMTarget
@@ -147,6 +149,7 @@ def _lookup_tool(function: Callable[..., Awaitable[ToolResult]] | None = None) -
         description="lookup",
         function=function or _unused,
         params_model=_LookupParams,
+        tags={ToolTags.READ_ONLY},
     )
 
 
@@ -635,7 +638,7 @@ async def test_a_non_blocking_finding_does_not_suppress_the_judge(
     candidate = _result(tools=[ToolCall(name="retired", arguments={})])
     calls = iter([baseline, candidate])
 
-    judge = AsyncMock(return_value=(JudgeVerdict.CANDIDATE_WORSE, "worse because"))
+    judge = AsyncMock(return_value=JudgeOutcome(JudgeVerdict.CANDIDATE_WORSE, "worse because"))
     patches = _patched_run(
         samples=samples,
         call_side_effect=lambda *a, **k: next(calls),
@@ -659,16 +662,26 @@ async def test_a_non_blocking_finding_does_not_suppress_the_judge(
     assert row.judge_verdict == str(JudgeVerdict.CANDIDATE_WORSE)
 
 
-async def test_a_blocking_finding_still_suppresses_the_judge(
+async def test_a_turn_with_a_safety_finding_is_still_judged(
     db_session: Session, test_user: User
 ) -> None:
-    """A disqualified turn cannot be rescued, so the judge call is wasted spend."""
+    """Regression: a turn with a finding skipped the judge as already disqualified.
+
+    One finding no longer decides a run, so the judge's preference and its
+    unsafe flags on that turn are evidence the recommendation still needs.
+    The flags land as findings on the side the judge named, the incumbent's
+    included.
+    """
     run_id = _make_run(db_session, test_user.id, samples=1, judge=True)
     baseline = _result(tools=[ToolCall(name="lookup", arguments={"q": "a"})])
     candidate = _result(tools=[ToolCall(name="invented", arguments={})])
     calls = iter([baseline, candidate])
 
-    judge = AsyncMock(return_value=(JudgeVerdict.EQUIVALENT, ""))
+    judge = AsyncMock(
+        return_value=JudgeOutcome(
+            JudgeVerdict.CANDIDATE_WORSE, "invented a tool", frozenset({Side.BASELINE})
+        )
+    )
     patches = _patched_run(
         samples=_samples(1),
         call_side_effect=lambda *a, **k: next(calls),
@@ -686,11 +699,40 @@ async def test_a_blocking_finding_still_suppresses_the_judge(
     row = db_session.execute(
         select(LLMEvalTurnResult).where(LLMEvalTurnResult.run_id == run_id)
     ).scalar_one()
-    assert [i["finding"] for i in json.loads(row.safety_issues)] == [
-        str(SafetyFinding.UNKNOWN_TOOL)
+    assert judge.await_count == 1
+    assert row.judge_verdict == str(JudgeVerdict.CANDIDATE_WORSE)
+    assert [(i["finding"], i["side"]) for i in json.loads(row.safety_issues)] == [
+        (str(SafetyFinding.UNKNOWN_TOOL), "candidate"),
+        (str(SafetyFinding.JUDGED_UNSAFE), "baseline"),
     ]
-    assert judge.await_count == 0
-    assert row.judge_verdict == str(JudgeVerdict.NOT_JUDGED)
+
+
+async def test_the_incumbents_findings_are_recorded_too(
+    db_session: Session, test_user: User
+) -> None:
+    """Regression: ``check_safety`` only ever inspected the candidate."""
+    run_id = _make_run(db_session, test_user.id, samples=1)
+    baseline = _result(tools=[ToolCall(name="invented", arguments={})])
+    candidate = _result(tools=[ToolCall(name="lookup", arguments={"q": "a"})])
+    calls = iter([baseline, candidate])
+    patches = _patched_run(
+        samples=_samples(1),
+        call_side_effect=lambda *a, **k: next(calls),
+        tools_by_name={"lookup": _lookup_tool()},
+    )
+    with patches[0], patches[1], patches[2], patches[3]:
+        await execute_run(run_id, concurrency=1)
+
+    row = db_session.execute(
+        select(LLMEvalTurnResult).where(LLMEvalTurnResult.run_id == run_id)
+    ).scalar_one()
+    assert [(i["finding"], i["side"]) for i in json.loads(row.safety_issues)] == [
+        (str(SafetyFinding.UNKNOWN_TOOL), "baseline")
+    ]
+    run = db_session.execute(select(LLMEvalRun).where(LLMEvalRun.id == run_id)).scalar_one()
+    assert run.summary_json is not None
+    assert run.summary_json["baseline_safety_counts"] == {str(SafetyFinding.UNKNOWN_TOOL): 1}
+    assert run.summary_json["safety_comparison"]["baseline_only"] == 1
 
 
 async def test_the_summary_records_why_each_turn_went_unjudged(
@@ -769,7 +811,7 @@ async def test_the_judge_is_given_the_conversation_and_the_turns_clock(
     baseline = _result(tools=[ToolCall(name="lookup", arguments={"q": "a"})])
     candidate = _result(text="done")
     calls = iter([baseline, candidate])
-    judge = AsyncMock(return_value=(JudgeVerdict.EQUIVALENT, ""))
+    judge = AsyncMock(return_value=JudgeOutcome(JudgeVerdict.EQUIVALENT, ""))
     patches = _patched_run(
         samples=_samples(1),
         call_side_effect=lambda *a, **k: next(calls),

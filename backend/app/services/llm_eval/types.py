@@ -21,31 +21,54 @@ from typing import Any
 from backend.app.services.llm_service import LLMTarget
 
 
-class SafetyFinding(StrEnum):
-    """A candidate behavior that disqualifies a switch on its own.
+class Side(StrEnum):
+    """Which model in a comparison a finding belongs to."""
 
-    These are not scored or averaged. One occurrence in a run is enough to
-    make the recommendation ``DO_NOT_SWITCH``, because each represents an
-    action the agent loop would actually have taken against a real user.
+    BASELINE = "baseline"
+    CANDIDATE = "candidate"
+
+
+class SafetyFinding(StrEnum):
+    """Something a model did that production would have acted on badly.
+
+    Recorded per side and never averaged into a quality score. A finding is
+    not disqualifying on its own: both models are held to the same checks,
+    and the recommendation turns on whether the candidate does these things
+    materially more often than the incumbent (see ``metrics._decide``). A
+    model the incumbent matches finding for finding is not worse for having
+    findings.
     """
 
     UNKNOWN_TOOL = "unknown_tool"
     """Called a tool name that was not in the schema it was offered."""
 
     INVALID_ARGS = "invalid_args"
-    """Emitted arguments the tool's own params model rejects."""
+    """Emitted arguments the tool would reject: its params model or its own precheck."""
 
     UNREQUESTED_MUTATION = "unrequested_mutation"
-    """Called an approval-gated (``ASK``) tool the incumbent did not call.
+    """Made a write that neither the other model nor the live turn made.
 
-    The approval prompt would still fire in production, so this is not an
-    unattended write. It is counted because a model that reaches for
-    mutating tools the incumbent left alone will bury the user in approval
-    prompts, and because the prompt is only as good as the user reading it.
+    Counted because a model that reaches for writes nobody else reached for
+    will bury the user in approval prompts, or write without one where the
+    tool is ungated, and the prompt is only as good as the user reading it.
     """
 
+    FABRICATED_ID = "fabricated_id"
+    """Wrote to a record ID that appears nowhere in what the model was shown.
+
+    The failure a reply-quality judge misses: a model that calls a search
+    and a write in one response has to guess the ID the search would have
+    returned, and a note filed against the neighbouring work order reads as
+    decisive action. Checked deterministically against the prompt, the
+    user's message and every tool result the model saw. See
+    ``metrics.fabricated_ids``.
+    """
+
+    JUDGED_UNSAFE = "judged_unsafe"
+    """The judge said this response would cause real harm if executed."""
+
     TRUNCATED = "truncated"
-    """Hit the output token ceiling, which can cut a tool call in half."""
+    """Hit the output token ceiling even after production's retry."""
 
     CALL_FAILED = "call_failed"
     """The provider raised. Recorded per turn rather than failing the run."""
@@ -53,33 +76,34 @@ class SafetyFinding(StrEnum):
     UNRESOLVED_TOOL_NAME = "unresolved_tool_name"
     """Called a tool that is in the replayed history but not in today's schema.
 
-    A property of the fixture, not of the candidate: both models read the name
-    out of the conversation history and reach for it, but only the candidate is
-    inspected, so counting it would charge one model for what both do. The run
-    warns instead, because it means the replay is scoring a tool surface the
-    user no longer has.
+    A property of the fixture, not of the model: both read the name out of
+    the conversation history and reach for it. The run warns instead,
+    because it means the replay is scoring a tool surface the user no longer
+    has.
     """
 
 
-_BLOCKING_FINDINGS = frozenset(
+_SAFETY_FINDINGS = frozenset(
     {
         SafetyFinding.UNKNOWN_TOOL,
         SafetyFinding.INVALID_ARGS,
         SafetyFinding.UNREQUESTED_MUTATION,
+        SafetyFinding.FABRICATED_ID,
+        SafetyFinding.JUDGED_UNSAFE,
         SafetyFinding.TRUNCATED,
     }
 )
-"""Findings that disqualify a switch on their own.
+"""Findings compared between the two sides to decide whether a switch is safe.
 
 Lives here rather than in ``metrics`` so ``TurnComparison`` can consult it
 without importing the module that imports this one. ``metrics`` re-exports it
-as ``BLOCKING_FINDINGS``, which is the name the rest of the package uses.
+as ``SAFETY_FINDINGS``, which is the name the rest of the package uses.
 
 ``CALL_FAILED`` and ``UNRESOLVED_TOOL_NAME`` are deliberately absent. Neither
-is something the candidate did: the first is a failure to measure and the
-second is a property of the replayed fixture. Both are still recorded on the
-turn and surfaced, the first through ``turns_failed`` and the second through a
-run warning.
+is something a model did: the first is a failure to measure and the second is
+a property of the replayed fixture. Both are still recorded on the turn and
+surfaced, the first through ``turns_failed`` and the second through a run
+warning.
 """
 
 
@@ -116,12 +140,17 @@ class AgreementClass(StrEnum):
 
 
 class JudgeVerdict(StrEnum):
-    """Adjudication of a divergence that already cleared the safety tier."""
+    """Which of two diverging decisions the judge preferred."""
 
     EQUIVALENT = "equivalent"
     CANDIDATE_BETTER = "candidate_better"
     CANDIDATE_WORSE = "candidate_worse"
     CANDIDATE_UNSAFE = "candidate_unsafe"
+    """Stored by runs recorded before unsafe flags became per-side findings.
+
+    New runs record the preference here and the flag as a ``JUDGED_UNSAFE``
+    finding on whichever side the judge named, including the incumbent.
+    """
     NOT_JUDGED = "not_judged"
     JUDGE_FAILED = "judge_failed"
 
@@ -142,7 +171,8 @@ class JudgeSkipReason(StrEnum):
     """Neither called a tool and the two replies were the same text."""
 
     BLOCKING_FINDING = "blocking_finding"
-    """Already disqualified; a verdict could not change the recommendation."""
+    """Recorded by runs where one finding disqualified a switch. New runs
+    judge those turns too, since a single finding no longer decides."""
 
     CALL_FAILED = "call_failed"
     """One of the two calls errored, so there was no decision to compare."""
@@ -299,6 +329,9 @@ class SafetyIssue:
     finding: SafetyFinding
     tool_name: str = ""
     detail: str = ""
+    side: Side = Side.CANDIDATE
+    """Whose finding this is. Rows written before both sides were checked
+    carry none and were always the candidate's."""
 
 
 @dataclass
@@ -315,19 +348,19 @@ class TurnComparison:
     judge_skip_reason: str | None = None
     """Set when ``judge_verdict`` is ``NOT_JUDGED``. See ``JudgeSkipReason``."""
 
-    @property
-    def has_blocking_finding(self) -> bool:
-        """Whether a finding on this turn disqualifies a switch on its own.
+    def has_safety_finding(self, side: Side) -> bool:
+        """Whether *side* has a finding that counts in the safety comparison.
 
         ``CALL_FAILED`` and ``UNRESOLVED_TOOL_NAME`` are recorded on the turn
-        but are not the candidate's fault, so they must not count here. See
-        ``metrics.BLOCKING_FINDINGS``.
+        but are not something a model did, so they must not count here. See
+        ``metrics.SAFETY_FINDINGS``.
         """
-        return any(issue.finding in _BLOCKING_FINDINGS for issue in self.safety_issues)
+        return any(
+            issue.finding in _SAFETY_FINDINGS and issue.side is side for issue in self.safety_issues
+        )
 
-    @property
-    def is_blocking(self) -> bool:
-        return self.has_blocking_finding or self.judge_verdict is JudgeVerdict.CANDIDATE_UNSAFE
+    def has_finding(self, side: Side, finding: SafetyFinding) -> bool:
+        return any(issue.finding is finding and issue.side is side for issue in self.safety_issues)
 
     @property
     def diverged(self) -> bool:

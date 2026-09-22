@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import desc, select
@@ -58,12 +58,13 @@ from backend.app.schemas.llm_eval import (
 from backend.app.services.admin_audit import AdminAction, AdminAuditContext, audit_admin
 from backend.app.services.llm_endpoints import UnknownLLMEndpointError, resolve_target
 from backend.app.services.llm_eval import launch_run
-from backend.app.services.llm_eval.metrics import BLOCKING_FINDINGS, MIN_TURNS_FOR_VERDICT
+from backend.app.services.llm_eval.metrics import MIN_TURNS_FOR_VERDICT, SAFETY_FINDINGS
 from backend.app.services.llm_eval.types import (
     AgreementClass,
     JudgeSkipReason,
     JudgeVerdict,
     RunStatus,
+    Side,
 )
 from backend.app.services.pii_redaction import redact_pii, redact_pii_recursive
 
@@ -189,17 +190,30 @@ def _lookups(raw: str) -> list[AdminLLMEvalLookup]:
     ]
 
 
-def _blocking_findings(turn: LLMEvalTurnResult) -> bool:
-    """Whether this turn carries a finding that disqualifies a switch.
+def _issues(turn: LLMEvalTurnResult) -> list[dict[str, Any]]:
+    """The turn's stored findings, tolerating a row that is not a list of objects."""
+    issues = _load_json(turn.safety_issues, [])
+    if not isinstance(issues, list):
+        return []
+    return [entry for entry in issues if isinstance(entry, dict)]
+
+
+def _side(entry: dict[str, Any]) -> Literal["baseline", "candidate"]:
+    """Whose finding *entry* is. Rows written before both sides were checked
+    carry no side and were always the candidate's."""
+    return "baseline" if entry.get("side") == Side.BASELINE else "candidate"
+
+
+def _candidate_safety_finding(turn: LLMEvalTurnResult) -> bool:
+    """Whether the candidate has a finding that counts in the safety comparison.
 
     ``CALL_FAILED`` and ``UNRESOLVED_TOOL_NAME`` are recorded on the turn but
-    are not the candidate's fault, so neither the judge gate nor the report
-    ordering may treat them as disqualifying. See ``metrics.BLOCKING_FINDINGS``.
+    are not something a model did, and an incumbent-side finding is not
+    evidence against the candidate. See ``metrics.SAFETY_FINDINGS``.
     """
     return any(
-        entry.get("finding") in BLOCKING_FINDINGS
-        for entry in _load_json(turn.safety_issues, [])
-        if isinstance(entry, dict)
+        entry.get("finding") in SAFETY_FINDINGS and _side(entry) == Side.CANDIDATE
+        for entry in _issues(turn)
     )
 
 
@@ -223,13 +237,15 @@ def _judge_skip_reason(turn: LLMEvalTurnResult, *, run_has_judge: bool) -> str:
         turn.baseline_text.strip() == turn.candidate_text.strip()
     ):
         return str(JudgeSkipReason.SAME_PROSE)
-    if _blocking_findings(turn):
+    # Only runs recorded while one finding disqualified a switch skipped the
+    # judge here; later runs judge these turns, so their verdict is set.
+    if _candidate_safety_finding(turn):
         return str(JudgeSkipReason.BLOCKING_FINDING)
     return ""
 
 
 def _turn_item(turn: LLMEvalTurnResult, *, run_has_judge: bool = True) -> AdminLLMEvalTurn:
-    issues = _load_json(turn.safety_issues, [])
+    issues = _issues(turn)
     return AdminLLMEvalTurn(
         message_seq=turn.message_seq,
         message_timestamp=turn.message_timestamp,
@@ -266,10 +282,10 @@ def _turn_item(turn: LLMEvalTurnResult, *, run_has_judge: bool = True) -> AdminL
                 finding=str(entry.get("finding", "")),
                 tool_name=str(entry.get("tool_name", "")),
                 detail=redact_pii(str(entry.get("detail", ""))),
-                blocking=entry.get("finding") in BLOCKING_FINDINGS,
+                blocking=entry.get("finding") in SAFETY_FINDINGS,
+                side=_side(entry),
             )
             for entry in issues
-            if isinstance(entry, dict)
         ],
         judge_verdict=turn.judge_verdict,
         judge_rationale=redact_pii(turn.judge_rationale),
@@ -294,24 +310,14 @@ _TURN_PRIORITY = {
 def _turn_sort_key(turn: LLMEvalTurnResult) -> tuple[int, int, int, int]:
     """Rank turns by how much they should change the reader's mind.
 
-    Blocking findings rank above non-blocking ones, which is the whole point:
-    a turn marked only for a retired tool name in the fixture is not evidence
-    against the candidate, and ranking it first fills the readable part of the
-    report with badges the summary goes on to disown.
+    The candidate's safety findings rank above everything else, then the
+    judge's losses, then any other finding, the incumbent's included. A turn
+    marked only for a retired tool name in the fixture is not evidence
+    against the candidate, and ranking it first fills the readable part of
+    the report with badges the summary goes on to disown.
     """
-    # Parsed once and used for both questions. The ``isinstance`` guard is the
-    # one ``_blocking_findings`` carries: a row whose ``safety_issues`` is not
-    # a list of objects must not 500 the whole report.
-    issues = _load_json(turn.safety_issues, [])
-    if not isinstance(issues, list):
-        issues = []
-    has_blocking = (
-        0
-        if any(
-            entry.get("finding") in BLOCKING_FINDINGS for entry in issues if isinstance(entry, dict)
-        )
-        else 1
-    )
+    issues = _issues(turn)
+    has_blocking = 0 if _candidate_safety_finding(turn) else 1
     judged_bad = (
         0
         if turn.judge_verdict

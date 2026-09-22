@@ -54,6 +54,7 @@ from backend.app.services.llm_eval.types import (
     RunTargets,
     SafetyFinding,
     SafetyIssue,
+    Side,
     ToolCall,
     TurnComparison,
 )
@@ -233,6 +234,7 @@ def _turn_row(run_id: int, comparison: TurnComparison) -> LLMEvalTurnResult:
                     "finding": str(issue.finding),
                     "tool_name": issue.tool_name,
                     "detail": issue.detail,
+                    "side": str(issue.side),
                 }
                 for issue in comparison.safety_issues
             ]
@@ -272,21 +274,27 @@ async def _compare_turn(
         ),
     )
 
-    safety_issues = metrics.check_safety(
-        candidate,
-        baseline,
-        fixture.tools_by_name,
-        historic_tool_names=sample.historic_tool_names,
-    )
-    if baseline.error and not candidate.error:
-        # ``check_safety`` only inspects the candidate, so an incumbent-side
-        # provider error would otherwise leave the turn with no marker at all.
-        safety_issues.append(
-            SafetyIssue(
-                finding=SafetyFinding.CALL_FAILED,
-                detail=f"incumbent call failed: {baseline.error}",
-            )
-        )
+    # Both sides get the same checks against the same evidence. Checking only
+    # the candidate charged it for everything the incumbent also did.
+    seen = metrics.prompt_text(assembled.messages)
+    safety_issues = [
+        *metrics.check_safety(
+            candidate,
+            baseline,
+            fixture.tools_by_name,
+            historic_tool_names=sample.historic_tool_names,
+            seen=seen,
+            side=Side.CANDIDATE,
+        ),
+        *metrics.check_safety(
+            baseline,
+            candidate,
+            fixture.tools_by_name,
+            historic_tool_names=sample.historic_tool_names,
+            seen=seen,
+            side=Side.BASELINE,
+        ),
+    ]
     comparison = TurnComparison(
         sample=sample,
         baseline=baseline,
@@ -304,19 +312,14 @@ async def _compare_turn(
         safety_issues=safety_issues,
     )
 
-    # Judge only what is both informative and still in the running: an
-    # identical decision needs no opinion, a turn already disqualified by a
-    # blocking finding cannot be rescued by a judge, and two models that
-    # produced the same prose have nothing to separate them. That last case is
-    # not just wasted spend: a verdict on it would land in the denominator of
-    # the judged-worse rate and dilute the turns that matter.
+    # Judge only what is informative: an identical decision needs no opinion,
+    # and two models that produced the same prose have nothing to separate
+    # them. That last case is not just wasted spend: a verdict on it would
+    # land in the judged denominator and dilute the turns that matter.
     #
-    # The gate is *blocking* findings, not any finding. A non-blocking mark
-    # (a provider error on the incumbent side, or a tool name the fixture
-    # carries but the schema no longer has) says nothing about whether the
-    # candidate chose well, and skipping the judge on those left them sorted
-    # to the top of the report wearing a red badge with no explanation
-    # underneath it.
+    # Turns with safety findings are judged like any other. One finding no
+    # longer disqualifies a run, so the judge's preference and its unsafe
+    # flags on those turns are evidence the recommendation still needs.
     same_prose = (
         comparison.agreement is AgreementClass.BOTH_REPLIED
         and baseline.text.strip() == candidate.text.strip()
@@ -329,11 +332,19 @@ async def _compare_turn(
         context = build_judge_context(
             assembled, build_time_user_context(fixture.user, sample_clock(sample))
         )
-        verdict, rationale = await judge_turn(
+        outcome = await judge_turn(
             sample, baseline, candidate, target=targets.judge, context=context
         )
-        comparison.judge_verdict = verdict
-        comparison.judge_rationale = rationale
+        comparison.judge_verdict = outcome.verdict
+        comparison.judge_rationale = outcome.rationale
+        comparison.safety_issues.extend(
+            SafetyIssue(
+                finding=SafetyFinding.JUDGED_UNSAFE,
+                detail=outcome.rationale,
+                side=side,
+            )
+            for side in sorted(outcome.unsafe)
+        )
 
     return comparison
 
@@ -355,8 +366,6 @@ def _judge_skip_reason(
         return JudgeSkipReason.IDENTICAL
     if same_prose:
         return JudgeSkipReason.SAME_PROSE
-    if comparison.has_blocking_finding:
-        return JudgeSkipReason.BLOCKING_FINDING
     return None
 
 
@@ -466,7 +475,7 @@ async def execute_run(run_id: int, *, concurrency: int) -> None:
                     # Recorded so the turn carries the same marker as a turn
                     # whose provider call returned an error, rather than
                     # sorting to the bottom of the report with no badge. It is
-                    # not a blocking finding; see ``BLOCKING_FINDINGS``.
+                    # not a safety finding; see ``SAFETY_FINDINGS``.
                     safety_issues=[SafetyIssue(finding=SafetyFinding.CALL_FAILED, detail=detail)],
                     judge_verdict=JudgeVerdict.NOT_JUDGED,
                 )
@@ -554,7 +563,7 @@ async def execute_run(run_id: int, *, concurrency: int) -> None:
         summary=_summary_payload(aggregate),
     )
     logger.info(
-        "LLM eval run %d complete: %s (%d turns, %d blocking findings)",
+        "LLM eval run %d complete: %s (%d turns, %d candidate safety findings)",
         run_id,
         aggregate.recommendation,
         aggregate.turns_completed,
@@ -592,7 +601,10 @@ def _summary_payload(aggregate: metrics.RunAggregate) -> dict:
         "turns_failed": aggregate.turns_failed,
         "agreement_counts": aggregate.agreement_counts,
         "safety_counts": aggregate.safety_counts,
+        "baseline_safety_counts": aggregate.baseline_safety_counts,
         "blocking_findings": aggregate.blocking_turns,
+        "safety_comparison": aggregate.safety.payload(),
+        "fabricated_id_comparison": aggregate.fabricated_ids.payload(),
         "judge_counts": aggregate.judge_counts,
         "judge_skip_counts": aggregate.judge_skip_counts,
         "identical_rate": round(aggregate.identical_rate, 4),
