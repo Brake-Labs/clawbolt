@@ -994,3 +994,39 @@ def test_report_says_whose_finding_each_one_is(
     # An older summary has no incumbent counts, which is not "had none".
     assert body["run"]["summary"]["baseline_safety_counts"] is None
     assert body["run"]["summary"]["safety_comparison"] is None
+
+
+def test_a_run_recorded_before_the_modes_existed_still_renders(
+    admin_client: TestClient, consenting_user: User, db_session: Session
+) -> None:
+    """Old rows replayed every turn, and must not read as having read any back.
+
+    The run row picks up its column defaults and the summary has none of the
+    new keys, so the report has to distinguish "replayed, nothing to report"
+    from a measured count. A missing mode reads as no provenance line at all
+    rather than as a fabricated one.
+    """
+    run = _make_run(
+        db_session,
+        consenting_user.id,
+        summary_json={"recommendation": "safe_to_switch", "turns_completed": 40},
+    )
+    db_session.add(
+        LLMEvalTurnResult(
+            run_id=run.id,
+            message_seq=1,
+            user_message="a turn from before the modes",
+            agreement=str(AgreementClass.IDENTICAL),
+        )
+    )
+    db_session.commit()
+
+    response = admin_client.get(f"{BASE}/runs/{run.public_id}")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["run"]["incumbent_source"] == "replay"
+    assert body["run"]["baseline_turns_unavailable"] == 0
+    assert body["run"]["summary"]["incumbent_source"] is None
+    assert body["run"]["summary"]["incumbent_source_counts"] is None
+    # Every turn of such a run was a live call, which is what the column says.
+    assert body["turns"][0]["baseline_source"] == "live"

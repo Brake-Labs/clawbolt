@@ -23,6 +23,7 @@ from backend.app.config import settings
 from backend.app.models import ChatSession, Message, User
 from backend.app.services.llm_eval.sampling import (
     ReplayFixture,
+    _historic_first_decision,
     _historic_response,
     _history_for,
     assemble_for_sample,
@@ -553,3 +554,91 @@ def test_a_corrupt_timestamp_does_not_hand_out_a_batch_exemption() -> None:
     ]
     rows[1].timestamp = "not a timestamp"
     assert _historic_response(rows, 0) == ("", [])
+
+
+# ---------------------------------------------------------------------------
+# The turn's first decision, which is what a historic run compares against
+# ---------------------------------------------------------------------------
+
+
+_LOOKUP_THEN_WRITE = json.dumps(
+    [
+        {"tool_call_id": "t1", "name": "qb_find", "args": {"q": "Acme Plumbing"}, "result": "1186"},
+        {"tool_call_id": "t2", "name": "qb_send", "args": {"invoice_id": "1186"}, "result": "ok"},
+    ]
+)
+
+
+def test_the_first_decision_is_the_first_recorded_call_with_its_arguments() -> None:
+    """The opening move, arguments included, not the reply it ended on.
+
+    The replay scores the candidate's first decision, so this is the only
+    like-for-like incumbent side. Comparing the reply instead reads every
+    lookup-then-act turn as the candidate acting where the incumbent talked.
+    """
+    rows = [
+        _row(1, "inbound", "invoice Acme for the stalls", BASE_TIME),
+        _row(
+            2,
+            "outbound",
+            "sent it",
+            BASE_TIME + _dt.timedelta(seconds=9),
+            tools=_LOOKUP_THEN_WRITE,
+        ),
+    ]
+    decision = _historic_first_decision(rows, 0)
+    assert decision.available
+    assert [(c.name, c.arguments) for c in decision.calls] == [("qb_find", {"q": "Acme Plumbing"})]
+    # Two calls in one flat list: whether they were one round or two is not
+    # recoverable, and the run says so rather than assuming.
+    assert decision.flattened
+
+
+def test_a_turn_that_called_nothing_has_its_prose_as_its_first_decision() -> None:
+    rows = [
+        _row(1, "inbound", "just checking in", BASE_TIME),
+        _row(2, "outbound", "all good", BASE_TIME + _dt.timedelta(seconds=4)),
+    ]
+    decision = _historic_first_decision(rows, 0)
+    assert decision.available
+    assert decision.calls == ()
+    assert not decision.flattened
+
+
+def test_an_unanswered_turn_has_no_first_decision() -> None:
+    """Distinct from "answered with nothing", which is a decision."""
+    rows = [_row(1, "inbound", "are you there", BASE_TIME)]
+    assert not _historic_first_decision(rows, 0).available
+
+
+def test_unparseable_interactions_make_the_first_decision_unavailable() -> None:
+    """Calls were made and their record is gone, which is not "did nothing".
+
+    Read as "did nothing" this turn would exempt a candidate's write from
+    ``unrequested_mutation`` on a turn production also wrote on.
+    """
+    rows = [
+        _row(1, "inbound", "invoice Acme", BASE_TIME),
+        _row(2, "outbound", "sent", BASE_TIME + _dt.timedelta(seconds=5), tools="{not json"),
+    ]
+    assert not _historic_first_decision(rows, 0).available
+
+
+def test_select_samples_carries_the_first_decision_onto_the_sample() -> None:
+    rows = [
+        _row(1, "inbound", "invoice Acme for the stalls", BASE_TIME),
+        _row(
+            2,
+            "outbound",
+            "sent it",
+            BASE_TIME + _dt.timedelta(seconds=9),
+            tools=_LOOKUP_THEN_WRITE,
+        ),
+    ]
+    fixture = ReplayFixture(user=User(id="u"), rows=rows)
+    sample = select_samples(fixture, 1)[0]
+    assert sample.historic_decision_available
+    assert [(c.name, c.arguments) for c in sample.historic_first_calls] == [
+        ("qb_find", {"q": "Acme Plumbing"})
+    ]
+    assert sample.historic_calls_flattened

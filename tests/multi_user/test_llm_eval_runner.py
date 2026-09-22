@@ -21,9 +21,11 @@ from sqlalchemy.orm import Session
 
 from backend.app.agent.core import AssembledPrompt
 from backend.app.agent.messages import SystemMessage, UserMessage
+from backend.app.agent.observer import PURPOSE_AGENT_MAIN
 from backend.app.agent.tools.base import Tool, ToolResult, ToolTags
-from backend.app.models import LLMEvalRun, LLMEvalTurnResult, User
+from backend.app.models import LLMEvalRun, LLMEvalTurnResult, LLMUsageLog, User
 from backend.app.services.llm_eval.judge import JudgeOutcome
+from backend.app.services.llm_eval.metrics import MIN_TURNS_FOR_VERDICT
 from backend.app.services.llm_eval.runner import (
     HARNESS_VERSION,
     MAX_CONSECUTIVE_CALL_FAILURES,
@@ -32,6 +34,7 @@ from backend.app.services.llm_eval.runner import (
 )
 from backend.app.services.llm_eval.sampling import ReplayFixture
 from backend.app.services.llm_eval.types import (
+    IncumbentSource,
     JudgeSkipReason,
     JudgeVerdict,
     ModelCallResult,
@@ -54,6 +57,8 @@ def _make_run(
     judge: bool = False,
     baseline_effort: str = "",
     candidate_effort: str = "",
+    incumbent_source: IncumbentSource = IncumbentSource.REPLAY,
+    candidate_model: str = "candidate",
 ) -> int:
     run = LLMEvalRun(
         user_id=user_id,
@@ -62,7 +67,8 @@ def _make_run(
         baseline_provider="anthropic",
         baseline_model="incumbent",
         candidate_provider="anthropic",
-        candidate_model="candidate",
+        candidate_model=candidate_model,
+        incumbent_source=str(incumbent_source),
         judge_provider="anthropic" if judge else "",
         judge_model="incumbent" if judge else "",
         requested_samples=samples,
@@ -106,6 +112,7 @@ def _patched_run(
     samples: list[ReplaySample],
     call_side_effect: object,
     tools_by_name: dict | None = None,
+    assembled: AssembledPrompt | None = None,
 ) -> tuple[Any, Any, Any, Any]:
     """Patch the run's collaborators, leaving the orchestration real."""
     fixture = ReplayFixture(user=User(id="u"), rows=[])
@@ -121,7 +128,7 @@ def _patched_run(
         ),
         patch(
             "backend.app.services.llm_eval.runner.assemble_for_sample",
-            AsyncMock(return_value=_assembled()),
+            AsyncMock(return_value=assembled or _assembled()),
         ),
         patch(
             "backend.app.services.llm_eval.runner.call_model",
@@ -945,3 +952,343 @@ async def test_a_self_comparison_run_says_it_is_the_calibration(
     assert stored.summary_json is not None
     assert stored.summary_json["divergence_noise_floor"] is None
     assert any("against itself" in w for w in stored.summary_json["warnings"])
+
+
+# ---------------------------------------------------------------------------
+# Historic mode: the incumbent's decision, read rather than bought
+# ---------------------------------------------------------------------------
+
+
+def _recording_dispatch(seen: list[str]) -> Callable[..., Awaitable[ModelCallResult]]:
+    """A ``call_model`` stand-in that logs which side asked for a decision.
+
+    The point of the mode is not paying for the incumbent twice, so the
+    assertion that matters is which models were called and how often.
+    """
+
+    async def dispatch(*_args: object, **kwargs: Any) -> ModelCallResult:
+        target: LLMTarget = kwargs["target"]
+        seen.append(target.model)
+        return _result(text=f"{target.model} answered")
+
+    return dispatch
+
+
+def _turns_of(db: Session, run_id: int) -> list[LLMEvalTurnResult]:
+    db.expire_all()
+    rows = (
+        db.execute(select(LLMEvalTurnResult).where(LLMEvalTurnResult.run_id == run_id))
+        .scalars()
+        .all()
+    )
+    return sorted(rows, key=lambda t: t.message_seq)
+
+
+async def test_historic_mode_never_calls_the_incumbent(
+    db_session: Session, test_user: User
+) -> None:
+    """Zero incumbent calls, and the decision comes from the recorded turn."""
+    run_id = _make_run(
+        db_session, test_user.id, samples=2, incumbent_source=IncumbentSource.HISTORIC
+    )
+    seen: list[str] = []
+    a, b, c, _ = _patched_run(
+        samples=_historic_samples(2),
+        call_side_effect=None,
+        tools_by_name={"lookup": _lookup_tool()},
+    )
+    with (
+        a,
+        b,
+        c,
+        patch("backend.app.services.llm_eval.runner.call_model", _recording_dispatch(seen)),
+    ):
+        await execute_run(run_id, concurrency=1)
+
+    assert seen == ["candidate", "candidate"]
+    assert [t.baseline_source for t in _turns_of(db_session, run_id)] == ["historic", "historic"]
+    run = db_session.execute(select(LLMEvalRun).where(LLMEvalRun.id == run_id)).scalar_one()
+    assert run.summary_json is not None
+    assert run.summary_json["incumbent_source"] == "historic"
+    assert run.summary_json["incumbent_source_counts"] == {"historic": 2}
+
+
+def _historic_samples(count: int) -> list[ReplaySample]:
+    """Turns whose first decision was a single recorded lookup."""
+    return [
+        ReplaySample(
+            seq=i,
+            timestamp="2026-05-01T12:00:00+00:00",
+            message_context=f"ask {i}",
+            historic_reply=f"here is what I found for {i}",
+            historic_tool_names=["lookup"],
+            historic_first_calls=(ToolCall(name="lookup", arguments={"q": f"a{i}"}),),
+            historic_tool_results=(
+                RecordedToolResult(name="lookup", arguments={"q": f"a{i}"}, result="found"),
+            ),
+        )
+        for i in range(1, count + 1)
+    ]
+
+
+async def test_the_historic_side_is_the_turns_first_decision_not_its_reply(
+    db_session: Session, test_user: User
+) -> None:
+    """The incumbent side must be the opening move, with its arguments.
+
+    ``historic_reply`` is the prose the user saw after every tool round had
+    run. Scoring it against the candidate's first decision compares a
+    finished message with an opening move, and reads every lookup-then-act
+    turn as the candidate acting where the incumbent only talked.
+    """
+    run_id = _make_run(
+        db_session, test_user.id, samples=1, incumbent_source=IncumbentSource.HISTORIC
+    )
+    a, b, c, d = _patched_run(
+        samples=_historic_samples(1),
+        call_side_effect=lambda *a, **k: _result(
+            tools=[ToolCall(name="lookup", arguments={"q": "a1"})]
+        ),
+        tools_by_name={"lookup": _lookup_tool()},
+    )
+    with a, b, c, d:
+        await execute_run(run_id, concurrency=1)
+
+    turn = _turns_of(db_session, run_id)[0]
+    assert json.loads(turn.baseline_tool_calls) == [{"name": "lookup", "arguments": {"q": "a1"}}]
+    # The reply is kept as context for a human, not as the scored decision.
+    assert turn.baseline_text == ""
+    assert turn.historic_reply == "here is what I found for 1"
+    # Same call, same arguments, so the candidate matched it.
+    assert turn.agreement == "identical"
+
+
+async def test_a_turn_that_only_replied_carries_its_prose_as_the_decision(
+    db_session: Session, test_user: User
+) -> None:
+    """When the turn called nothing, its first decision was what it said."""
+    run_id = _make_run(
+        db_session, test_user.id, samples=1, incumbent_source=IncumbentSource.HISTORIC
+    )
+    sample = ReplaySample(
+        seq=1,
+        timestamp="2026-05-01T12:00:00+00:00",
+        message_context="just checking in",
+        historic_reply="all good here",
+    )
+    a, b, c, d = _patched_run(
+        samples=[sample], call_side_effect=lambda *a, **k: _result(text="all good here")
+    )
+    with a, b, c, d:
+        await execute_run(run_id, concurrency=1)
+
+    turn = _turns_of(db_session, run_id)[0]
+    assert turn.baseline_text == "all good here"
+    assert json.loads(turn.baseline_tool_calls) == []
+    assert turn.agreement == "both_replied"
+
+
+async def test_an_unreconstructable_turn_leaves_the_comparison(
+    db_session: Session, test_user: User
+) -> None:
+    """A turn with no readable decision is dropped, not guessed at.
+
+    Reading it as "the agent did nothing" is the dangerous default: that is
+    what exempts a candidate's write from ``unrequested_mutation`` on a turn
+    production also wrote on.
+    """
+    run_id = _make_run(
+        db_session, test_user.id, samples=2, incumbent_source=IncumbentSource.HISTORIC
+    )
+    samples = _historic_samples(2)
+    broken = ReplaySample(
+        seq=2,
+        timestamp="2026-05-01T12:00:00+00:00",
+        message_context="ask 2",
+        historic_decision_available=False,
+    )
+    a, b, c, d = _patched_run(
+        samples=[samples[0], broken],
+        call_side_effect=lambda *a, **k: _result(
+            tools=[ToolCall(name="lookup", arguments={"q": "a1"})]
+        ),
+        tools_by_name={"lookup": _lookup_tool()},
+    )
+    with a, b, c, d:
+        await execute_run(run_id, concurrency=1)
+
+    turns = _turns_of(db_session, run_id)
+    assert [t.baseline_source for t in turns] == ["historic", "unavailable"]
+    assert turns[1].agreement == "not_compared"
+    assert turns[1].judge_verdict == str(JudgeVerdict.NOT_JUDGED)
+
+    run = db_session.execute(select(LLMEvalRun).where(LLMEvalRun.id == run_id)).scalar_one()
+    assert run.baseline_turns_unavailable == 1
+    summary = run.summary_json
+    assert summary is not None
+    assert summary["turns_incumbent_unavailable"] == 1
+    # Neither compared nor failed: it is in no rate's denominator.
+    assert summary["turns_completed"] == 1
+    assert summary["turns_failed"] == 0
+    assert summary["incumbent_source_counts"] == {"historic": 1, "unavailable": 1}
+    assert any("no reconstructable incumbent decision" in w for w in summary["warnings"])
+
+
+async def test_historic_mode_reports_the_unmeasured_incumbent_as_unavailable(
+    db_session: Session, test_user: User
+) -> None:
+    """Nothing the incumbent was not asked may be reported as a zero.
+
+    Its safety record, its tokens and its cost were never measured, so the
+    safety comparison is marked incomparable and the cost unpriced rather
+    than $0.0000, which a reader would take for a free model.
+    """
+    run_id = _make_run(
+        db_session, test_user.id, samples=2, incumbent_source=IncumbentSource.HISTORIC
+    )
+    a, b, c, d = _patched_run(
+        samples=_historic_samples(2),
+        call_side_effect=lambda *a, **k: _result(text="candidate answered"),
+        tools_by_name={"lookup": _lookup_tool()},
+    )
+    with a, b, c, d:
+        await execute_run(run_id, concurrency=1)
+
+    run = db_session.execute(select(LLMEvalRun).where(LLMEvalRun.id == run_id)).scalar_one()
+    summary = run.summary_json
+    assert summary is not None
+    assert summary["safety_comparison"]["comparable"] is False
+    assert summary["fabricated_id_comparison"]["comparable"] is False
+    assert summary["baseline"]["pricing_available"] is False
+    assert summary["baseline"]["pricing_unknown_reason"] == "not_replayed"
+    assert summary["baseline"]["input_tokens"] == 0
+    assert any("was not replayed" in warning for warning in summary["warnings"])
+    # And no second warning blaming a missing price list for the same zero.
+    assert not any("No pricing data for the incumbent" in w for w in summary["warnings"])
+
+
+async def test_historic_mode_says_which_model_actually_answered(
+    db_session: Session, test_user: User
+) -> None:
+    """A historic run compares against whoever answered, not whoever it names.
+
+    The transcript does not record that per turn, so the usage log over the
+    sampled window is the evidence. Saying nothing would present the run as
+    a comparison against the configured incumbent, which it may not be.
+    """
+    run_id = _make_run(
+        db_session, test_user.id, samples=1, incumbent_source=IncumbentSource.HISTORIC
+    )
+    db_session.add_all(
+        [
+            LLMUsageLog(
+                user_id=test_user.id,
+                provider="anthropic",
+                model="incumbent",
+                purpose=PURPOSE_AGENT_MAIN,
+                created_at=datetime(2026, 5, 1, 12, 0, tzinfo=UTC),
+            ),
+            LLMUsageLog(
+                user_id=test_user.id,
+                provider="anthropic",
+                model="a-model-nobody-named",
+                purpose=PURPOSE_AGENT_MAIN,
+                created_at=datetime(2026, 5, 1, 12, 5, tzinfo=UTC),
+            ),
+        ]
+    )
+    db_session.commit()
+
+    a, b, c, d = _patched_run(
+        samples=_historic_samples(1),
+        call_side_effect=lambda *a, **k: _result(text="ok"),
+        tools_by_name={"lookup": _lookup_tool()},
+    )
+    with a, b, c, d:
+        await execute_run(run_id, concurrency=1)
+
+    run = db_session.execute(select(LLMEvalRun).where(LLMEvalRun.id == run_id)).scalar_one()
+    assert run.historic_other_config_calls == 1
+    assert run.summary_json is not None
+    assert any("a-model-nobody-named" in warning for warning in run.summary_json["warnings"])
+
+
+async def test_historic_mode_never_clears_a_candidate_outright(
+    db_session: Session, test_user: User
+) -> None:
+    """A clean run that never asked the incumbent is not permission to switch.
+
+    Long enough for a verdict, no findings on either side, nothing diverging:
+    in replay mode this is ``safe_to_switch``. Here the claim rests on a
+    comparison that was never made, so the verdict stops one step short and
+    says why.
+    """
+    turns = MIN_TURNS_FOR_VERDICT + 2
+    samples = [
+        ReplaySample(
+            seq=i,
+            timestamp="2026-05-01T12:00:00+00:00",
+            message_context=f"ask {i}",
+            historic_reply="same answer",
+        )
+        for i in range(1, turns + 1)
+    ]
+    run_id = _make_run(
+        db_session, test_user.id, samples=turns, incumbent_source=IncumbentSource.HISTORIC
+    )
+    a, b, c, d = _patched_run(
+        samples=samples, call_side_effect=lambda *a, **k: _result(text="same answer")
+    )
+    with a, b, c, d:
+        await execute_run(run_id, concurrency=1)
+
+    run = db_session.execute(select(LLMEvalRun).where(LLMEvalRun.id == run_id)).scalar_one()
+    assert run.summary_json is not None
+    assert run.summary_json["divergence_rate"] == 0.0
+    assert run.recommendation == Recommendation.SWITCH_WITH_MONITORING
+    assert any("was not replayed" in reason for reason in run.summary_json["reasons"])
+
+
+async def test_a_historic_run_is_not_a_divergence_calibration(
+    db_session: Session, test_user: User
+) -> None:
+    """Both columns naming the incumbent is not enough to be a noise floor.
+
+    A historic run's divergence is the candidate's distance from a months-old
+    transcript, not the incumbent's disagreement with itself, and adopting it
+    as a floor would excuse a genuinely divergent candidate later.
+    """
+    _calibration_run(db_session, test_user.id, divergence=0.38, version=HARNESS_VERSION)
+    db_session.execute(update(LLMEvalRun).values(incumbent_source=str(IncumbentSource.HISTORIC)))
+    db_session.commit()
+
+    run_id = _make_run(db_session, test_user.id, samples=1)
+    a, b, c, d = _patched_run(samples=_samples(1), call_side_effect=lambda *a, **k: _result("ok"))
+    with a, b, c, d:
+        await execute_run(run_id, concurrency=1)
+
+    run = db_session.execute(select(LLMEvalRun).where(LLMEvalRun.id == run_id)).scalar_one()
+    assert run.summary_json is not None
+    assert run.summary_json["divergence_noise_floor"] is None
+
+
+async def test_a_replay_run_still_calls_both_sides(db_session: Session, test_user: User) -> None:
+    """The escape hatch has to still work, and still record what it was."""
+    run_id = _make_run(db_session, test_user.id, samples=2, incumbent_source=IncumbentSource.REPLAY)
+    seen: list[str] = []
+    a, b, c, _ = _patched_run(samples=_samples(2), call_side_effect=None)
+    with (
+        a,
+        b,
+        c,
+        patch("backend.app.services.llm_eval.runner.call_model", _recording_dispatch(seen)),
+    ):
+        await execute_run(run_id, concurrency=1)
+
+    assert sorted(seen) == ["candidate", "candidate", "incumbent", "incumbent"]
+    assert [t.baseline_source for t in _turns_of(db_session, run_id)] == ["live", "live"]
+    run = db_session.execute(select(LLMEvalRun).where(LLMEvalRun.id == run_id)).scalar_one()
+    assert run.baseline_turns_unavailable == 0
+    assert run.summary_json is not None
+    assert run.summary_json["incumbent_source"] == "replay"
+    assert run.summary_json["incumbent_source_counts"] == {"live": 2}
