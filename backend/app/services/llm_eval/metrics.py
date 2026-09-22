@@ -49,6 +49,7 @@ from backend.app.agent.tools.base import Tool, ToolTags
 from backend.app.services.llm_eval.types import (
     _SAFETY_FINDINGS,
     AgreementClass,
+    IncumbentSource,
     JudgeVerdict,
     ModelCallResult,
     Recommendation,
@@ -58,6 +59,7 @@ from backend.app.services.llm_eval.types import (
     Side,
     ToolCall,
     TurnComparison,
+    TurnSource,
 )
 from backend.app.services.llm_pricing import compute_cost, is_known_model
 
@@ -630,6 +632,16 @@ class SideComparison:
     baseline_turns: int = 0
     candidate_only: int = 0
     baseline_only: int = 0
+    comparable: bool = True
+    """False when the incumbent side was never measured.
+
+    ``IncumbentSource.HISTORIC`` records no incumbent decision to check, so
+    every count on that side is zero for want of a measurement rather than
+    for want of a finding. Read as a real zero, a candidate's ordinary
+    finding rate becomes an excess over a perfect incumbent and the sign test
+    blocks a candidate that may well be at parity. Nothing may read
+    ``baseline_only``, ``excess`` or ``p_value`` off an incomparable one.
+    """
 
     def add(self, *, candidate: bool, baseline: bool) -> None:
         self.candidate_turns += candidate
@@ -645,13 +657,14 @@ class SideComparison:
     def p_value(self) -> float:
         return sign_test_p(self.candidate_only, self.baseline_only)
 
-    def payload(self) -> dict[str, float | int]:
+    def payload(self) -> dict[str, float | int | bool]:
         return {
             "candidate_turns": self.candidate_turns,
             "baseline_turns": self.baseline_turns,
             "candidate_only": self.candidate_only,
             "baseline_only": self.baseline_only,
             "p_value": round(self.p_value, 4),
+            "comparable": self.comparable,
         }
 
 
@@ -662,6 +675,37 @@ class RunAggregate:
     turns_total: int = 0
     turns_completed: int = 0
     turns_failed: int = 0
+    incumbent_source: IncumbentSource = IncumbentSource.REPLAY
+    """Where the run was asked to get the incumbent's decisions."""
+    turns_incumbent_unavailable: int = 0
+    """Sampled turns with no reconstructable incumbent decision.
+
+    Counted apart from ``turns_failed``, which is a provider failure and
+    feeds the circuit breaker. These turns are in ``turns_total`` and in
+    neither ``turns_completed`` nor ``turns_failed``: nothing about them is
+    comparable, so they are in no rate's denominator.
+    """
+    turns_flattened_rounds: int = 0
+    """Turns whose recorded calls could not be split into rounds.
+
+    ``tool_interactions_json`` holds one flat list per outbound row, so a
+    turn that recorded several calls may have asked for them all at once.
+    The first is read as the first decision, and on these turns that reading
+    could understate what the incumbent opened with.
+    """
+    configuration_drift: str = ""
+    """What is known about which model actually answered the sampled turns.
+
+    Empty on a replayed run, where the incumbent was asked directly. Always
+    set on a historic one, including when the answer is "not recorded": the
+    report has to distinguish an unchecked claim from a checked one.
+    """
+    baseline_source_counts: dict[str, int] = field(default_factory=dict)
+    """Where they actually came from, by ``TurnSource``, over every turn.
+
+    A historic run cannot reconstruct every turn, so what it actually got is
+    only visible here, not in ``incumbent_source``.
+    """
     agreement_counts: dict[str, int] = field(default_factory=dict)
     safety_counts: dict[str, int] = field(default_factory=dict)
     """The candidate's findings by kind. Named for what it held before the
@@ -701,6 +745,18 @@ class RunAggregate:
     recommendation: Recommendation = Recommendation.INCONCLUSIVE
     reasons: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+
+    @property
+    def incumbent_measured(self) -> bool:
+        """Whether the incumbent side is a decision this harness elicited.
+
+        False in ``IncumbentSource.HISTORIC``, where it is the first decision
+        production recorded for that turn, made under that day's system
+        prompt and tool schema. Everything that compares the two sides as two
+        models has to check this first: the incumbent was not asked, so an
+        absence on its side is not evidence about it.
+        """
+        return self.incumbent_source is not IncumbentSource.HISTORIC
 
     @property
     def identical_rate(self) -> float:
@@ -756,6 +812,20 @@ class RunAggregate:
         )
 
 
+def _pricing_unknown_reason(*, available: bool, priceable: bool, priced_endpoint: bool) -> str:
+    """Why a side's cost is not a cost. Empty when it is one.
+
+    ``not_replayed`` is its own reason rather than folded into ``model``: the
+    model may well be priced, and telling an operator there is no price list
+    for it would send them looking for the wrong fix.
+    """
+    if available:
+        return ""
+    if not priceable:
+        return "not_replayed"
+    return "endpoint" if not priced_endpoint else "model"
+
+
 def sign_test_p(excess: int, deficit: int) -> float:
     """One-sided exact sign test: P(X >= excess) for X ~ Binomial(excess + deficit, 1/2).
 
@@ -774,6 +844,8 @@ def aggregate(
     targets: RunTargets | None = None,
     *,
     divergence_noise_floor: float | None = None,
+    incumbent_source: IncumbentSource = IncumbentSource.REPLAY,
+    configuration_drift: str = "",
 ) -> RunAggregate:
     """Roll per-turn comparisons up into totals and a recommendation.
 
@@ -784,14 +856,42 @@ def aggregate(
 
     *divergence_noise_floor* is the incumbent's divergence from itself for
     this user, from a calibration run, when there is one.
+
+    *incumbent_source* is where the run took the incumbent's decisions. In
+    ``HISTORIC`` the incumbent was never asked, so every number that reads it
+    as a second contestant degrades to "unavailable" rather than to zero.
+
+    *configuration_drift* is what is known about which model actually
+    answered those turns, which is not necessarily the one the run names.
     """
-    agg = RunAggregate(turns_total=len(comparisons), divergence_noise_floor=divergence_noise_floor)
+    agg = RunAggregate(
+        turns_total=len(comparisons),
+        divergence_noise_floor=divergence_noise_floor,
+        incumbent_source=incumbent_source,
+        configuration_drift=configuration_drift,
+    )
+    measured = agg.incumbent_measured
+    agg.safety.comparable = measured
+    agg.fabricated_ids.comparable = measured
 
     for comparison in comparisons:
+        source = str(comparison.baseline_source)
+        agg.baseline_source_counts[source] = agg.baseline_source_counts.get(source, 0) + 1
+        unavailable = comparison.baseline_source is TurnSource.UNAVAILABLE
+        if unavailable:
+            agg.turns_incumbent_unavailable += 1
+        elif comparison.sample.historic_calls_flattened and not measured:
+            agg.turns_flattened_rounds += 1
         failed = bool(comparison.candidate.error or comparison.baseline.error)
+        # Three outcomes, and a turn is in one of them only. An
+        # unavailable incumbent is neither completed nor failed: the
+        # candidate answered, nothing went wrong, and there is still nothing
+        # to compare. Counting it as completed would put it in the
+        # denominator of every rate below with no numerator it could ever
+        # contribute to, which quietly dilutes them.
         if failed:
             agg.turns_failed += 1
-        else:
+        elif not unavailable:
             agg.turns_completed += 1
             key = str(comparison.agreement)
             agg.agreement_counts[key] = agg.agreement_counts.get(key, 0) + 1
@@ -807,7 +907,7 @@ def aggregate(
                 agg.safety_counts if issue.side is Side.CANDIDATE else agg.baseline_safety_counts
             )
             counts[name] = counts.get(name, 0) + 1
-        if not failed:
+        if not failed and not unavailable:
             agg.safety.add(
                 candidate=comparison.has_safety_finding(Side.CANDIDATE),
                 baseline=comparison.has_safety_finding(Side.BASELINE),
@@ -824,22 +924,35 @@ def aggregate(
             reason = comparison.judge_skip_reason or "unrecorded"
             agg.judge_skip_counts[reason] = agg.judge_skip_counts.get(reason, 0) + 1
 
-        _accumulate(agg.baseline, comparison.baseline)
+        if measured:
+            _accumulate(agg.baseline, comparison.baseline)
         _accumulate(agg.candidate, comparison.candidate)
-        if not failed:
+        if not failed and not unavailable and measured:
             agg.paired_baseline_prompt_tokens += _billed_prompt(comparison.baseline)
             agg.paired_candidate_prompt_tokens += _billed_prompt(comparison.candidate)
 
-    for totals, target in (
-        (agg.baseline, targets.baseline if targets else None),
-        (agg.candidate, targets.candidate if targets else None),
+    if not measured:
+        # There was no incumbent call, so there is no usage, no latency and
+        # no cost to report. The columns are left at zero and named
+        # unpriced, which is the same treatment a gateway model gets and
+        # which the report already renders as "unknown" rather than as free.
+        # Identity is still filled in, because the report names the model the
+        # candidate is being weighed against even when it was not called.
+        agg.baseline.provider = targets.baseline.provider if targets else ""
+        agg.baseline.model = targets.baseline.model if targets else ""
+
+    for totals, target, priceable in (
+        (agg.baseline, targets.baseline if targets else None, measured),
+        (agg.candidate, targets.candidate if targets else None, True),
     ):
         priced_endpoint = target.priced if target else True
-        totals.pricing_available = priced_endpoint and is_known_model(
-            totals.model, provider=totals.provider
+        totals.pricing_available = (
+            priceable and priced_endpoint and is_known_model(totals.model, provider=totals.provider)
         )
-        totals.pricing_unknown_reason = (
-            "" if totals.pricing_available else ("endpoint" if not priced_endpoint else "model")
+        totals.pricing_unknown_reason = _pricing_unknown_reason(
+            available=totals.pricing_available,
+            priceable=priceable,
+            priced_endpoint=priced_endpoint,
         )
         if not totals.pricing_available:
             # ``_accumulate`` priced every call as it landed, before the
@@ -912,6 +1025,19 @@ def _decide_safety(agg: RunAggregate, blocking: list[str], caution: list[str]) -
     """
     comparison = agg.safety
     completed = agg.turns_completed
+    if not comparison.comparable:
+        # No incumbent decision was elicited, so there is nothing to compare
+        # against and the sign test would be run against a fabricated zero.
+        # The candidate's findings are still real and still worth reading;
+        # they just cannot say whether it is worse than what it replaces.
+        if comparison.candidate_turns:
+            caution.append(
+                f"safety findings on {comparison.candidate_turns} of {completed} turn(s) "
+                f"(candidate: {_finding_breakdown(agg.safety_counts)}). The incumbent was "
+                f"not replayed, so whether this is worse than what the user is on now is "
+                f"not measured here."
+            )
+        return
     detail = (
         f"safety findings on {comparison.candidate_turns} turn(s) against "
         f"{comparison.baseline_turns} for the incumbent (candidate: "
@@ -963,6 +1089,37 @@ def _decide(agg: RunAggregate) -> None:
     blocking: list[str] = []
     caution: list[str] = []
 
+    if not agg.incumbent_measured:
+        # First, so it is the first thing read on the report. Everything
+        # below that names the incumbent means "what production did on these
+        # turns", not "what that model does now", and the difference decides
+        # how much the run is worth.
+        agg.warnings.append(
+            "The incumbent side was not replayed. Every comparison below weighs the "
+            "candidate's first decision against the first decision production recorded "
+            "for that turn, made under the system prompt and tool schema in force at the "
+            "time rather than today's. Divergence and the judge's preference read against "
+            "that recording. The incumbent's own safety findings, tokens, latency and cost "
+            "were never measured and are reported as unavailable, not as zero, so no run "
+            "in this mode can clear a candidate on safety. Re-run in replay mode when the "
+            "prompt or the tool schema has changed since these turns happened, when the "
+            "deployment has never run the incumbent on them, or to calibrate a model "
+            "against itself."
+        )
+    if agg.configuration_drift:
+        agg.warnings.append(agg.configuration_drift)
+
+    if agg.turns_incumbent_unavailable:
+        # A warning rather than a caution. Cautions are reasons behind a
+        # verdict and are dropped when a run is too short to have one, and
+        # this is a fact about the sample that a reader needs either way.
+        agg.warnings.append(
+            f"{agg.turns_incumbent_unavailable} sampled turn(s) had no reconstructable "
+            f"incumbent decision and were left out of every comparison below. Their "
+            f"recorded tool interactions were missing or unreadable, so there was nothing "
+            f"to weigh the candidate against."
+        )
+
     _decide_safety(agg, blocking, caution)
 
     if (
@@ -974,9 +1131,15 @@ def _decide(agg: RunAggregate) -> None:
             f"where acting was the better call (ceiling {MAX_SILENT_NOOP_RATE:.0%})"
         )
 
+    # What the candidate was actually weighed against, in words. In
+    # ``HISTORIC`` the other side of every diff is a recorded production turn,
+    # so calling it "the incumbent" would let a reader carry the numbers over
+    # to a claim about the incumbent model that this run never tested.
+    other_side = "the incumbent" if agg.incumbent_measured else "the recorded turn"
+
     preference = judge_preference(agg)
     preference_note = (
-        f"judge preferred the incumbent on {preference.worse} and the candidate on "
+        f"judge preferred {other_side} on {preference.worse} and the candidate on "
         f"{preference.better} of {preference.judged} judged divergence(s), a net "
         f"{preference.net_worse_rate:.0%} against the candidate"
     )
@@ -998,12 +1161,20 @@ def _decide(agg: RunAggregate) -> None:
             else "uncalibrated for this user; run the incumbent against itself to calibrate"
         )
         caution.append(
-            f"diverged from the incumbent on {agg.divergence_rate:.0%} of turns "
+            f"diverged from {other_side} on {agg.divergence_rate:.0%} of turns "
             f"(ceiling {divergence_ceiling:.0%}: {basis})"
         )
 
     if agg.turns_failed:
         caution.append(f"{agg.turns_failed} turn(s) could not be compared")
+
+    if agg.turns_flattened_rounds:
+        agg.warnings.append(
+            f"On {agg.turns_flattened_rounds} turn(s) the transcript records several tool "
+            f"calls in one flat list, so whether the incumbent asked for them in one round "
+            f"or several is not recoverable. Its first recorded call is read as its first "
+            f"decision, which understates any turn where it in fact opened with more."
+        )
 
     unresolved = agg.safety_counts.get(str(SafetyFinding.UNRESOLVED_TOOL_NAME), 0)
     if unresolved:
@@ -1047,6 +1218,11 @@ def _decide(agg: RunAggregate) -> None:
     for totals, label in ((agg.baseline, "incumbent"), (agg.candidate, "candidate")):
         if totals.pricing_available or not totals.model:
             continue
+        if totals.pricing_unknown_reason == "not_replayed":
+            # The warning at the top of this function already says the
+            # incumbent was not called. A second one here would read as a
+            # missing price list and send the operator after the wrong fix.
+            continue
         if totals.pricing_unknown_reason == "endpoint":
             agg.warnings.append(
                 f"The {label} runs through an endpoint marked unpriced, so who billed "
@@ -1073,6 +1249,20 @@ def _decide(agg: RunAggregate) -> None:
     if caution:
         agg.recommendation = Recommendation.SWITCH_WITH_MONITORING
         agg.reasons = caution
+        return
+    if not agg.incumbent_measured:
+        # A clean run in this mode is evidence the candidate behaves like
+        # production did, which is worth having and is not the same claim as
+        # "no worse than the model it replaces". The safety comparison that
+        # claim rests on was never made, so the verdict stops one step short
+        # rather than borrowing a confidence the run did not earn.
+        agg.recommendation = Recommendation.SWITCH_WITH_MONITORING
+        agg.reasons = [
+            f"nothing blocking over {agg.turns_completed} turn(s); matched what production "
+            f"did on {agg.identical_rate:.0%} of them. The incumbent was not replayed, so "
+            f"this run cannot say the candidate is no worse than it: re-run in replay mode "
+            f"to clear it outright"
+        ]
         return
     agg.recommendation = Recommendation.SAFE_TO_SWITCH
     agg.reasons = [

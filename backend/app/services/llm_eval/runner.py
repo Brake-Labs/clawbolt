@@ -21,16 +21,23 @@ import asyncio
 import json
 import logging
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import cast
 
 from sqlalchemy import CursorResult, func, select, update
 from sqlalchemy.exc import IntegrityError
 
+from backend.app.agent.core import AssembledPrompt
+from backend.app.agent.observer import (
+    PURPOSE_AGENT_FOLLOWUP,
+    PURPOSE_AGENT_MAIN,
+    PURPOSE_AGENT_WRAP_UP,
+)
 from backend.app.agent.system_prompt import build_time_user_context
 from backend.app.config import settings
 from backend.app.database import db_session_async
-from backend.app.models import LLMEvalRun, LLMEvalTurnResult, User
+from backend.app.models import LLMEvalRun, LLMEvalTurnResult, LLMUsageLog, User
 from backend.app.services.llm_endpoints import resolve_target
 from backend.app.services.llm_eval import metrics
 from backend.app.services.llm_eval.execution import call_model
@@ -44,6 +51,7 @@ from backend.app.services.llm_eval.sampling import (
 )
 from backend.app.services.llm_eval.types import (
     AgreementClass,
+    IncumbentSource,
     JudgeSkipReason,
     JudgeVerdict,
     ModelCallResult,
@@ -57,6 +65,7 @@ from backend.app.services.llm_eval.types import (
     Side,
     ToolCall,
     TurnComparison,
+    TurnSource,
 )
 
 logger = logging.getLogger(__name__)
@@ -126,6 +135,146 @@ MAX_CONSECUTIVE_CALL_FAILURES = 3
 HARNESS_VERSION = 2
 
 
+def incumbent_source(run: LLMEvalRun) -> IncumbentSource:
+    """Where *run* takes the incumbent's decisions, tolerating an unknown value.
+
+    A row written before the mode existed carries ``replay``, and so does one
+    carrying anything this build does not recognize: calling the model is the
+    only answer that is never wrong about what it measured.
+    """
+    try:
+        return IncumbentSource(run.incumbent_source)
+    except ValueError:
+        logger.warning(
+            "LLM eval run %d has an unknown incumbent source %r; replaying",
+            run.id,
+            run.incumbent_source,
+        )
+        return IncumbentSource.REPLAY
+
+
+def historic_decision(run: LLMEvalRun, sample: ReplaySample) -> tuple[ModelCallResult, TurnSource]:
+    """The incumbent's *first* decision for a turn, read out of the transcript.
+
+    First decision, not final reply. The candidate side of every comparison
+    is scored on the first response that would need a live tool, so that is
+    what the incumbent side has to be: a turn that looked a customer up and
+    then sent them a message decided to look them up, and scoring
+    ``historic_reply`` against the candidate's tool call would compare a
+    finished message with an opening move. ``sampling`` reconstructs it from
+    the recorded tool interactions; when the turn called nothing, its first
+    decision was its prose and that is what lands here.
+
+    A turn whose decision could not be reconstructed comes back as
+    ``UNAVAILABLE`` with an empty result, and everything downstream drops it
+    from the comparison rather than reading an empty decision as "the agent
+    did nothing". That reading is the dangerous one: it is what exempts the
+    candidate's write from ``UNREQUESTED_MUTATION`` on a turn production
+    also wrote on, or charges it for one production made too.
+
+    Token, latency and stop-reason columns stay at their zero values on both
+    paths. No call was made, so there is nothing to measure, and
+    ``metrics.aggregate`` reports the incumbent's usage and cost as
+    unavailable in this mode rather than letting these zeros read as a free,
+    instant model.
+    """
+    if not sample.historic_decision_available:
+        return (
+            ModelCallResult(provider=run.baseline_provider, model=run.baseline_model),
+            TurnSource.UNAVAILABLE,
+        )
+    return (
+        ModelCallResult(
+            provider=run.baseline_provider,
+            model=run.baseline_model,
+            # Prose only when the turn asked for no tool. A turn that opened
+            # with a call carries no scored text: the prose it ended on was
+            # written after the rounds this decision precedes.
+            text="" if sample.historic_first_calls else sample.historic_reply,
+            tool_calls=list(sample.historic_first_calls),
+        ),
+        TurnSource.HISTORIC,
+    )
+
+
+# ``llm_usage_logs.purpose`` values written by the agent loop answering an
+# inbound turn. The other purposes (compaction, heartbeat decisions) are
+# background work on their own model settings and say nothing about which
+# model answered the user.
+_AGENT_PURPOSES = (PURPOSE_AGENT_MAIN, PURPOSE_AGENT_FOLLOWUP, PURPOSE_AGENT_WRAP_UP)
+
+# Slack on each end of the sampled window when reading the usage log. A
+# turn's row is timestamped when it was persisted and its usage rows when
+# each call returned, so the two are minutes apart at worst, and the check
+# is about which models were in play over a period rather than about pairing
+# a call to a turn.
+_CONFIG_WINDOW_MARGIN = timedelta(minutes=30)
+
+
+@dataclass(frozen=True)
+class ConfigurationDrift:
+    """Which models actually answered over the window the samples fall in.
+
+    A historic run compares the candidate against whatever answered at the
+    time, which is not necessarily the model named as the incumbent at the
+    top of the report. The transcript does not record that per turn, so this
+    is read from ``llm_usage_logs`` over the sampled window: coarser than
+    per turn, and enough to stop a report claiming a comparison it did not
+    make.
+    """
+
+    checked: bool
+    """False when no sampled timestamp parsed, so nothing could be looked up."""
+    total_calls: int
+    other_calls: int
+    other_configurations: list[str]
+
+
+async def historic_configuration_drift(
+    run: LLMEvalRun, samples: list[ReplaySample]
+) -> ConfigurationDrift:
+    """Read which (endpoint, provider, model) answered over the sampled window."""
+    stamps = [parsed for s in samples if (parsed := sample_clock(s)) is not None]
+    if not stamps:
+        return ConfigurationDrift(
+            checked=False, total_calls=0, other_calls=0, other_configurations=[]
+        )
+    async with db_session_async() as db:
+        rows = (
+            await db.execute(
+                select(
+                    LLMUsageLog.endpoint,
+                    LLMUsageLog.provider,
+                    LLMUsageLog.model,
+                    func.count(),
+                )
+                .where(
+                    LLMUsageLog.user_id == run.user_id,
+                    LLMUsageLog.purpose.in_(_AGENT_PURPOSES),
+                    LLMUsageLog.created_at >= min(stamps) - _CONFIG_WINDOW_MARGIN,
+                    LLMUsageLog.created_at <= max(stamps) + _CONFIG_WINDOW_MARGIN,
+                )
+                .group_by(LLMUsageLog.endpoint, LLMUsageLog.provider, LLMUsageLog.model)
+            )
+        ).all()
+    configured = (run.baseline_endpoint, run.baseline_provider, run.baseline_model)
+    total = 0
+    other = 0
+    labels: list[str] = []
+    for endpoint, provider, model, count in rows:
+        total += count
+        if (endpoint, provider, model) == configured:
+            continue
+        other += count
+        labels.append(f"{endpoint or provider}/{model} ({count})")
+    return ConfigurationDrift(
+        checked=True,
+        total_calls=total,
+        other_calls=other,
+        other_configurations=sorted(labels),
+    )
+
+
 def is_self_comparison(run: LLMEvalRun) -> bool:
     """Whether *run* replays the incumbent against itself, as a calibration run."""
     return (
@@ -152,6 +301,13 @@ async def divergence_noise_floor(run: LLMEvalRun) -> float | None:
     ``metrics._decide`` cautions on divergence only above
     this floor plus ``metrics.DIVERGENCE_MARGIN``; without one it uses the
     uncalibrated ceiling.
+
+    A run in ``IncumbentSource.HISTORIC`` is never a calibration, whatever
+    its two model columns say: its incumbent side is a decision production
+    recorded months ago, so its divergence rate measures how far the model
+    has drifted from that rather than how much it disagrees with itself
+    today. Only a replayed run measures self-divergence, because only it
+    asks the model twice.
     """
     async with db_session_async() as db:
         candidates = (
@@ -162,6 +318,7 @@ async def divergence_noise_floor(run: LLMEvalRun) -> float | None:
                         LLMEvalRun.user_id == run.user_id,
                         LLMEvalRun.id != run.id,
                         LLMEvalRun.status == str(RunStatus.COMPLETED),
+                        LLMEvalRun.incumbent_source != str(IncumbentSource.HISTORIC),
                         LLMEvalRun.baseline_endpoint == run.baseline_endpoint,
                         LLMEvalRun.baseline_provider == run.baseline_provider,
                         LLMEvalRun.baseline_model == run.baseline_model,
@@ -282,6 +439,7 @@ def _turn_row(run_id: int, comparison: TurnComparison) -> LLMEvalTurnResult:
         user_message=sample.user_text,
         historic_reply=sample.historic_reply,
         historic_tool_names=json.dumps(sample.historic_tool_names),
+        baseline_source=str(comparison.baseline_source),
         baseline_text=base.text,
         baseline_tool_calls=_serialize_calls(base.tool_calls),
         baseline_replayed_lookups=_serialize_lookups(base.replayed_lookups),
@@ -319,26 +477,49 @@ def _turn_row(run_id: int, comparison: TurnComparison) -> LLMEvalTurnResult:
     )
 
 
+async def _incumbent_decision(
+    run: LLMEvalRun,
+    fixture: ReplayFixture,
+    sample: ReplaySample,
+    targets: RunTargets,
+    assembled: AssembledPrompt,
+    source: IncumbentSource,
+) -> tuple[ModelCallResult, TurnSource]:
+    """The incumbent's decision for one turn, and where it came from."""
+    if source is IncumbentSource.HISTORIC:
+        return historic_decision(run, sample)
+    live = await call_model(
+        assembled,
+        fixture.tool_schemas,
+        target=targets.baseline,
+        reasoning_effort=targets.baseline_reasoning_effort,
+        tools_by_name=fixture.tools_by_name,
+        recorded=sample.historic_tool_results,
+    )
+    return live, TurnSource.LIVE
+
+
 async def _compare_turn(
     run: LLMEvalRun,
     fixture: ReplayFixture,
     sample: ReplaySample,
     targets: RunTargets,
+    source: IncumbentSource,
 ) -> TurnComparison:
-    """Replay one turn through both models and score the result."""
+    """Score one turn's candidate decision against the incumbent's.
+
+    The candidate is always called live: it is the thing being evaluated.
+    Only the incumbent side varies, by *source*, and in ``HISTORIC`` it
+    resolves without a provider call, which is the saving the whole mode
+    exists for. The ``asyncio.gather`` still overlaps the two in ``REPLAY``,
+    which is the case it is here for.
+    """
     assembled = await assemble_for_sample(fixture, sample)
 
     # Both sides may continue through lookups the live turn also made, fed
     # the recorded results; nothing is executed. See ``call_model``.
-    baseline, candidate = await asyncio.gather(
-        call_model(
-            assembled,
-            fixture.tool_schemas,
-            target=targets.baseline,
-            reasoning_effort=targets.baseline_reasoning_effort,
-            tools_by_name=fixture.tools_by_name,
-            recorded=sample.historic_tool_results,
-        ),
+    (baseline, baseline_source), candidate = await asyncio.gather(
+        _incumbent_decision(run, fixture, sample, targets, assembled, source),
         call_model(
             assembled,
             fixture.tool_schemas,
@@ -348,40 +529,62 @@ async def _compare_turn(
             recorded=sample.historic_tool_results,
         ),
     )
+    unavailable = baseline_source is TurnSource.UNAVAILABLE
 
     # Both sides get the same checks against the same evidence. Checking only
     # the candidate charged it for everything the incumbent also did.
+    #
+    # Except when the incumbent side was not replayed. Nothing is checked on
+    # a decision read out of the transcript, because every finding would be
+    # an artifact of the reading rather than a fact about the incumbent: its
+    # tool names are the very ``historic_tool_names`` the mutation check
+    # exempts, so it can never raise one, and the turn ran against a tool
+    # schema that is not today's, so the args validator would reject calls
+    # production accepted. Recording zero findings there and comparing them
+    # with the candidate's would read as a flawless incumbent, which is why
+    # ``metrics`` marks the comparison incomparable in this mode instead.
     seen = metrics.prompt_text(assembled.messages)
-    safety_issues = [
-        *metrics.check_safety(
-            candidate,
-            baseline,
-            fixture.tools_by_name,
-            historic_tool_names=sample.historic_tool_names,
-            seen=seen,
-            side=Side.CANDIDATE,
-        ),
-        *metrics.check_safety(
-            baseline,
-            candidate,
-            fixture.tools_by_name,
-            historic_tool_names=sample.historic_tool_names,
-            seen=seen,
-            side=Side.BASELINE,
-        ),
-    ]
+    safety_issues: list[SafetyIssue] = []
+    # An unavailable incumbent means nothing about the candidate is compared,
+    # so no finding is recorded against it. A provider error is the exception:
+    # ``check_safety`` answers that with ``CALL_FAILED`` alone, and a turn
+    # that errored still has to carry the badge saying so.
+    if not unavailable or candidate.error:
+        safety_issues.extend(
+            metrics.check_safety(
+                candidate,
+                baseline,
+                fixture.tools_by_name,
+                historic_tool_names=sample.historic_tool_names,
+                seen=seen,
+                side=Side.CANDIDATE,
+            )
+        )
+    if baseline_source is TurnSource.LIVE:
+        safety_issues.extend(
+            metrics.check_safety(
+                baseline,
+                candidate,
+                fixture.tools_by_name,
+                historic_tool_names=sample.historic_tool_names,
+                seen=seen,
+                side=Side.BASELINE,
+            )
+        )
     comparison = TurnComparison(
         sample=sample,
         baseline=baseline,
         candidate=candidate,
-        # A turn where either call errored produced no decision to compare.
+        baseline_source=baseline_source,
+        # A turn where either call errored produced no decision to compare,
+        # and so did one whose incumbent decision could not be read back.
         # Classifying it anyway stores a value the models never chose (an
         # errored baseline reads as "did not act", so the turn lands in
         # ``both_replied`` or ``acted_instead_of_replying``) and sorts the
         # unmeasured turn to the bottom of the report.
         agreement=(
             AgreementClass.NOT_COMPARED
-            if (baseline.error or candidate.error)
+            if (baseline.error or candidate.error or unavailable)
             else metrics.classify_agreement(baseline, candidate)
         ),
         safety_issues=safety_issues,
@@ -435,6 +638,8 @@ def _judge_skip_reason(
     """
     if not run_has_judge:
         return JudgeSkipReason.JUDGE_DISABLED
+    if comparison.baseline_source is TurnSource.UNAVAILABLE:
+        return JudgeSkipReason.INCUMBENT_UNAVAILABLE
     if comparison.baseline.error or comparison.candidate.error:
         return JudgeSkipReason.CALL_FAILED
     if not comparison.diverged:
@@ -470,7 +675,7 @@ async def execute_run(run_id: int, *, concurrency: int) -> None:
     if not samples:
         # Not an ``error``: the report renders that in a red banner, and a
         # run that completed normally against an empty history did not fail.
-        empty = metrics.aggregate([])
+        empty = metrics.aggregate([], incumbent_source=incumbent_source(run))
         empty.reasons = ["this user has no replayable turns"]
         await _finish(
             run_id,
@@ -509,6 +714,7 @@ async def execute_run(run_id: int, *, concurrency: int) -> None:
         candidate_reasoning_effort=run.candidate_reasoning_effort,
     )
 
+    source = incumbent_source(run)
     cancellation = _CancellationWatcher(run_id)
     semaphore = asyncio.Semaphore(max(1, concurrency))
     comparisons: list[TurnComparison] = []
@@ -528,7 +734,7 @@ async def execute_run(run_id: int, *, concurrency: int) -> None:
                 # and ``gather`` must not discard the bookkeeping for them.
                 return
             try:
-                comparison = await _compare_turn(run, fixture, sample, targets)
+                comparison = await _compare_turn(run, fixture, sample, targets, source)
             except Exception as exc:
                 logger.exception("Eval turn seq=%d failed in run %d", sample.seq, run_id)
                 # A turn that could not even be assembled still belongs in
@@ -547,6 +753,15 @@ async def execute_run(run_id: int, *, concurrency: int) -> None:
                         error=detail,
                     ),
                     agreement=AgreementClass.NOT_COMPARED,
+                    # Not ``UNAVAILABLE``: this turn failed outright, which
+                    # the error columns already say, and counting it as an
+                    # unreconstructable incumbent would blame the transcript
+                    # for an exception somewhere else.
+                    baseline_source=(
+                        TurnSource.HISTORIC
+                        if source is IncumbentSource.HISTORIC
+                        else TurnSource.LIVE
+                    ),
                     # Recorded so the turn carries the same marker as a turn
                     # whose provider call returned an error, rather than
                     # sorting to the bottom of the report with no badge. It is
@@ -581,6 +796,13 @@ async def execute_run(run_id: int, *, concurrency: int) -> None:
                     .where(LLMEvalRun.id == run_id)
                     .values(
                         progress_completed=LLMEvalRun.progress_completed + 1,
+                        # Same reason the progress counter is incremented in
+                        # SQL: it advances per committed turn from workers
+                        # that land out of order, and a Python counter
+                        # written whole would let a late worker overwrite a
+                        # higher value with its own stale one.
+                        baseline_turns_unavailable=LLMEvalRun.baseline_turns_unavailable
+                        + int(comparison.baseline_source is TurnSource.UNAVAILABLE),
                         heartbeat_at=datetime.now(UTC),
                     )
                 )
@@ -612,16 +834,42 @@ async def execute_run(run_id: int, *, concurrency: int) -> None:
 
     comparisons.sort(key=lambda c: c.sample.seq)
     self_comparison = is_self_comparison(run)
+    calibrating = self_comparison and source is IncumbentSource.REPLAY
+    drift = (
+        await historic_configuration_drift(run, samples)
+        if source is IncumbentSource.HISTORIC
+        else None
+    )
     aggregate = metrics.aggregate(
         comparisons,
         targets,
-        divergence_noise_floor=None if self_comparison else await divergence_noise_floor(run),
+        divergence_noise_floor=None if calibrating else await divergence_noise_floor(run),
+        incumbent_source=source,
+        configuration_drift=_drift_note(run, drift),
     )
-    if self_comparison:
+    if drift is not None:
+        async with db_session_async() as db:
+            await db.execute(
+                update(LLMEvalRun)
+                .where(LLMEvalRun.id == run_id)
+                .values(historic_other_config_calls=drift.other_calls)
+            )
+            await db.commit()
+    if calibrating:
         aggregate.warnings.append(
             f"This run replays the incumbent against itself. Its divergence rate, "
             f"{aggregate.divergence_rate:.0%}, is the noise floor later runs against this "
             f"incumbent for this user are measured against."
+        )
+    elif self_comparison:
+        # Both columns name the incumbent, but only one side was asked. The
+        # rate this produces is the model's distance from a months-old
+        # transcript, not its disagreement with itself, and treating it as a
+        # floor would excuse a genuinely divergent candidate later.
+        aggregate.warnings.append(
+            "Both sides of this run name the incumbent, but the incumbent side was not "
+            "replayed, so this is not a calibration run and sets no divergence floor. "
+            "Start one in replay mode to calibrate this user."
         )
     if breaker_error:
         # The evidence gathered before the provider went down is kept and
@@ -657,6 +905,42 @@ async def execute_run(run_id: int, *, concurrency: int) -> None:
     )
 
 
+def _drift_note(run: LLMEvalRun, drift: ConfigurationDrift | None) -> str:
+    """What to say about which model actually answered the sampled turns.
+
+    Empty for a replayed run, where the incumbent was asked directly and the
+    question does not arise. Never empty for a historic one: "could not be
+    checked" and "checked, all on the stated incumbent" are different facts
+    and a reader has to be told which one they have.
+    """
+    if drift is None:
+        return ""
+    configured = f"{run.baseline_endpoint or run.baseline_provider}/{run.baseline_model}"
+    if not drift.checked:
+        return (
+            f"Which model answered these turns could not be checked, because none of their "
+            f"timestamps parsed. They are compared against whatever was running at the "
+            f"time, which may not be {configured}."
+        )
+    if not drift.total_calls:
+        return (
+            f"Which model answered these turns is not recorded: the usage log holds no agent "
+            f"calls over the window they fall in. They are compared against whatever was "
+            f"running at the time, which may not be {configured}."
+        )
+    if not drift.other_calls:
+        return (
+            f"Over the window these turns fall in, all {drift.total_calls} recorded agent "
+            f"call(s) ran on {configured}, the incumbent this run names."
+        )
+    return (
+        f"{drift.other_calls} of {drift.total_calls} recorded agent call(s) over the window "
+        f"these turns fall in did not run on {configured}: "
+        f"{', '.join(drift.other_configurations)}. Those turns are compared against a model "
+        f"this run does not name."
+    )
+
+
 def _model_totals_payload(totals: metrics.ModelTotals) -> dict:
     return {
         "provider": totals.provider,
@@ -683,6 +967,13 @@ def _summary_payload(aggregate: metrics.RunAggregate) -> dict:
     """
     return {
         "harness_version": HARNESS_VERSION,
+        "incumbent_source": str(aggregate.incumbent_source),
+        # Where the incumbent's decisions came from, by ``TurnSource``.
+        # Frozen here as well as counted on the run row, because the summary
+        # is what the report reads and a verdict has to carry the provenance
+        # of the evidence behind it.
+        "incumbent_source_counts": aggregate.baseline_source_counts,
+        "turns_incumbent_unavailable": aggregate.turns_incumbent_unavailable,
         "turns_total": aggregate.turns_total,
         "turns_completed": aggregate.turns_completed,
         "turns_failed": aggregate.turns_failed,

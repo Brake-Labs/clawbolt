@@ -50,7 +50,7 @@ from backend.app.bus import OutboundMessage
 from backend.app.config import settings
 from backend.app.enums import MessageDirection
 from backend.app.models import User
-from backend.app.services.llm_eval.types import RecordedToolResult, ReplaySample
+from backend.app.services.llm_eval.types import RecordedToolResult, ReplaySample, ToolCall
 
 logger = logging.getLogger(__name__)
 
@@ -345,6 +345,61 @@ def _historic_tool_results(rows: list[StoredMessage], start: int) -> tuple[Recor
     )
 
 
+@dataclass(frozen=True)
+class HistoricDecision:
+    """The live turn's first decision, as far as the transcript preserves it.
+
+    What the evaluator scores on the candidate side is its *first* decision:
+    the first response that would need a live tool, or its prose when it
+    asks for none. ``IncumbentSource.HISTORIC`` needs the same thing on the
+    incumbent side, and neither ``historic_reply`` nor ``historic_tool_names``
+    is it. The reply is what the user saw after every round had run, and the
+    names are every call the whole turn made.
+
+    One thing the transcript cannot give back. ``tool_interactions_json``
+    holds one flat, ordered list per outbound row, so a turn that recorded
+    three calls could have asked for all three at once or for one at a time
+    across three rounds. The first recorded call is taken as the first
+    decision and ``flattened`` says the reading was ambiguous, which is
+    counted and surfaced rather than assumed away.
+    """
+
+    available: bool
+    calls: tuple[ToolCall, ...]
+    flattened: bool
+
+
+def _historic_first_decision(rows: list[StoredMessage], start: int) -> HistoricDecision:
+    """Reconstruct the first decision of the turn whose batch begins at *start*.
+
+    Unavailable in two cases, both of which read as "the agent did nothing"
+    if they are not distinguished, which is the reading that would charge a
+    candidate with an unrequested mutation on a turn production also wrote
+    on. The turn was never answered, so there is no decision of any kind to
+    read. Or an outbound row carried tool interactions that did not parse,
+    so calls were made and their record is gone.
+    """
+    answered = _response_rows(rows, start)
+    if not answered:
+        return HistoricDecision(available=False, calls=(), flattened=False)
+    calls: list[ToolCall] = []
+    for row in answered:
+        raw = row.tool_interactions_json
+        parsed = _parse_tool_interactions(raw)
+        if raw and raw.strip() not in ("", "[]") and not parsed:
+            logger.warning(
+                "Unparseable tool interactions on seq %d; its first decision is unavailable",
+                row.seq,
+            )
+            return HistoricDecision(available=False, calls=(), flattened=False)
+        calls.extend(ToolCall(name=item.name, arguments=item.args) for item in parsed)
+    if not calls:
+        # The turn answered in prose, so its first decision was that prose,
+        # which the sample already carries as ``historic_reply``.
+        return HistoricDecision(available=True, calls=(), flattened=False)
+    return HistoricDecision(available=True, calls=(calls[0],), flattened=len(calls) > 1)
+
+
 def _batch_end(rows: list[StoredMessage], start: int) -> int:
     """Index of the last inbound row in the batch that begins at *start*."""
     index = start
@@ -392,6 +447,7 @@ def select_samples(fixture: ReplayFixture, limit: int) -> list[ReplaySample]:
             last_index, message_context = texts[-1]
             row = rows[last_index]
             reply, tool_names = _historic_response(rows, last_index)
+            decision = _historic_first_decision(rows, last_index)
             samples.append(
                 ReplaySample(
                     seq=row.seq,
@@ -400,6 +456,9 @@ def select_samples(fixture: ReplayFixture, limit: int) -> list[ReplaySample]:
                     historic_reply=reply,
                     historic_tool_names=tool_names,
                     historic_tool_results=_historic_tool_results(rows, last_index),
+                    historic_first_calls=decision.calls,
+                    historic_decision_available=decision.available,
+                    historic_calls_flattened=decision.flattened,
                     batched_messages=tuple(text for _, text in texts[:-1]),
                 )
             )

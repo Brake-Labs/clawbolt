@@ -28,6 +28,64 @@ class Side(StrEnum):
     CANDIDATE = "candidate"
 
 
+class IncumbentSource(StrEnum):
+    """Where a run gets the incumbent's decision for each turn.
+
+    Chosen when the run is started and frozen onto the row. Only the
+    incumbent side is affected: the candidate is the thing being evaluated,
+    so it is always called live.
+    """
+
+    HISTORIC = "historic"
+    """Do not call the incumbent; read its decision out of the transcript.
+
+    The default, and what halves a run's provider bill: the incumbent's
+    answer to a turn was already bought once, when the turn happened. The
+    incumbent side is that turn's *first decision*, reconstructed from the
+    tool calls production recorded for it, which is the same thing the
+    replay scores on the candidate side.
+
+    It is not a replay, and four things it cannot control are reported
+    rather than papered over. That turn ran under the system prompt and tool
+    schema of the day, not today's. It may have run on a different model,
+    endpoint or reasoning effort than the run's stated incumbent. A turn
+    whose recorded interactions did not survive has no reconstructable
+    decision and leaves the paired comparisons entirely. And the incumbent
+    made no call here, so its tokens, latency, cost and safety record were
+    never measured and are reported as unavailable rather than as zero.
+    """
+
+    REPLAY = "replay"
+    """Call the incumbent live on every turn, doubling the run's cost.
+
+    Worth the money in three cases: the deployment has never run the
+    incumbent on these turns under today's prompt, so there is nothing
+    recorded to read; the run is a calibration of a model against itself,
+    which needs two live samples to mean anything; or the prompt or tool
+    schema has changed since the turns happened, which is the thing
+    ``HISTORIC`` cannot correct for.
+    """
+
+
+class TurnSource(StrEnum):
+    """Where one turn's incumbent decision actually came from.
+
+    A run's ``IncumbentSource`` is what was asked for; this is what
+    happened, recorded per turn because a historic run cannot reconstruct
+    every turn.
+    """
+
+    LIVE = "live"
+    HISTORIC = "historic"
+    UNAVAILABLE = "unavailable"
+    """The turn's recorded interactions were missing or unparseable.
+
+    No decision could be reconstructed, so there is nothing to compare the
+    candidate with. The turn is kept as evidence that it was sampled and
+    dropped from every paired comparison, rather than guessed at.
+    """
+
+
 class SafetyFinding(StrEnum):
     """Something a model did that production would have acted on badly.
 
@@ -180,6 +238,14 @@ class JudgeSkipReason(StrEnum):
     JUDGE_DISABLED = "judge_disabled"
     """The run was started with the judge turned off."""
 
+    INCUMBENT_UNAVAILABLE = "incumbent_unavailable"
+    """The incumbent's decision for this turn could not be reconstructed.
+
+    Only reachable in ``IncumbentSource.HISTORIC``. There is one decision on
+    the table, not two, and a judge asked to prefer one of them would be
+    scoring the candidate against nothing.
+    """
+
 
 class RunStatus(StrEnum):
     PENDING = "pending"
@@ -259,6 +325,37 @@ class ReplaySample:
     What lets a replay continue past a lookup: a read-only call that matches
     one of these gets its recorded result back instead of a live call.
     """
+    historic_first_calls: tuple[ToolCall, ...] = ()
+    """The live turn's *first* decision, as tool calls with their arguments.
+
+    Not the same thing as ``historic_tool_names``, which is every call the
+    turn made across every round. The replay scores the candidate on its
+    first decision, so the only like-for-like incumbent side is the live
+    turn's first one; comparing it against ``historic_reply``, which is the
+    prose the user saw after every round had run, would score a summary
+    against a tool call.
+
+    Empty when the turn called nothing, in which case its first decision was
+    ``historic_reply``. See ``historic_decision_available`` for the case
+    where there is no first decision to read at all.
+    """
+    historic_decision_available: bool = True
+    """Whether a first decision could be reconstructed for this turn.
+
+    False when the turn was never answered, or when an outbound row carried
+    tool interactions that did not parse. Those turns leave every paired
+    comparison instead of being read as "the agent did nothing", which is
+    what an unparseable row would otherwise look like.
+    """
+    historic_calls_flattened: bool = False
+    """Whether this turn's recorded calls cannot be split into rounds.
+
+    ``tool_interactions_json`` stores one flat, ordered list per outbound
+    row, so a turn that recorded several calls could have made them in one
+    round or in several. The first call is taken as the first decision, and
+    turns in this state are counted and surfaced, because on one of them the
+    incumbent may have asked for more in its first breath than this says.
+    """
     batched_messages: tuple[str, ...] = ()
     """Earlier messages of the batch this turn closes, oldest first.
 
@@ -315,6 +412,16 @@ class ModelCallResult:
     Production retries a reply cut off at ``max_tokens`` with no tool call,
     so the replay does too, and the usage above includes the spent attempts.
     """
+    unrecorded_tool_arguments: int = 0
+    """Tool calls here whose arguments are not known.
+
+    Only ever non-zero on a decision read out of the transcript
+    (``IncumbentSource.HISTORIC``), where a turn can carry a tool name with
+    no surviving interaction record. Such a call is stored with empty
+    arguments, which is not the same as a call made with none: anything that
+    inspects arguments (the args validator, the fabricated-ID check, whether
+    two decisions used the same arguments) has to treat it as unknown.
+    """
 
     @property
     def acted(self) -> bool:
@@ -342,6 +449,8 @@ class TurnComparison:
     baseline: ModelCallResult
     candidate: ModelCallResult
     agreement: AgreementClass
+    baseline_source: TurnSource = TurnSource.LIVE
+    """Where the incumbent's decision came from. See ``TurnSource``."""
     safety_issues: list[SafetyIssue] = field(default_factory=list)
     judge_verdict: JudgeVerdict = JudgeVerdict.NOT_JUDGED
     judge_rationale: str = ""
