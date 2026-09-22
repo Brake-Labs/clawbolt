@@ -28,7 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 from functools import lru_cache
@@ -53,6 +53,7 @@ from backend.app.services.llm_eval.types import (
     JudgeVerdict,
     ModelCallResult,
     Recommendation,
+    RecordedToolResult,
     RunTargets,
     SafetyFinding,
     SafetyIssue,
@@ -195,6 +196,48 @@ def normalized_args(tool: Tool, args: dict[str, Any]) -> str:
         return canonical_args(tool.params_model.model_validate(args).model_dump(mode="json"))
     except ValidationError:
         return canonical_args(args)
+
+
+def replayable_lookup(
+    name: str,
+    arguments: dict[str, Any],
+    tools_by_name: Mapping[str, Tool],
+    recorded: Sequence[RecordedToolResult],
+) -> RecordedToolResult | None:
+    """The recorded result a replay would feed back for this call, or None.
+
+    One call is replayable when the tool is on today's schema, the call is a
+    read (``is_mutating_call``, so ``ToolTags.READ_ONLY`` or a
+    ``read_only_when`` that says so for these arguments), and the live turn
+    made the same call with the same arguments once defaults are filled in.
+    Anything else would need a live tool, and a replay never makes one.
+
+    The single rule both sides are scored by. ``execution.replayable_lookups``
+    applies it to every call of a model's response, and
+    ``sampling._historic_first_decision`` applies it to the recorded calls of
+    a historic turn, so the incumbent's scored decision is taken at the same
+    point in the turn as the candidate's. They drifted apart once already:
+    the replay advanced the candidate past a lookup while the historic side
+    stayed on the first recorded call, and every lookup-then-act turn then
+    read as the candidate acting where production had only looked something
+    up. An identical candidate scored ``do_not_switch``.
+    """
+    tool = tools_by_name.get(name)
+    if tool is None or is_mutating_call(tool, arguments):
+        return None
+    wanted = normalized_args(tool, arguments)
+    match = next(
+        (r for r in recorded if r.name == name and normalized_args(tool, r.arguments) == wanted),
+        None,
+    )
+    if match is None:
+        return None
+    return RecordedToolResult(
+        name=name,
+        arguments=arguments,
+        result=match.result,
+        is_error=match.is_error,
+    )
 
 
 def _args_are_valid(tool: Tool, args: dict[str, Any]) -> tuple[bool, str]:

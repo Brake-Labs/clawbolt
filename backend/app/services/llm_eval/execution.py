@@ -165,37 +165,20 @@ def replayable_lookups(
 ) -> list[RecordedToolResult] | None:
     """The recorded results to feed back for *result*, or None to stop here.
 
-    Continues only when every call is a read the live turn also made with the
-    same arguments (compared after the params model fills defaults). One call
-    that would need a live tool, a write included, ends the replay: a partial
-    round cannot be answered without executing something.
+    Continues only when every call in the round is a replayable lookup
+    (``metrics.replayable_lookup``, the rule the historic side is
+    reconstructed by too). One call that would need a live tool, a write
+    included, ends the replay: a partial round cannot be answered without
+    executing something.
     """
     if result.error or not result.tool_calls or result.stop_reason == "max_tokens":
         return None
     fed: list[RecordedToolResult] = []
     for call in result.tool_calls:
-        tool = tools_by_name.get(call.name)
-        if tool is None or metrics.is_mutating_call(tool, call.arguments):
-            return None
-        wanted = metrics.normalized_args(tool, call.arguments)
-        match = next(
-            (
-                r
-                for r in recorded
-                if r.name == call.name and metrics.normalized_args(tool, r.arguments) == wanted
-            ),
-            None,
-        )
+        match = metrics.replayable_lookup(call.name, call.arguments, tools_by_name, recorded)
         if match is None:
             return None
-        fed.append(
-            RecordedToolResult(
-                name=call.name,
-                arguments=call.arguments,
-                result=match.result,
-                is_error=match.is_error,
-            )
-        )
+        fed.append(match)
     return fed
 
 
