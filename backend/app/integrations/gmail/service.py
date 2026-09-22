@@ -16,7 +16,7 @@ import base64
 import logging
 import re
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
@@ -170,7 +170,7 @@ class GmailService:
         path: str,
         *,
         json: dict[str, Any] | None = None,
-        params: dict[str, str] | None = None,
+        params: Mapping[str, str | list[str]] | None = None,
     ) -> dict[str, Any] | None:
         url = f"{GMAIL_API_BASE}{path}"
         headers = {
@@ -235,9 +235,12 @@ class GmailService:
         return summaries
 
     async def _get_message_summary(self, message_id: str) -> GmailMessageSummary:
-        params = {
+        # metadataHeaders is a repeated param: httpx encodes the list as
+        # ?metadataHeaders=From&metadataHeaders=Subject&... A comma-joined
+        # string matches no header, so Gmail would return none.
+        params: dict[str, str | list[str]] = {
             "format": "metadata",
-            "metadataHeaders": "From,Subject,Date",
+            "metadataHeaders": ["From", "Subject", "Date"],
         }
         data = await self._request("GET", f"/users/me/messages/{message_id}", params=params) or {}
         headers = _index_headers(data.get("payload", {}).get("headers", []))
