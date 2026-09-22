@@ -40,6 +40,8 @@ logger = logging.getLogger(__name__)
 # usage-log table without translation.
 PURPOSE_AGENT_MAIN = "agent_main"
 PURPOSE_AGENT_FOLLOWUP = "agent_followup"  # post-trim retry of the main agent call
+# Tool-less closing call when the loop hits ``max_tool_rounds`` with no reply text.
+PURPOSE_AGENT_WRAP_UP = "agent_wrap_up"
 PURPOSE_COMPACTION = "compaction"
 PURPOSE_HEARTBEAT_DECISION = "heartbeat_decision"
 

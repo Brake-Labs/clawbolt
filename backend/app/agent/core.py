@@ -68,6 +68,7 @@ from backend.app.agent.messages import (
 from backend.app.agent.observer import (
     PURPOSE_AGENT_FOLLOWUP,
     PURPOSE_AGENT_MAIN,
+    PURPOSE_AGENT_WRAP_UP,
     LLMRequestPayload,
     LLMResponsePayload,
     compute_min_message_seq,
@@ -135,6 +136,20 @@ _VALID_STOP_REASONS: set[str | None] = {"end_turn", "max_tokens", "tool_use", "s
 _MAX_TOKENS_CEILING = 16384
 
 _LLM_ERROR_FALLBACK = "I'm having trouble thinking right now. Can you try again in a moment?"
+
+# Appended as a user turn for the tool-less wrap-up call made when the loop
+# runs out of rounds without reply text, so the user is never left in silence.
+_MAX_ROUNDS_WRAP_UP_INSTRUCTION = (
+    "You have reached the tool-call limit for this turn and cannot call any more tools. "
+    "Reply to the user now: say what you finished, what is still open, and what you "
+    "need from them to continue."
+)
+
+# Sent when the wrap-up call fails or also comes back without text.
+_MAX_ROUNDS_FALLBACK = (
+    "I ran out of steps before I could finish this one. "
+    'Reply "keep going" and I\'ll pick up where I left off.'
+)
 
 # Telegram expires typing status within five seconds, the shortest documented
 # channel window. Refresh beneath that limit; explicit stop handles slow-clearing channels.
@@ -520,6 +535,9 @@ class ClawboltAgent:
         messages: list[AgentMessage],
         tool_schemas: list[Any] | None,
         max_tokens: int | None = None,
+        *,
+        tool_choice: dict[str, Any] | None = None,
+        purpose: str = PURPOSE_AGENT_MAIN,
     ) -> MessageResponse:
         """Call amessages with typed exception handling and retry logic.
 
@@ -564,7 +582,7 @@ class ClawboltAgent:
         await emit_llm_request(
             LLMRequestPayload(
                 schema_version=1,
-                purpose=PURPOSE_AGENT_MAIN,
+                purpose=purpose,
                 user_id=self.user.id,
                 session_id=self._session_id or None,
                 request_id=self._request_id or None,
@@ -589,13 +607,14 @@ class ClawboltAgent:
                             system=system,
                             messages=msg_dicts,
                             tools=tool_schemas,
+                            tool_choice=tool_choice,
                             max_tokens=effective_max_tokens,
                             **reasoning,
                         ),
                     )
                 await self._emit_response(
                     response,
-                    purpose=PURPOSE_AGENT_MAIN,
+                    purpose=purpose,
                     model=effective_model,
                     provider=effective_provider,
                     started_at=started_at,
@@ -616,6 +635,7 @@ class ClawboltAgent:
                 return await self._trim_and_retry(
                     messages,
                     tool_schemas=tool_schemas,
+                    tool_choice=tool_choice,
                     effective_model=effective_model,
                     effective_provider=effective_provider,
                     effective_max_tokens=effective_max_tokens,
@@ -637,6 +657,7 @@ class ClawboltAgent:
                 return await self._trim_and_retry(
                     messages,
                     tool_schemas=tool_schemas,
+                    tool_choice=tool_choice,
                     effective_model=effective_model,
                     effective_provider=effective_provider,
                     effective_max_tokens=effective_max_tokens,
@@ -656,6 +677,7 @@ class ClawboltAgent:
         messages: list[AgentMessage],
         *,
         tool_schemas: list[Any] | None,
+        tool_choice: dict[str, Any] | None = None,
         effective_model: str,
         effective_provider: str,
         effective_max_tokens: int,
@@ -716,6 +738,7 @@ class ClawboltAgent:
                     system=system,
                     messages=trimmed_dicts,
                     tools=tool_schemas,
+                    tool_choice=tool_choice,
                     max_tokens=effective_max_tokens,
                     **target.reasoning_kwargs(settings.reasoning_effort),
                 ),
@@ -1730,6 +1753,28 @@ class ClawboltAgent:
             reply_text = get_response_text(response)
             thinking_text = get_response_thinking(response)
             logger.debug("Max tool rounds (%d) reached, using last response", MAX_TOOL_ROUNDS)
+            # A tool-only final round leaves no reply text. Unlike the in-loop
+            # empty reply (the model chose silence), the loop was cut off, so
+            # ask for a tool-less summary instead of ending the turn silently.
+            # Skip it when a reply tool already reached the user, since
+            # ``dispatch_reply_step`` would not send the text anyway.
+            already_replied = any(
+                ToolTags.SENDS_REPLY in tc.tags and not tc.is_error for tc in tool_call_records
+            )
+            if not reply_text and not already_replied:
+                wrap_up = await self._wrap_up_after_max_rounds(messages, max_tokens)
+                if wrap_up is not None:
+                    if wrap_up.usage:
+                        _total_input_tokens += wrap_up.usage.input_tokens or 0
+                        _total_output_tokens += wrap_up.usage.output_tokens or 0
+                        _total_cache_creation_tokens += (
+                            wrap_up.usage.cache_creation_input_tokens or 0
+                        )
+                        _total_cache_read_tokens += wrap_up.usage.cache_read_input_tokens or 0
+                    reply_text = get_response_text(wrap_up)
+                    thinking_text = get_response_thinking(wrap_up)
+                if not reply_text:
+                    reply_text = _MAX_ROUNDS_FALLBACK
 
         # Collect any messages dropped by reactive trimming (ContextLengthExceededError)
         if self._reactive_trim_dropped:
@@ -1780,6 +1825,54 @@ class ClawboltAgent:
             system_prompt=system_prompt,
             thinking_text=thinking_text,
         )
+
+    async def _wrap_up_after_max_rounds(
+        self,
+        messages: list[AgentMessage],
+        max_tokens: int | None,
+    ) -> MessageResponse | None:
+        """Ask the model, with tools disabled, to tell the user where things stand.
+
+        *messages* already ends with the final round's tool results, each
+        paired with its ``tool_use`` in the preceding assistant message, so
+        the request is valid as-is. The tool schemas are still sent because
+        Anthropic rejects ``tool_use`` history without a ``tools`` param;
+        ``tool_choice`` ``none`` stops new calls on both Anthropic and
+        OpenAI-compatible providers.
+
+        Returns ``None`` when the call fails or its output is not usable as
+        a reply (error or truncated stop reason); the caller then falls back
+        to canned text. Tool calls the provider emits anyway are ignored.
+        """
+        wrap_up_messages = [*messages, UserMessage(content=_MAX_ROUNDS_WRAP_UP_INSTRUCTION)]
+        try:
+            response = await self._call_llm_with_retry(
+                wrap_up_messages,
+                self._get_or_build_tool_schemas(),
+                max_tokens=max_tokens,
+                tool_choice={"type": "none"},
+                purpose=PURPOSE_AGENT_WRAP_UP,
+            )
+            usage_target = await self._resolve_target()
+            await log_llm_usage(
+                self.user.id,
+                usage_target.model,
+                response,
+                PURPOSE_AGENT_WRAP_UP,
+                provider=usage_target.provider,
+                endpoint=usage_target.endpoint,
+                priced=usage_target.priced,
+            )
+        except Exception:
+            logger.exception("Max tool rounds wrap-up call failed; using fallback reply")
+            return None
+        if response.stop_reason not in _VALID_STOP_REASONS or response.stop_reason == "max_tokens":
+            logger.warning(
+                "Max tool rounds wrap-up returned stop_reason=%r; using fallback reply",
+                response.stop_reason,
+            )
+            return None
+        return response
 
     def _find_tool(self, name: str) -> Callable[..., Any] | None:
         """Find a registered tool by name."""

@@ -13,6 +13,7 @@ from any_llm import (
 )
 from pydantic import BaseModel
 
+from backend.app.agent import core as core_module
 from backend.app.agent.core import MAX_TOOL_ROUNDS, ClawboltAgent
 from backend.app.agent.core_support import _is_context_overflow
 from backend.app.agent.messages import (
@@ -23,7 +24,7 @@ from backend.app.agent.messages import (
     ToolResultMessage,
     UserMessage,
 )
-from backend.app.agent.tools.base import Tool, ToolErrorKind, ToolResult
+from backend.app.agent.tools.base import Tool, ToolErrorKind, ToolResult, ToolTags
 from backend.app.agent.trimming import trim_messages
 from backend.app.models import User
 from backend.app.services.llm_service import UserLLMOverride
@@ -594,6 +595,135 @@ async def test_agent_tool_loop_respects_max_rounds(mock_amessages: object, test_
 
     # Should still return a reply (from the last response's content)
     assert response.reply_text == "Still thinking..."
+
+
+def _tool_only_rounds() -> list[object]:
+    """One tool-only response (no text) per allowed round."""
+    return [
+        make_tool_call_response(
+            tool_calls=[
+                {
+                    "id": f"call_{i}",
+                    "name": "recall_facts",
+                    "arguments": json.dumps({"query": f"round {i}"}),
+                }
+            ],
+        )
+        for i in range(MAX_TOOL_ROUNDS)
+    ]
+
+
+def _recall_agent(test_user: User) -> ClawboltAgent:
+    agent = ClawboltAgent(user=test_user)
+    agent.register_tools(
+        [
+            Tool(
+                name="recall_facts",
+                description="Recall facts",
+                function=AsyncMock(return_value=ToolResult(content="some result")),
+                params_model=_QueryParams,
+            ),
+        ]
+    )
+    return agent
+
+
+@patch("backend.app.agent.core.log_llm_usage", new_callable=AsyncMock)
+@patch("backend.app.agent.core.amessages")
+async def test_max_rounds_tool_only_last_round_gets_wrap_up_reply(
+    mock_amessages: AsyncMock, mock_usage: AsyncMock, test_user: User
+) -> None:
+    """Running out of rounds on a tool-only response must not end in silence.
+
+    A tool-less wrap-up call summarizes progress, and its request carries the
+    final round's tool results paired with their tool calls.
+    """
+    mock_amessages.side_effect = [
+        *_tool_only_rounds(),
+        make_text_response("Found three options so far; still need your budget."),
+    ]
+    agent = _recall_agent(test_user)
+
+    response = await agent.process_message("Plan the whole kitchen remodel")
+
+    assert response.reply_text == "Found three options so far; still need your budget."
+    assert response.is_error_fallback is False
+    assert len(response.tool_calls) == MAX_TOOL_ROUNDS
+    assert mock_amessages.call_count == MAX_TOOL_ROUNDS + 1
+
+    wrap_up = mock_amessages.call_args_list[-1].kwargs
+    assert wrap_up["tool_choice"] == {"type": "none"}
+    assert wrap_up["tools"], "tools must stay defined so tool_use history is accepted"
+    sent = wrap_up["messages"]
+    assert sent[-1]["role"] == "user"
+    assert "tool-call limit" in sent[-1]["content"]
+    last_assistant = sent[-3]
+    assert last_assistant["role"] == "assistant"
+    assert last_assistant["content"][-1]["id"] == f"call_{MAX_TOOL_ROUNDS - 1}"
+    tool_results = sent[-2]["content"]
+    assert tool_results[0]["type"] == "tool_result"
+    assert tool_results[0]["tool_use_id"] == f"call_{MAX_TOOL_ROUNDS - 1}"
+
+    # Loop rounds keep their normal tool_choice (unset).
+    assert mock_amessages.call_args_list[0].kwargs["tool_choice"] is None
+    purposes = [c.args[3] for c in mock_usage.call_args_list]
+    assert purposes[-1] == "agent_wrap_up"
+    assert purposes.count("agent_wrap_up") == 1
+
+
+@patch("backend.app.agent.core.amessages")
+async def test_max_rounds_wrap_up_failure_uses_fallback_text(
+    mock_amessages: AsyncMock, test_user: User
+) -> None:
+    """If the wrap-up call raises, the user still gets a canned message."""
+    mock_amessages.side_effect = [*_tool_only_rounds(), RuntimeError("provider down")]
+    agent = _recall_agent(test_user)
+
+    response = await agent.process_message("Plan the whole kitchen remodel")
+
+    assert response.reply_text == core_module._MAX_ROUNDS_FALLBACK
+    # Not an error fallback: the tool work is real and must be persisted.
+    assert response.is_error_fallback is False
+    assert len(response.tool_calls) == MAX_TOOL_ROUNDS
+
+
+@patch("backend.app.agent.core.amessages")
+async def test_max_rounds_wrap_up_empty_uses_fallback_text(
+    mock_amessages: AsyncMock, test_user: User
+) -> None:
+    """An empty wrap-up response also falls back to the canned message."""
+    mock_amessages.side_effect = [*_tool_only_rounds(), make_empty_response()]
+    agent = _recall_agent(test_user)
+
+    response = await agent.process_message("Plan the whole kitchen remodel")
+
+    assert response.reply_text == core_module._MAX_ROUNDS_FALLBACK
+
+
+@patch("backend.app.agent.core.amessages")
+async def test_max_rounds_skips_wrap_up_when_reply_tool_already_sent(
+    mock_amessages: AsyncMock, test_user: User
+) -> None:
+    """A successful reply tool already reached the user, and dispatch would not
+    send reply text anyway, so no wrap-up call is made."""
+    mock_amessages.side_effect = _tool_only_rounds()
+    agent = ClawboltAgent(user=test_user)
+    agent.register_tools(
+        [
+            Tool(
+                name="recall_facts",
+                description="Send a reply",
+                function=AsyncMock(return_value=ToolResult(content="sent")),
+                params_model=_QueryParams,
+                tags={ToolTags.SENDS_REPLY},
+            ),
+        ]
+    )
+
+    response = await agent.process_message("Send me the photo")
+
+    assert mock_amessages.call_count == MAX_TOOL_ROUNDS
+    assert response.reply_text == ""
 
 
 @patch("backend.app.agent.core.amessages")
