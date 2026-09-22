@@ -3404,3 +3404,41 @@ async def test_agent_does_not_retry_a_non_overflow_invalid_request(
         await agent.process_message("Current message")
 
     assert mock_amessages.call_count == 1
+
+
+# The eval replay fits ``max_tokens`` around the thinking budget, and
+# production must send the same shape: Anthropic rejects a request whose
+# ``thinking.budget_tokens`` is not below ``max_tokens``, and the agent's
+# default ``max_tokens`` is smaller than the medium-and-up budgets.
+
+
+@pytest.mark.parametrize("effort", ["medium", "high", "xhigh"])
+@patch("backend.app.agent.core.amessages")
+async def test_a_thinking_budget_fits_under_the_agent_max_tokens(
+    mock_amessages: AsyncMock, test_user: User, effort: str
+) -> None:
+    mock_amessages.return_value = make_text_response("ok")
+    with (
+        patch("backend.app.agent.core.settings.reasoning_effort", effort),
+        patch("backend.app.agent.core.settings.llm_max_tokens_agent", 8192),
+    ):
+        await ClawboltAgent(user=test_user).process_message("hi")
+
+    kwargs = mock_amessages.call_args.kwargs
+    assert kwargs["thinking"]["type"] == "enabled"
+    assert kwargs["max_tokens"] > kwargs["thinking"]["budget_tokens"]
+
+
+@pytest.mark.parametrize("effort", ["auto", "none", "low"])
+@patch("backend.app.agent.core.amessages")
+async def test_max_tokens_is_unchanged_when_no_budget_needs_room(
+    mock_amessages: AsyncMock, test_user: User, effort: str
+) -> None:
+    mock_amessages.return_value = make_text_response("ok")
+    with (
+        patch("backend.app.agent.core.settings.reasoning_effort", effort),
+        patch("backend.app.agent.core.settings.llm_max_tokens_agent", 8192),
+    ):
+        await ClawboltAgent(user=test_user).process_message("hi")
+
+    assert mock_amessages.call_args.kwargs["max_tokens"] == 8192

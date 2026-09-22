@@ -55,6 +55,26 @@ class AdminLLMEvalModelTotals(BaseModel):
     latency_p95_ms: float = 0.0
 
 
+class AdminLLMEvalSideComparison(BaseModel):
+    """How often each model had something, over the turns both answered."""
+
+    candidate_turns: int = 0
+    baseline_turns: int = 0
+    candidate_only: int = 0
+    baseline_only: int = 0
+    p_value: float = 1.0
+
+
+class AdminLLMEvalJudgePreference(BaseModel):
+    """How often the judge preferred each side, over the turns it scored."""
+
+    better: int = 0
+    worse: int = 0
+    judged: int = 0
+    net_worse_rate: float = 0.0
+    p_value: float = 1.0
+
+
 class AdminLLMEvalSummary(BaseModel):
     """The frozen aggregate stored on the run when it completed."""
 
@@ -63,17 +83,33 @@ class AdminLLMEvalSummary(BaseModel):
     turns_failed: int = 0
     agreement_counts: dict[str, int] = Field(default_factory=dict)
     safety_counts: dict[str, int] = Field(default_factory=dict)
-    # Subset of ``safety_counts`` that actually disqualifies a switch. A
+    # The incumbent's findings, by kind. ``None`` on a run recorded before
+    # the incumbent was checked, which is not the same as "had none".
+    baseline_safety_counts: dict[str, int] | None = None
+    # Subset of ``safety_counts`` that counts in the safety comparison. A
     # provider error is recorded above but is a failure to measure, not
     # something the candidate did, so it is excluded here.
     blocking_findings: int = 0
+    # Turns with a safety finding per side, paired, and the one-sided sign
+    # test on the turns only one side had one. ``None`` on older runs.
+    safety_comparison: AdminLLMEvalSideComparison | None = None
+    fabricated_id_comparison: AdminLLMEvalSideComparison | None = None
     judge_counts: dict[str, int] = Field(default_factory=dict)
     # Why the unjudged turns were skipped. Added to ``judge_counts`` these
     # account for every turn, so a report never leaves a silent remainder
     # between the judged count and the turn count.
     judge_skip_counts: dict[str, int] = Field(default_factory=dict)
+    # The judge's verdicts reduced to a net preference; see
+    # ``llm_eval.metrics.JudgePreference``. ``None`` on older runs.
+    judge_preference: AdminLLMEvalJudgePreference | None = None
     identical_rate: float = 0.0
     divergence_rate: float = 0.0
+    # The incumbent's divergence from itself for this user, from the newest
+    # calibration run, and the ceiling this run's divergence was held to.
+    # The floor is ``None`` when no calibration run exists; the threshold is
+    # ``None`` on runs recorded before it was reported.
+    divergence_noise_floor: float | None = None
+    divergence_threshold: float | None = None
     silent_noop_rate: float = 0.0
     # The subset of ``silent_noop_rate`` the judge did not score in the
     # candidate's favor, which is what the recommendation blocks on. Prose is
@@ -176,11 +212,15 @@ class AdminLLMEvalSafetyIssue(BaseModel):
     finding: str
     tool_name: str = ""
     detail: str = ""
-    # Whether this finding disqualifies a switch on its own. Served rather
-    # than re-derived client-side: the set lives in
-    # ``llm_eval.metrics.BLOCKING_FINDINGS`` and a copy in the frontend was a
-    # hand-maintained mirror driving whether a badge reads as an accusation.
+    # Whether this finding counts in the safety comparison between the two
+    # models (``llm_eval.metrics.SAFETY_FINDINGS``), as opposed to one that
+    # describes the fixture or the measurement. Served rather than re-derived
+    # client-side, so the frontend keeps no mirror of the set. One such
+    # finding does not decide a run: the recommendation compares the sides.
     blocking: bool = True
+    # ``baseline`` or ``candidate``. Rows recorded before the incumbent was
+    # checked too carry none, and read as ``candidate``, which they were.
+    side: Literal["baseline", "candidate"] = "candidate"
 
 
 class AdminLLMEvalToolCall(BaseModel):
@@ -188,11 +228,25 @@ class AdminLLMEvalToolCall(BaseModel):
     arguments: dict[str, Any] = Field(default_factory=dict)
 
 
+class AdminLLMEvalLookup(BaseModel):
+    """A lookup the replay fed back from the live turn before the decision."""
+
+    name: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    result: str = ""
+    is_error: bool = False
+
+
 class AdminLLMEvalDecision(BaseModel):
     """One model's decision for one replayed turn."""
 
     text: str = ""
     tool_calls: list[AdminLLMEvalToolCall] = Field(default_factory=list)
+    # Read-only calls the replay answered from the live turn's recorded
+    # results before ``tool_calls``/``text`` above, oldest first. Empty on a
+    # turn decided in one round, and on every run recorded before replays
+    # continued past a first decision.
+    replayed_lookups: list[AdminLLMEvalLookup] = Field(default_factory=list)
     stop_reason: str = ""
     input_tokens: int = 0
     output_tokens: int = 0

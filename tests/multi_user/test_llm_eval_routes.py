@@ -905,3 +905,92 @@ def test_a_run_with_the_judge_off_says_so_rather_than_looking_broken(
 
     response = admin_client.get(f"{BASE}/runs/{run.public_id}")
     assert response.json()["turns"][0]["judge_skip_reason"] == "judge_disabled"
+
+
+def test_report_shows_the_lookups_each_side_made_before_deciding(
+    admin_client: TestClient, consenting_user: User, db_session: Session
+) -> None:
+    run = _make_run(db_session, consenting_user.id)
+    db_session.add_all(
+        [
+            LLMEvalTurnResult(
+                run_id=run.id,
+                message_seq=1,
+                user_message="note the job at 12 Oak St",
+                agreement=str(AgreementClass.IDENTICAL),
+                candidate_replayed_lookups=json.dumps(
+                    [
+                        {
+                            "name": "search",
+                            "arguments": {"q": "12 Oak St"},
+                            "result": "work order 71002",
+                            "is_error": False,
+                        }
+                    ]
+                ),
+            ),
+            # Recorded before replays continued past a first decision.
+            LLMEvalTurnResult(
+                run_id=run.id,
+                message_seq=2,
+                user_message="an older turn",
+                agreement=str(AgreementClass.IDENTICAL),
+            ),
+        ]
+    )
+    db_session.commit()
+
+    response = admin_client.get(f"{BASE}/runs/{run.public_id}")
+    assert response.status_code == 200
+    by_seq = {t["message_seq"]: t for t in response.json()["turns"]}
+    (lookup,) = by_seq[1]["candidate"]["replayed_lookups"]
+    assert lookup["name"] == "search"
+    assert lookup["result"] == "work order 71002"
+    assert by_seq[1]["baseline"]["replayed_lookups"] == []
+    assert by_seq[2]["candidate"]["replayed_lookups"] == []
+
+
+def test_report_says_whose_finding_each_one_is(
+    admin_client: TestClient, consenting_user: User, db_session: Session
+) -> None:
+    """The incumbent is checked too; its findings must not read as the candidate's."""
+    run = _make_run(
+        db_session,
+        consenting_user.id,
+        summary_json={"recommendation": "safe_to_switch", "safety_counts": {}},
+    )
+    db_session.add_all(
+        [
+            LLMEvalTurnResult(
+                run_id=run.id,
+                message_seq=1,
+                user_message="the incumbent guessed",
+                agreement=str(AgreementClass.DIFFERENT_TOOLS),
+                safety_issues=json.dumps(
+                    [{"finding": "fabricated_id", "tool_name": "add_note", "side": "baseline"}]
+                ),
+            ),
+            # Written before sides existed: always the candidate's.
+            LLMEvalTurnResult(
+                run_id=run.id,
+                message_seq=2,
+                user_message="an older finding",
+                agreement=str(AgreementClass.DIFFERENT_TOOLS),
+                safety_issues=json.dumps([{"finding": "unknown_tool", "tool_name": "nope"}]),
+            ),
+        ]
+    )
+    db_session.commit()
+
+    response = admin_client.get(f"{BASE}/runs/{run.public_id}")
+    assert response.status_code == 200
+    body = response.json()
+    turns = body["turns"]
+    # The candidate's finding ranks first; the incumbent's is not evidence
+    # against the candidate.
+    assert [t["message_seq"] for t in turns] == [2, 1]
+    assert turns[0]["safety_issues"][0]["side"] == "candidate"
+    assert turns[1]["safety_issues"][0]["side"] == "baseline"
+    # An older summary has no incumbent counts, which is not "had none".
+    assert body["run"]["summary"]["baseline_safety_counts"] is None
+    assert body["run"]["summary"]["safety_comparison"] is None

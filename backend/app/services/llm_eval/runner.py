@@ -27,17 +27,19 @@ from typing import cast
 from sqlalchemy import CursorResult, func, select, update
 from sqlalchemy.exc import IntegrityError
 
+from backend.app.agent.system_prompt import build_time_user_context
 from backend.app.config import settings
 from backend.app.database import db_session_async
 from backend.app.models import LLMEvalRun, LLMEvalTurnResult, User
 from backend.app.services.llm_endpoints import resolve_target
 from backend.app.services.llm_eval import metrics
 from backend.app.services.llm_eval.execution import call_model
-from backend.app.services.llm_eval.judge import judge_turn
+from backend.app.services.llm_eval.judge import build_judge_context, judge_turn
 from backend.app.services.llm_eval.sampling import (
     ReplayFixture,
     assemble_for_sample,
     build_fixture,
+    sample_clock,
     select_samples,
 )
 from backend.app.services.llm_eval.types import (
@@ -46,11 +48,13 @@ from backend.app.services.llm_eval.types import (
     JudgeVerdict,
     ModelCallResult,
     Recommendation,
+    RecordedToolResult,
     ReplaySample,
     RunStatus,
     RunTargets,
     SafetyFinding,
     SafetyIssue,
+    Side,
     ToolCall,
     TurnComparison,
 )
@@ -114,6 +118,81 @@ _HEARTBEAT_STALE_AFTER = timedelta(minutes=15)
 MAX_CONSECUTIVE_CALL_FAILURES = 3
 
 
+# Stamped on every summary. The replay's shape moves the numbers a run
+# reports: continuing through lookups and grouping batches both change how
+# often two models diverge. A calibration run is only a noise floor for runs
+# measured the same way, so ``divergence_noise_floor`` ignores summaries from
+# another version. Bump it when the replay changes what it measures.
+HARNESS_VERSION = 2
+
+
+def is_self_comparison(run: LLMEvalRun) -> bool:
+    """Whether *run* replays the incumbent against itself, as a calibration run."""
+    return (
+        run.candidate_endpoint,
+        run.candidate_provider,
+        run.candidate_model,
+        run.candidate_reasoning_effort,
+    ) == (
+        run.baseline_endpoint,
+        run.baseline_provider,
+        run.baseline_model,
+        run.baseline_reasoning_effort,
+    )
+
+
+async def divergence_noise_floor(run: LLMEvalRun) -> float | None:
+    """How often this user's incumbent diverges from itself, if it was measured.
+
+    Read from the newest completed calibration run (the incumbent as its own
+    candidate, same endpoint and effort) for the same user, measured by this
+    harness version, over at least ``metrics.MIN_TURNS_FOR_VERDICT`` compared
+    turns: a handful of turns is a sample, not a floor, and a 3-turn run that
+    happened to agree with itself would otherwise set a floor of zero.
+    ``metrics._decide`` cautions on divergence only above
+    this floor plus ``metrics.DIVERGENCE_MARGIN``; without one it uses the
+    uncalibrated ceiling.
+    """
+    async with db_session_async() as db:
+        candidates = (
+            (
+                await db.execute(
+                    select(LLMEvalRun)
+                    .where(
+                        LLMEvalRun.user_id == run.user_id,
+                        LLMEvalRun.id != run.id,
+                        LLMEvalRun.status == str(RunStatus.COMPLETED),
+                        LLMEvalRun.baseline_endpoint == run.baseline_endpoint,
+                        LLMEvalRun.baseline_provider == run.baseline_provider,
+                        LLMEvalRun.baseline_model == run.baseline_model,
+                        LLMEvalRun.baseline_reasoning_effort == run.baseline_reasoning_effort,
+                        LLMEvalRun.candidate_endpoint == LLMEvalRun.baseline_endpoint,
+                        LLMEvalRun.candidate_provider == LLMEvalRun.baseline_provider,
+                        LLMEvalRun.candidate_model == LLMEvalRun.baseline_model,
+                        LLMEvalRun.candidate_reasoning_effort
+                        == LLMEvalRun.baseline_reasoning_effort,
+                    )
+                    .order_by(LLMEvalRun.completed_at.desc())
+                    .limit(10)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    for calibration in candidates:
+        summary = calibration.summary_json or {}
+        rate = summary.get("divergence_rate")
+        completed = summary.get("turns_completed")
+        if (
+            summary.get("harness_version") == HARNESS_VERSION
+            and isinstance(rate, int | float)
+            and isinstance(completed, int)
+            and completed >= metrics.MIN_TURNS_FOR_VERDICT
+        ):
+            return float(rate)
+    return None
+
+
 class _CancellationWatcher:
     """Caches the cancelled flag for a run across closely-spaced checks."""
 
@@ -171,6 +250,27 @@ def _serialize_calls(calls: list[ToolCall]) -> str:
     )
 
 
+def _serialize_lookups(lookups: list[RecordedToolResult]) -> str:
+    """The lookups a side replayed before its decision, results included.
+
+    Results are kept so the drill-down can show what the model read before
+    it decided. They are the live turn's own recorded results, already in
+    the user's history, and the column is encrypted like the rest.
+    """
+    return json.dumps(
+        [
+            {
+                "name": item.name,
+                "arguments": item.arguments,
+                "result": item.result,
+                "is_error": item.is_error,
+            }
+            for item in lookups
+        ],
+        default=str,
+    )
+
+
 def _turn_row(run_id: int, comparison: TurnComparison) -> LLMEvalTurnResult:
     sample = comparison.sample
     base = comparison.baseline
@@ -179,11 +279,12 @@ def _turn_row(run_id: int, comparison: TurnComparison) -> LLMEvalTurnResult:
         run_id=run_id,
         message_seq=sample.seq,
         message_timestamp=sample.timestamp,
-        user_message=sample.message_context,
+        user_message=sample.user_text,
         historic_reply=sample.historic_reply,
         historic_tool_names=json.dumps(sample.historic_tool_names),
         baseline_text=base.text,
         baseline_tool_calls=_serialize_calls(base.tool_calls),
+        baseline_replayed_lookups=_serialize_lookups(base.replayed_lookups),
         baseline_stop_reason=base.stop_reason or "",
         baseline_input_tokens=base.input_tokens,
         baseline_output_tokens=base.output_tokens,
@@ -193,6 +294,7 @@ def _turn_row(run_id: int, comparison: TurnComparison) -> LLMEvalTurnResult:
         baseline_error=base.error,
         candidate_text=cand.text,
         candidate_tool_calls=_serialize_calls(cand.tool_calls),
+        candidate_replayed_lookups=_serialize_lookups(cand.replayed_lookups),
         candidate_stop_reason=cand.stop_reason or "",
         candidate_input_tokens=cand.input_tokens,
         candidate_output_tokens=cand.output_tokens,
@@ -207,6 +309,7 @@ def _turn_row(run_id: int, comparison: TurnComparison) -> LLMEvalTurnResult:
                     "finding": str(issue.finding),
                     "tool_name": issue.tool_name,
                     "detail": issue.detail,
+                    "side": str(issue.side),
                 }
                 for issue in comparison.safety_issues
             ]
@@ -225,36 +328,48 @@ async def _compare_turn(
     """Replay one turn through both models and score the result."""
     assembled = await assemble_for_sample(fixture, sample)
 
+    # Both sides may continue through lookups the live turn also made, fed
+    # the recorded results; nothing is executed. See ``call_model``.
     baseline, candidate = await asyncio.gather(
         call_model(
             assembled,
             fixture.tool_schemas,
             target=targets.baseline,
             reasoning_effort=targets.baseline_reasoning_effort,
+            tools_by_name=fixture.tools_by_name,
+            recorded=sample.historic_tool_results,
         ),
         call_model(
             assembled,
             fixture.tool_schemas,
             target=targets.candidate,
             reasoning_effort=targets.candidate_reasoning_effort,
+            tools_by_name=fixture.tools_by_name,
+            recorded=sample.historic_tool_results,
         ),
     )
 
-    safety_issues = metrics.check_safety(
-        candidate,
-        baseline,
-        fixture.tools_by_name,
-        historic_tool_names=sample.historic_tool_names,
-    )
-    if baseline.error and not candidate.error:
-        # ``check_safety`` only inspects the candidate, so an incumbent-side
-        # provider error would otherwise leave the turn with no marker at all.
-        safety_issues.append(
-            SafetyIssue(
-                finding=SafetyFinding.CALL_FAILED,
-                detail=f"incumbent call failed: {baseline.error}",
-            )
-        )
+    # Both sides get the same checks against the same evidence. Checking only
+    # the candidate charged it for everything the incumbent also did.
+    seen = metrics.prompt_text(assembled.messages)
+    safety_issues = [
+        *metrics.check_safety(
+            candidate,
+            baseline,
+            fixture.tools_by_name,
+            historic_tool_names=sample.historic_tool_names,
+            seen=seen,
+            side=Side.CANDIDATE,
+        ),
+        *metrics.check_safety(
+            baseline,
+            candidate,
+            fixture.tools_by_name,
+            historic_tool_names=sample.historic_tool_names,
+            seen=seen,
+            side=Side.BASELINE,
+        ),
+    ]
     comparison = TurnComparison(
         sample=sample,
         baseline=baseline,
@@ -272,19 +387,14 @@ async def _compare_turn(
         safety_issues=safety_issues,
     )
 
-    # Judge only what is both informative and still in the running: an
-    # identical decision needs no opinion, a turn already disqualified by a
-    # blocking finding cannot be rescued by a judge, and two models that
-    # produced the same prose have nothing to separate them. That last case is
-    # not just wasted spend: a verdict on it would land in the denominator of
-    # the judged-worse rate and dilute the turns that matter.
+    # Judge only what is informative: an identical decision needs no opinion,
+    # and two models that produced the same prose have nothing to separate
+    # them. That last case is not just wasted spend: a verdict on it would
+    # land in the judged denominator and dilute the turns that matter.
     #
-    # The gate is *blocking* findings, not any finding. A non-blocking mark
-    # (a provider error on the incumbent side, or a tool name the fixture
-    # carries but the schema no longer has) says nothing about whether the
-    # candidate chose well, and skipping the judge on those left them sorted
-    # to the top of the report wearing a red badge with no explanation
-    # underneath it.
+    # Turns with safety findings are judged like any other. One finding no
+    # longer disqualifies a run, so the judge's preference and its unsafe
+    # flags on those turns are evidence the recommendation still needs.
     same_prose = (
         comparison.agreement is AgreementClass.BOTH_REPLIED
         and baseline.text.strip() == candidate.text.strip()
@@ -294,9 +404,22 @@ async def _compare_turn(
     )
     comparison.judge_skip_reason = skip_reason
     if skip_reason is None:
-        verdict, rationale = await judge_turn(sample, baseline, candidate, target=targets.judge)
-        comparison.judge_verdict = verdict
-        comparison.judge_rationale = rationale
+        context = build_judge_context(
+            assembled, build_time_user_context(fixture.user, sample_clock(sample))
+        )
+        outcome = await judge_turn(
+            sample, baseline, candidate, target=targets.judge, context=context
+        )
+        comparison.judge_verdict = outcome.verdict
+        comparison.judge_rationale = outcome.rationale
+        comparison.safety_issues.extend(
+            SafetyIssue(
+                finding=SafetyFinding.JUDGED_UNSAFE,
+                detail=outcome.rationale,
+                side=side,
+            )
+            for side in sorted(outcome.unsafe)
+        )
 
     return comparison
 
@@ -318,8 +441,6 @@ def _judge_skip_reason(
         return JudgeSkipReason.IDENTICAL
     if same_prose:
         return JudgeSkipReason.SAME_PROSE
-    if comparison.has_blocking_finding:
-        return JudgeSkipReason.BLOCKING_FINDING
     return None
 
 
@@ -429,7 +550,7 @@ async def execute_run(run_id: int, *, concurrency: int) -> None:
                     # Recorded so the turn carries the same marker as a turn
                     # whose provider call returned an error, rather than
                     # sorting to the bottom of the report with no badge. It is
-                    # not a blocking finding; see ``BLOCKING_FINDINGS``.
+                    # not a safety finding; see ``SAFETY_FINDINGS``.
                     safety_issues=[SafetyIssue(finding=SafetyFinding.CALL_FAILED, detail=detail)],
                     judge_verdict=JudgeVerdict.NOT_JUDGED,
                 )
@@ -490,7 +611,18 @@ async def execute_run(run_id: int, *, concurrency: int) -> None:
         raise
 
     comparisons.sort(key=lambda c: c.sample.seq)
-    aggregate = metrics.aggregate(comparisons, targets)
+    self_comparison = is_self_comparison(run)
+    aggregate = metrics.aggregate(
+        comparisons,
+        targets,
+        divergence_noise_floor=None if self_comparison else await divergence_noise_floor(run),
+    )
+    if self_comparison:
+        aggregate.warnings.append(
+            f"This run replays the incumbent against itself. Its divergence rate, "
+            f"{aggregate.divergence_rate:.0%}, is the noise floor later runs against this "
+            f"incumbent for this user are measured against."
+        )
     if breaker_error:
         # The evidence gathered before the provider went down is kept and
         # still readable, but it cannot endorse a switch: the run stopped
@@ -517,7 +649,7 @@ async def execute_run(run_id: int, *, concurrency: int) -> None:
         summary=_summary_payload(aggregate),
     )
     logger.info(
-        "LLM eval run %d complete: %s (%d turns, %d blocking findings)",
+        "LLM eval run %d complete: %s (%d turns, %d candidate safety findings)",
         run_id,
         aggregate.recommendation,
         aggregate.turns_completed,
@@ -550,16 +682,25 @@ def _summary_payload(aggregate: metrics.RunAggregate) -> dict:
     silently rewrites the verdict of a run an operator already acted on.
     """
     return {
+        "harness_version": HARNESS_VERSION,
         "turns_total": aggregate.turns_total,
         "turns_completed": aggregate.turns_completed,
         "turns_failed": aggregate.turns_failed,
         "agreement_counts": aggregate.agreement_counts,
         "safety_counts": aggregate.safety_counts,
+        "baseline_safety_counts": aggregate.baseline_safety_counts,
         "blocking_findings": aggregate.blocking_turns,
+        "safety_comparison": aggregate.safety.payload(),
+        "fabricated_id_comparison": aggregate.fabricated_ids.payload(),
         "judge_counts": aggregate.judge_counts,
         "judge_skip_counts": aggregate.judge_skip_counts,
+        "judge_preference": metrics.judge_preference(aggregate).payload(),
         "identical_rate": round(aggregate.identical_rate, 4),
         "divergence_rate": round(aggregate.divergence_rate, 4),
+        "divergence_noise_floor": aggregate.divergence_noise_floor,
+        "divergence_threshold": round(
+            metrics.divergence_threshold(aggregate.divergence_noise_floor), 4
+        ),
         "silent_noop_rate": round(aggregate.silent_noop_rate, 4),
         "silent_noop_blocking_rate": round(aggregate.silent_noop_blocking_rate, 4),
         "baseline": _model_totals_payload(aggregate.baseline),

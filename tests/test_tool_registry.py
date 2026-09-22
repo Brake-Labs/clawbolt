@@ -547,7 +547,7 @@ async def test_read_only_is_never_combined_with_a_mutating_tag() -> None:
 
 # Every tool that writes, sends, uploads, or deletes. The complement of
 # ``ToolTags.READ_ONLY``, kept as an explicit roster so a new tool cannot ship
-# unclassified: ``llm_eval.metrics._is_mutating`` reads "not READ_ONLY" as
+# unclassified: ``llm_eval.metrics.is_mutating_call`` reads "not READ_ONLY" as
 # "this call would mutate a real account" and blocks a model switch on it, so
 # an unconsidered default is a wrong answer in one direction or the other.
 # Adding a name here is a claim that calling it changes something a user would
@@ -655,7 +655,7 @@ async def test_the_classification_sweep_reaches_the_integration_tools() -> None:
 
 
 async def test_every_tool_is_classified_read_or_write() -> None:
-    """``_is_mutating`` reads "not READ_ONLY" as "this writes", so decide once.
+    """``is_mutating_call`` reads "not READ_ONLY" as "this writes", so decide once.
 
     The evaluator blocks a model switch on a single unrequested mutation, so
     both mistakes are expensive: a read left untagged sinks a run over a

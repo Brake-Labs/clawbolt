@@ -5772,6 +5772,13 @@
             "type": "array",
             "title": "Tool Calls"
           },
+          "replayed_lookups": {
+            "items": {
+              "$ref": "#/components/schemas/AdminLLMEvalLookup"
+            },
+            "type": "array",
+            "title": "Replayed Lookups"
+          },
           "stop_reason": {
             "type": "string",
             "title": "Stop Reason",
@@ -5811,6 +5818,67 @@
         "type": "object",
         "title": "AdminLLMEvalDecision",
         "description": "One model's decision for one replayed turn."
+      },
+      "AdminLLMEvalJudgePreference": {
+        "properties": {
+          "better": {
+            "type": "integer",
+            "title": "Better",
+            "default": 0
+          },
+          "worse": {
+            "type": "integer",
+            "title": "Worse",
+            "default": 0
+          },
+          "judged": {
+            "type": "integer",
+            "title": "Judged",
+            "default": 0
+          },
+          "net_worse_rate": {
+            "type": "number",
+            "title": "Net Worse Rate",
+            "default": 0.0
+          },
+          "p_value": {
+            "type": "number",
+            "title": "P Value",
+            "default": 1.0
+          }
+        },
+        "type": "object",
+        "title": "AdminLLMEvalJudgePreference",
+        "description": "How often the judge preferred each side, over the turns it scored."
+      },
+      "AdminLLMEvalLookup": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "arguments": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Arguments"
+          },
+          "result": {
+            "type": "string",
+            "title": "Result",
+            "default": ""
+          },
+          "is_error": {
+            "type": "boolean",
+            "title": "Is Error",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "title": "AdminLLMEvalLookup",
+        "description": "A lookup the replay fed back from the live turn before the decision."
       },
       "AdminLLMEvalModelTotals": {
         "properties": {
@@ -6225,6 +6293,15 @@
             "type": "boolean",
             "title": "Blocking",
             "default": true
+          },
+          "side": {
+            "type": "string",
+            "enum": [
+              "baseline",
+              "candidate"
+            ],
+            "title": "Side",
+            "default": "candidate"
           }
         },
         "type": "object",
@@ -6232,6 +6309,38 @@
           "finding"
         ],
         "title": "AdminLLMEvalSafetyIssue"
+      },
+      "AdminLLMEvalSideComparison": {
+        "properties": {
+          "candidate_turns": {
+            "type": "integer",
+            "title": "Candidate Turns",
+            "default": 0
+          },
+          "baseline_turns": {
+            "type": "integer",
+            "title": "Baseline Turns",
+            "default": 0
+          },
+          "candidate_only": {
+            "type": "integer",
+            "title": "Candidate Only",
+            "default": 0
+          },
+          "baseline_only": {
+            "type": "integer",
+            "title": "Baseline Only",
+            "default": 0
+          },
+          "p_value": {
+            "type": "number",
+            "title": "P Value",
+            "default": 1.0
+          }
+        },
+        "type": "object",
+        "title": "AdminLLMEvalSideComparison",
+        "description": "How often each model had something, over the turns both answered."
       },
       "AdminLLMEvalSummary": {
         "properties": {
@@ -6264,10 +6373,44 @@
             "type": "object",
             "title": "Safety Counts"
           },
+          "baseline_safety_counts": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "integer"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Baseline Safety Counts"
+          },
           "blocking_findings": {
             "type": "integer",
             "title": "Blocking Findings",
             "default": 0
+          },
+          "safety_comparison": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AdminLLMEvalSideComparison"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "fabricated_id_comparison": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AdminLLMEvalSideComparison"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "judge_counts": {
             "additionalProperties": {
@@ -6283,6 +6426,16 @@
             "type": "object",
             "title": "Judge Skip Counts"
           },
+          "judge_preference": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AdminLLMEvalJudgePreference"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "identical_rate": {
             "type": "number",
             "title": "Identical Rate",
@@ -6292,6 +6445,28 @@
             "type": "number",
             "title": "Divergence Rate",
             "default": 0.0
+          },
+          "divergence_noise_floor": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Divergence Noise Floor"
+          },
+          "divergence_threshold": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Divergence Threshold"
           },
           "silent_noop_rate": {
             "type": "number",

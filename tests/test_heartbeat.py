@@ -3984,3 +3984,58 @@ async def test_heartbeat_auto_approves_send_media_reply(user: User) -> None:
     assert other_tool.approval_policy is not None, (
         "non-messaging tools should retain their approval_policy"
     )
+
+
+class TestHeartbeatThinkingBudgetFits:
+    """A thinking budget must stay below ``max_tokens``, as in the agent loop."""
+
+    @pytest.mark.parametrize(("effort", "fits"), [("high", True), ("auto", False)])
+    @patch("backend.app.agent.heartbeat.log_llm_usage")
+    @patch("backend.app.agent.heartbeat.build_heartbeat_system_prompt", new_callable=AsyncMock)
+    @patch("backend.app.agent.heartbeat.HeartbeatStore")
+    @patch("backend.app.agent.heartbeat.get_session_store")
+    @patch("backend.app.agent.heartbeat.settings")
+    @patch("backend.app.agent.heartbeat.amessages_streamed")
+    async def test_max_tokens_makes_room_for_the_budget(
+        self,
+        mock_llm: AsyncMock,
+        mock_settings: MagicMock,
+        mock_get_session_store: MagicMock,
+        mock_heartbeat_store_cls: MagicMock,
+        mock_build_prompt: AsyncMock,
+        mock_log_usage: MagicMock,
+        user: User,
+        effort: str,
+        fits: bool,
+    ) -> None:
+        mock_settings.llm_model = "claude-sonnet-4-5"
+        mock_settings.llm_provider = "anthropic"
+        mock_settings.llm_api_base = None
+        mock_settings.llm_endpoint = ""
+        mock_settings.vision_endpoint = ""
+        mock_settings.heartbeat_endpoint = ""
+        mock_settings.compaction_endpoint = ""
+        mock_settings.heartbeat_model = ""
+        mock_settings.heartbeat_provider = ""
+        mock_settings.llm_max_tokens_heartbeat = 256
+        mock_settings.heartbeat_recent_messages_count = 5
+        mock_settings.reasoning_effort = effort
+
+        mock_session_store = MagicMock()
+        mock_session_store.get_recent_messages_async = AsyncMock(return_value=[])
+        mock_get_session_store.return_value = mock_session_store
+        mock_hb_store = MagicMock()
+        mock_hb_store.read_heartbeat_md_async = AsyncMock(return_value="")
+        mock_hb_store.get_recent_logs = AsyncMock(return_value=[])
+        mock_heartbeat_store_cls.return_value = mock_hb_store
+        mock_build_prompt.return_value = "system prompt"
+        mock_llm.return_value = _make_decision_tool_call(action="skip", tasks="", reasoning="test")
+
+        await evaluate_heartbeat_need(user)
+
+        kwargs = mock_llm.call_args.kwargs
+        if fits:
+            assert kwargs["max_tokens"] > kwargs["thinking"]["budget_tokens"]
+        else:
+            assert "thinking" not in kwargs
+            assert kwargs["max_tokens"] == 256

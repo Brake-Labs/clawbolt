@@ -19,9 +19,13 @@ from pydantic import BaseModel
 from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
 
-from backend.app.agent.tools.base import Tool, ToolResult
+from backend.app.agent.core import AssembledPrompt
+from backend.app.agent.messages import SystemMessage, UserMessage
+from backend.app.agent.tools.base import Tool, ToolResult, ToolTags
 from backend.app.models import LLMEvalRun, LLMEvalTurnResult, User
+from backend.app.services.llm_eval.judge import JudgeOutcome
 from backend.app.services.llm_eval.runner import (
+    HARNESS_VERSION,
     MAX_CONSECUTIVE_CALL_FAILURES,
     execute_run,
     mark_interrupted_runs,
@@ -32,9 +36,11 @@ from backend.app.services.llm_eval.types import (
     JudgeVerdict,
     ModelCallResult,
     Recommendation,
+    RecordedToolResult,
     ReplaySample,
     RunStatus,
     SafetyFinding,
+    Side,
     ToolCall,
 )
 from backend.app.services.llm_service import LLMTarget
@@ -81,6 +87,20 @@ def _samples(count: int) -> list[ReplaySample]:
     ]
 
 
+def _assembled() -> AssembledPrompt:
+    """A real assembled prompt: the judge renders its history into context."""
+    return AssembledPrompt(
+        messages=[
+            SystemMessage(content="system"),
+            UserMessage(content="earlier ask"),
+            UserMessage(content="current ask"),
+        ],
+        stable_system="system",
+        dynamic_context="",
+        system_prompt="system",
+    )
+
+
 def _patched_run(
     *,
     samples: list[ReplaySample],
@@ -101,7 +121,7 @@ def _patched_run(
         ),
         patch(
             "backend.app.services.llm_eval.runner.assemble_for_sample",
-            AsyncMock(return_value=object()),
+            AsyncMock(return_value=_assembled()),
         ),
         patch(
             "backend.app.services.llm_eval.runner.call_model",
@@ -130,6 +150,7 @@ def _lookup_tool(function: Callable[..., Awaitable[ToolResult]] | None = None) -
         description="lookup",
         function=function or _unused,
         params_model=_LookupParams,
+        tags={ToolTags.READ_ONLY},
     )
 
 
@@ -618,7 +639,7 @@ async def test_a_non_blocking_finding_does_not_suppress_the_judge(
     candidate = _result(tools=[ToolCall(name="retired", arguments={})])
     calls = iter([baseline, candidate])
 
-    judge = AsyncMock(return_value=(JudgeVerdict.CANDIDATE_WORSE, "worse because"))
+    judge = AsyncMock(return_value=JudgeOutcome(JudgeVerdict.CANDIDATE_WORSE, "worse because"))
     patches = _patched_run(
         samples=samples,
         call_side_effect=lambda *a, **k: next(calls),
@@ -642,16 +663,26 @@ async def test_a_non_blocking_finding_does_not_suppress_the_judge(
     assert row.judge_verdict == str(JudgeVerdict.CANDIDATE_WORSE)
 
 
-async def test_a_blocking_finding_still_suppresses_the_judge(
+async def test_a_turn_with_a_safety_finding_is_still_judged(
     db_session: Session, test_user: User
 ) -> None:
-    """A disqualified turn cannot be rescued, so the judge call is wasted spend."""
+    """Regression: a turn with a finding skipped the judge as already disqualified.
+
+    One finding no longer decides a run, so the judge's preference and its
+    unsafe flags on that turn are evidence the recommendation still needs.
+    The flags land as findings on the side the judge named, the incumbent's
+    included.
+    """
     run_id = _make_run(db_session, test_user.id, samples=1, judge=True)
     baseline = _result(tools=[ToolCall(name="lookup", arguments={"q": "a"})])
     candidate = _result(tools=[ToolCall(name="invented", arguments={})])
     calls = iter([baseline, candidate])
 
-    judge = AsyncMock(return_value=(JudgeVerdict.EQUIVALENT, ""))
+    judge = AsyncMock(
+        return_value=JudgeOutcome(
+            JudgeVerdict.CANDIDATE_WORSE, "invented a tool", frozenset({Side.BASELINE})
+        )
+    )
     patches = _patched_run(
         samples=_samples(1),
         call_side_effect=lambda *a, **k: next(calls),
@@ -669,11 +700,40 @@ async def test_a_blocking_finding_still_suppresses_the_judge(
     row = db_session.execute(
         select(LLMEvalTurnResult).where(LLMEvalTurnResult.run_id == run_id)
     ).scalar_one()
-    assert [i["finding"] for i in json.loads(row.safety_issues)] == [
-        str(SafetyFinding.UNKNOWN_TOOL)
+    assert judge.await_count == 1
+    assert row.judge_verdict == str(JudgeVerdict.CANDIDATE_WORSE)
+    assert [(i["finding"], i["side"]) for i in json.loads(row.safety_issues)] == [
+        (str(SafetyFinding.UNKNOWN_TOOL), "candidate"),
+        (str(SafetyFinding.JUDGED_UNSAFE), "baseline"),
     ]
-    assert judge.await_count == 0
-    assert row.judge_verdict == str(JudgeVerdict.NOT_JUDGED)
+
+
+async def test_the_incumbents_findings_are_recorded_too(
+    db_session: Session, test_user: User
+) -> None:
+    """Regression: ``check_safety`` only ever inspected the candidate."""
+    run_id = _make_run(db_session, test_user.id, samples=1)
+    baseline = _result(tools=[ToolCall(name="invented", arguments={})])
+    candidate = _result(tools=[ToolCall(name="lookup", arguments={"q": "a"})])
+    calls = iter([baseline, candidate])
+    patches = _patched_run(
+        samples=_samples(1),
+        call_side_effect=lambda *a, **k: next(calls),
+        tools_by_name={"lookup": _lookup_tool()},
+    )
+    with patches[0], patches[1], patches[2], patches[3]:
+        await execute_run(run_id, concurrency=1)
+
+    row = db_session.execute(
+        select(LLMEvalTurnResult).where(LLMEvalTurnResult.run_id == run_id)
+    ).scalar_one()
+    assert [(i["finding"], i["side"]) for i in json.loads(row.safety_issues)] == [
+        (str(SafetyFinding.UNKNOWN_TOOL), "baseline")
+    ]
+    run = db_session.execute(select(LLMEvalRun).where(LLMEvalRun.id == run_id)).scalar_one()
+    assert run.summary_json is not None
+    assert run.summary_json["baseline_safety_counts"] == {str(SafetyFinding.UNKNOWN_TOOL): 1}
+    assert run.summary_json["safety_comparison"]["baseline_only"] == 1
 
 
 async def test_the_summary_records_why_each_turn_went_unjudged(
@@ -694,3 +754,194 @@ async def test_the_summary_records_why_each_turn_went_unjudged(
     summary = run.summary_json
     assert summary is not None
     assert summary["judge_skip_counts"] == {str(JudgeSkipReason.IDENTICAL): 2}
+
+
+# ---------------------------------------------------------------------------
+# Lookups replayed from the live turn, and the judge's context
+# ---------------------------------------------------------------------------
+
+
+async def test_each_side_is_offered_the_live_turns_recorded_lookups(
+    db_session: Session, test_user: User
+) -> None:
+    """The replay can only continue past a lookup the live turn made."""
+    run_id = _make_run(db_session, test_user.id, samples=1)
+    recorded = (RecordedToolResult(name="lookup", arguments={"q": "a"}, result="id 42"),)
+    samples = [
+        ReplaySample(
+            seq=1,
+            timestamp="2026-05-01T12:00:00+00:00",
+            message_context="note it on the job",
+            historic_tool_names=["lookup"],
+            historic_tool_results=recorded,
+        )
+    ]
+    seen: list[Any] = []
+
+    async def record(*_args: object, **kwargs: Any) -> ModelCallResult:
+        seen.append(kwargs["recorded"])
+        result = _result(tools=[ToolCall(name="lookup", arguments={"q": "b"})])
+        result.replayed_lookups = list(recorded)
+        return result
+
+    a, b, c, d = _patched_run(
+        samples=samples, call_side_effect=record, tools_by_name={"lookup": _lookup_tool()}
+    )
+    with a, b, c, d:
+        await execute_run(run_id, concurrency=1)
+
+    assert seen == [recorded, recorded]
+    row = db_session.execute(
+        select(LLMEvalTurnResult).where(LLMEvalTurnResult.run_id == run_id)
+    ).scalar_one()
+    stored = json.loads(row.candidate_replayed_lookups)
+    assert stored == [
+        {"name": "lookup", "arguments": {"q": "a"}, "result": "id 42", "is_error": False}
+    ]
+
+
+async def test_the_judge_is_given_the_conversation_and_the_turns_clock(
+    db_session: Session, test_user: User
+) -> None:
+    """Regression: the judge saw only the user's latest message.
+
+    It called correct answers made up when the fact came from an earlier
+    turn, and resolved relative dates against no date at all.
+    """
+    run_id = _make_run(db_session, test_user.id, samples=1, judge=True)
+    baseline = _result(tools=[ToolCall(name="lookup", arguments={"q": "a"})])
+    candidate = _result(text="done")
+    calls = iter([baseline, candidate])
+    judge = AsyncMock(return_value=JudgeOutcome(JudgeVerdict.EQUIVALENT, ""))
+    patches = _patched_run(
+        samples=_samples(1),
+        call_side_effect=lambda *a, **k: next(calls),
+        tools_by_name={"lookup": _lookup_tool()},
+    )
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patches[3],
+        patch("backend.app.services.llm_eval.runner.judge_turn", judge),
+    ):
+        await execute_run(run_id, concurrency=1)
+
+    context = judge.await_args_list[-1].kwargs["context"]
+    assert "earlier ask" in context.transcript
+    assert "current ask" not in context.transcript
+    assert "2026-05-01" in context.current_time
+
+
+# ---------------------------------------------------------------------------
+# Calibrating divergence with the incumbent against itself
+# ---------------------------------------------------------------------------
+
+
+def _calibration_run(
+    db: Session,
+    user_id: str,
+    *,
+    divergence: float,
+    version: int,
+    turns: int = 100,
+    completed_at: datetime | None = None,
+) -> None:
+    db.add(
+        LLMEvalRun(
+            user_id=user_id,
+            baseline_provider="anthropic",
+            baseline_model="incumbent",
+            candidate_provider="anthropic",
+            candidate_model="incumbent",
+            requested_samples=100,
+            status=str(RunStatus.COMPLETED),
+            completed_at=completed_at or datetime.now(UTC),
+            summary_json={
+                "harness_version": version,
+                "divergence_rate": divergence,
+                "turns_completed": turns,
+            },
+        )
+    )
+    db.commit()
+
+
+async def test_a_calibration_run_sets_the_divergence_noise_floor(
+    db_session: Session, test_user: User
+) -> None:
+    _calibration_run(db_session, test_user.id, divergence=0.9, version=HARNESS_VERSION - 1)
+    _calibration_run(db_session, test_user.id, divergence=0.38, version=HARNESS_VERSION)
+    run_id = _make_run(db_session, test_user.id, samples=1)
+    a, b, c, d = _patched_run(samples=_samples(1), call_side_effect=lambda *a, **k: _result("ok"))
+    with a, b, c, d:
+        await execute_run(run_id, concurrency=1)
+
+    run = db_session.execute(select(LLMEvalRun).where(LLMEvalRun.id == run_id)).scalar_one()
+    assert run.summary_json is not None
+    assert run.summary_json["divergence_noise_floor"] == 0.38
+    assert run.summary_json["divergence_threshold"] == 0.48
+    assert run.summary_json["harness_version"] == HARNESS_VERSION
+
+
+async def test_a_calibration_run_too_short_for_a_verdict_is_ignored(
+    db_session: Session, test_user: User
+) -> None:
+    now = datetime.now(UTC)
+    _calibration_run(
+        db_session,
+        test_user.id,
+        divergence=0.38,
+        version=HARNESS_VERSION,
+        completed_at=now - timedelta(days=1),
+    )
+    _calibration_run(
+        db_session, test_user.id, divergence=0.0, version=HARNESS_VERSION, turns=3, completed_at=now
+    )
+    run_id = _make_run(db_session, test_user.id, samples=1)
+    a, b, c, d = _patched_run(samples=_samples(1), call_side_effect=lambda *a, **k: _result("ok"))
+    with a, b, c, d:
+        await execute_run(run_id, concurrency=1)
+
+    run = db_session.execute(select(LLMEvalRun).where(LLMEvalRun.id == run_id)).scalar_one()
+    assert run.summary_json is not None
+    assert run.summary_json["divergence_noise_floor"] == 0.38
+
+
+async def test_only_a_short_calibration_run_leaves_divergence_uncalibrated(
+    db_session: Session, test_user: User
+) -> None:
+    _calibration_run(db_session, test_user.id, divergence=0.1, version=HARNESS_VERSION, turns=3)
+    run_id = _make_run(db_session, test_user.id, samples=1)
+    a, b, c, d = _patched_run(samples=_samples(1), call_side_effect=lambda *a, **k: _result("ok"))
+    with a, b, c, d:
+        await execute_run(run_id, concurrency=1)
+
+    run = db_session.execute(select(LLMEvalRun).where(LLMEvalRun.id == run_id)).scalar_one()
+    assert run.summary_json is not None
+    assert run.summary_json["divergence_noise_floor"] is None
+
+
+async def test_a_self_comparison_run_says_it_is_the_calibration(
+    db_session: Session, test_user: User
+) -> None:
+    run = LLMEvalRun(
+        user_id=test_user.id,
+        baseline_provider="anthropic",
+        baseline_model="incumbent",
+        candidate_provider="anthropic",
+        candidate_model="incumbent",
+        requested_samples=1,
+        status=str(RunStatus.PENDING),
+    )
+    db_session.add(run)
+    db_session.commit()
+    a, b, c, d = _patched_run(samples=_samples(1), call_side_effect=lambda *a, **k: _result("ok"))
+    with a, b, c, d:
+        await execute_run(run.id, concurrency=1)
+
+    db_session.expire_all()
+    stored = db_session.execute(select(LLMEvalRun).where(LLMEvalRun.id == run.id)).scalar_one()
+    assert stored.summary_json is not None
+    assert stored.summary_json["divergence_noise_floor"] is None
+    assert any("against itself" in w for w in stored.summary_json["warnings"])

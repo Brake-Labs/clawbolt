@@ -141,6 +141,12 @@ class LLMEvalTurnResult(Base):
     baseline_tool_calls: Mapped[str] = mapped_column(
         EncryptedString(table="llm_eval_turn_results", column="baseline_tool_calls"), default=""
     )
+    # Lookups the replay fed back from the live turn before the scored
+    # decision above, with their recorded results. See ``llm_eval.execution``.
+    baseline_replayed_lookups: Mapped[str] = mapped_column(
+        EncryptedString(table="llm_eval_turn_results", column="baseline_replayed_lookups"),
+        default="",
+    )
     baseline_stop_reason: Mapped[str] = mapped_column(String(64), default="")
     baseline_input_tokens: Mapped[int] = mapped_column(Integer, default=0)
     baseline_output_tokens: Mapped[int] = mapped_column(Integer, default=0)
@@ -154,6 +160,10 @@ class LLMEvalTurnResult(Base):
     )
     candidate_tool_calls: Mapped[str] = mapped_column(
         EncryptedString(table="llm_eval_turn_results", column="candidate_tool_calls"), default=""
+    )
+    candidate_replayed_lookups: Mapped[str] = mapped_column(
+        EncryptedString(table="llm_eval_turn_results", column="candidate_replayed_lookups"),
+        default="",
     )
     candidate_stop_reason: Mapped[str] = mapped_column(String(64), default="")
     candidate_input_tokens: Mapped[int] = mapped_column(Integer, default=0)

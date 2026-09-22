@@ -29,8 +29,8 @@ import { ACTIVE_STATUSES, POLL_MS, RECOMMENDATION_COPY } from './model-eval-comm
 // - The verdict is stated once, in words, at the top. Someone opening this
 //   page has one question, and a grid of rates does not answer it.
 // - Safety findings are never mixed into a quality score. They are listed
-//   separately and they are what sinks a recommendation, because each one is
-//   an action the agent loop would have taken against a real account.
+//   separately, for both models, and a recommendation sinks when the
+//   candidate has materially more of them than the incumbent.
 // - The turn drill-down is the point, not an appendix. Numbers persuade
 //   nobody about a decision this consequential; reading six diverging turns
 //   does. The report arrives worst-first so the turns that matter are the
@@ -58,7 +58,9 @@ const AGREEMENT_COPY: Record<string, string> = {
 const FINDING_COPY: Record<string, string> = {
   unknown_tool: 'Called a tool that does not exist',
   invalid_args: 'Arguments the tool rejects',
-  unrequested_mutation: 'Wrote something neither the incumbent nor the live turn did',
+  unrequested_mutation: 'Wrote something neither the other model nor the live turn did',
+  fabricated_id: 'Wrote to a record ID it was never shown',
+  judged_unsafe: 'Judge: would cause harm',
   truncated: 'Response truncated mid-thought',
   call_failed: 'Provider call failed',
   unresolved_tool_name: 'Retired tool name, carried by this history',
@@ -165,6 +167,20 @@ function Stat({ label, value, hint }: { label: string; value: string; hint?: str
   );
 }
 
+/** The safety tile's hint: how the candidate's findings compare with the
+ * incumbent's, which is what decides a run. Older runs checked only the
+ * candidate and say so. */
+function safetyHint(summary: EvalSummary, advisory: number): string {
+  const comparison = summary.safety_comparison;
+  if (comparison) {
+    return `Turns with one: candidate ${comparison.candidate_turns}, incumbent ${comparison.baseline_turns}`;
+  }
+  if (summary.blocking_findings) return 'Candidate only; this run did not check the incumbent';
+  return advisory
+    ? `None. ${advisory} advisory note${advisory === 1 ? '' : 's'} below`
+    : 'None across the run';
+}
+
 function SummaryGrid({ summary }: { summary: EvalSummary }) {
   const safetyTotal = summary.blocking_findings;
   const allFindings = Object.values(summary.safety_counts).reduce((a, b) => a + b, 0);
@@ -182,15 +198,9 @@ function SummaryGrid({ summary }: { summary: EvalSummary }) {
   return (
     <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
       <Stat
-        label="Blocking findings"
+        label="Candidate safety findings"
         value={String(safetyTotal)}
-        hint={
-          safetyTotal
-            ? 'Each one blocks a switch on its own'
-            : advisory
-              ? `None. ${advisory} advisory note${advisory === 1 ? '' : 's'} below`
-              : 'None across the run'
-        }
+        hint={safetyHint(summary, advisory)}
       />
       <Stat
         label="Matched the incumbent"
@@ -223,7 +233,17 @@ function SummaryGrid({ summary }: { summary: EvalSummary }) {
         value={pct(summary.candidate.cache_participation_ratio)}
         hint={`Incumbent ${pct(summary.baseline.cache_participation_ratio)}. Cached share of prompt tokens`}
       />
-      <Stat label="Turns that diverged" value={pct(summary.divergence_rate)} />
+      <Stat
+        label="Turns that diverged"
+        value={pct(summary.divergence_rate)}
+        hint={
+          summary.divergence_threshold == null
+            ? undefined
+            : summary.divergence_noise_floor == null
+              ? `Caution above ${pct(summary.divergence_threshold)} (uncalibrated)`
+              : `Incumbent against itself ${pct(summary.divergence_noise_floor)}`
+        }
+      />
       <Stat
         label="Turns that failed"
         value={String(summary.turns_failed)}
@@ -270,6 +290,26 @@ function DecisionColumn({ title, decision }: { title: string; decision: EvalDeci
         <p className="text-sm text-error-text">{decision.error}</p>
       ) : (
         <>
+          {decision.replayed_lookups && decision.replayed_lookups.length > 0 ? (
+            // Lookups the live turn also made, answered from its recorded
+            // results so the decision below could be scored. Nothing ran.
+            <details className="mb-2">
+              <summary className="cursor-pointer text-xs text-muted-foreground">
+                Looked up first: {decision.replayed_lookups.map(l => l.name).join(', ')}
+              </summary>
+              <ul className="mt-1 space-y-1">
+                {decision.replayed_lookups.map((lookup, index) => (
+                  <li
+                    key={`${lookup.name}-${index}`}
+                    className="break-all rounded-[--radius-sm] bg-panel px-2 py-1 font-mono text-xs text-muted-foreground"
+                  >
+                    <span className="font-semibold">{lookup.name}</span>(
+                    {JSON.stringify(lookup.arguments)}) returned {lookup.result}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          ) : null}
           {decision.tool_calls.length > 0 ? (
             <ul className="mb-2 space-y-1">
               {decision.tool_calls.map((call, index) => (
@@ -302,10 +342,13 @@ function DecisionColumn({ title, decision }: { title: string; decision: EvalDeci
 
 function TurnCard({ turn }: { turn: EvalTurn }) {
   // ``blocking`` comes from the API rather than a local set: a copy here was
-  // a hand-maintained mirror of metrics.BLOCKING_FINDINGS, and it decides
-  // whether a badge reads as an accusation.
-  const blocking = turn.safety_issues.filter(i => i.blocking);
+  // a hand-maintained mirror of metrics.SAFETY_FINDINGS, and it decides
+  // whether a badge reads as an accusation. Only the candidate's findings are
+  // one; the incumbent's are the comparison it is measured against.
+  const blocking = turn.safety_issues.filter(i => i.blocking && i.side !== 'baseline');
+  const incumbent = turn.safety_issues.filter(i => i.blocking && i.side === 'baseline');
   const advisory = turn.safety_issues.filter(i => !i.blocking);
+  const detailed = [...blocking, ...incumbent, ...advisory];
   // Expand what decides the verdict. An advisory note alone is not worth
   // opening a diff for, and auto-expanding those buried the turns that were.
   const [open, setOpen] = useState(
@@ -342,6 +385,16 @@ function TurnCard({ turn }: { turn: EvalTurn }) {
                 {issue.tool_name ? `: ${issue.tool_name}` : ''}
               </span>
             ))}
+            {incumbent.map((issue, index) => (
+              <span
+                key={`incumbent-${issue.finding}-${index}`}
+                className="rounded-full bg-warning-bg px-2 py-0.5 text-warning-text"
+                title="The incumbent's finding, the baseline the candidate is compared with"
+              >
+                Incumbent: {FINDING_COPY[issue.finding] ?? issue.finding}
+                {issue.tool_name ? `: ${issue.tool_name}` : ''}
+              </span>
+            ))}
             {advisory.map((issue, index) => (
               <span
                 key={`advisory-${issue.finding}-${index}`}
@@ -372,11 +425,12 @@ function TurnCard({ turn }: { turn: EvalTurn }) {
 
       {open ? (
         <div className="border-t border-border p-3">
-          {advisory.length > 0 ? (
+          {detailed.length > 0 ? (
             <ul className="mb-3 space-y-1 text-xs text-muted-foreground">
-              {advisory.map((issue, index) => (
+              {detailed.map((issue, index) => (
                 <li key={`detail-${issue.finding}-${index}`}>
                   <span className="font-medium">
+                    {issue.side === 'baseline' ? 'Incumbent: ' : ''}
                     {FINDING_COPY[issue.finding] ?? issue.finding}
                   </span>{' '}
                   {issue.detail}

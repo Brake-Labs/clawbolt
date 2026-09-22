@@ -220,29 +220,56 @@ owns the job lifecycle.
 
 Three invariants, each of which the feature is worthless without:
 
-- **A replay never executes a tool.** It stops at the model's first decision
-  for a turn. Executing would text real customers and mutate real job records
-  on every evaluation.
+- **A replay never executes a tool.** Executing would text real customers and
+  mutate real job records on every evaluation. A replay continues past a
+  lookup only when every call in the response is read-only
+  (`metrics.is_mutating_call`) and matches a call the live turn made; it then
+  feeds back the result that turn recorded, for at most
+  `MAX_REPLAY_READ_ROUNDS` extra rounds (`execution.call_model`). Anything
+  else, a write included, is the decision scored. Feeding a recorded result is
+  not execution; calling a tool to get a fresh one would be.
 - **Prompts are built by `ClawboltAgent.assemble_prompt`,** the same method the
   live loop calls. A second assembly implementation would score prompts no user
   ever received. If you change how the agent assembles a turn, the evaluator
   follows automatically; keep it that way.
 - **Safety findings are never averaged into a quality score.** `metrics.py`
-  keeps them in their own tier, and one occurrence of a *blocking* finding
-  forces `do_not_switch`. Not every finding blocks: `BLOCKING_FINDINGS` is the
-  set that does, and the rest (a provider error, a tool name the replayed
-  history carries but the current schema does not) describe the fixture or the
-  measurement rather than the candidate, so they surface as run warnings.
-  Anything reading `bool(safety_issues)` as "disqualified" is a bug.
+  keeps them in their own tier. Both models get the same checks
+  (`check_safety` runs once per side, and the judge's unsafe flags become
+  `JUDGED_UNSAFE` findings on the side they name), and the recommendation
+  compares the two: a candidate materially worse than the incumbent blocks,
+  one at parity or better does not. "Materially" is a one-sided sign test on
+  the turns where only one side had a finding (`SAFETY_ALPHA`, plus
+  `MIN_SAFETY_EXCESS_RATE`). `FABRICATED_ID` also blocks on its own under a
+  looser version of the same test (`FABRICATED_ID_ALPHA` plus
+  `SEVERE_FINDING_MIN_EXCESS`), so a small excess can block but parity cannot. Only `SAFETY_FINDINGS` are compared; the rest
+  (a provider error, a tool name the replayed history carries but the current
+  schema does not) describe the fixture or the measurement, so they surface as
+  run warnings. Anything reading `bool(safety_issues)` as "disqualified" is a
+  bug, and so is anything that reads one finding as decisive.
+- **A write's record IDs must come from what the model saw.** `FABRICATED_ID`
+  is deterministic: an ID-shaped argument of a mutating call (named `*_id`,
+  `*_ids`, `*_ref` or described as an ID in the params model) that appears
+  nowhere in the prompt, the user's message, or a replayed lookup result is a
+  guess. Name new ID parameters that way so the check covers them.
 - **Whether a tool mutates comes from `ToolTags.READ_ONLY`, not the approval
   policy.** Untagged means mutating. See step 7 of "Adding a New Agent Tool".
 - **A finding is judged against what the turn actually did,** not against the
-  incumbent's first decision alone. A replay captures one decision, so
-  `check_safety` takes the turn's `historic_tool_names`: a mutation the live
-  agent went on to make is not unrequested, and a tool name the incumbent also
-  reaches for is a fixture artifact (`UNRESOLVED_TOOL_NAME`, non-blocking)
-  rather than a candidate hallucination. Both mistakes produced almost every
-  blocking finding in the first real runs.
+  other model's decision alone. `check_safety` takes the turn's
+  `historic_tool_names`: a mutation the live agent went on to make is not
+  unrequested, and a tool name the other model also reaches for is a fixture
+  artifact (`UNRESOLVED_TOOL_NAME`, not compared) rather than a
+  hallucination. Both mistakes produced almost every finding in the first
+  real runs.
+- **Quality is a net preference, and divergence is read against noise.** The
+  judge's verdicts reduce to (worse - better) / judged, which blocks only
+  above `MAX_NET_WORSE_BLOCKING` and with a significant sign test. Divergence
+  never blocks; its caution fires above the incumbent's own divergence from
+  itself plus `DIVERGENCE_MARGIN`. To calibrate a user, start a run whose
+  candidate is the incumbent (same endpoint, model and effort) over at least
+  `MIN_TURNS_FOR_VERDICT` turns; later runs for that user pick it up
+  (`runner.divergence_noise_floor`), and a shorter one is ignored. Bump
+  `runner.HARNESS_VERSION` when the replay changes what it measures, so old
+  calibrations stop applying.
 - **A failing provider stops the run.** `MAX_CONSECUTIVE_CALL_FAILURES`
   consecutive errored turns end it with `FAILED`, the evidence already
   gathered, and `inconclusive` stamped on both the column and the summary. A
@@ -279,7 +306,7 @@ The agent's capabilities are extended by adding tools. Tools follow a factory/re
 
 6. **Set a `concurrency_group` if your tool mutates shared state.** The agent runs all approved tool calls from a single LLM turn concurrently by default. Tools with the same non-None `concurrency_group` serialize in submission order; tools with different keys (or `None`) may run in parallel. Set this whenever your tool could race with another tool in the same turn against a shared resource, for example a DB row, a workspace document, a disk file, or the user-facing message stream. Read-only and stateless tools should leave it `None`. Accepts either a static string or a callable that takes the validated args and returns a key, for the case where a single tool routes to distinct resources by argument (e.g. workspace writers keyed by file path). Existing keys: `"workspace_path:<path>"` for workspace document mutations (resolved per call by `_workspace_path_concurrency_key`), `"user_outbound"` for reply senders, `"user_integrations"` for integration toggles. The global test `test_state_mutating_tools_have_concurrency_group` in `test_tool_registry.py` enforces that any tool tagged `MODIFIES_PROFILE` or `SENDS_REPLY` declares one.
 
-7. **Classify the tool as a read or a write.** Tag it `tags={ToolTags.READ_ONLY}` if calling it only looks something up; otherwise add its name to `_MUTATING_TOOLS` in `tests/test_tool_registry.py`. Untagged means mutating. The approval policy cannot stand in for this: `ApprovalPolicy` defaults `default_level` to `ASK`, so most search and list tools are gated too, while `write_file` and `manage_integration` write without being gated. The model-swap evaluator blocks a switch on a single unrequested mutation, so a read left untagged sinks a run over a lookup and a writer left unlisted lets a candidate rewrite MEMORY.md with nothing reported. The global test `test_every_tool_is_classified_read_or_write` in `test_tool_registry.py` enforces it, reaching integration tools through their own builders rather than the registry factories.
+7. **Classify the tool as a read or a write.** Tag it `tags={ToolTags.READ_ONLY}` if calling it only looks something up; otherwise add its name to `_MUTATING_TOOLS` in `tests/test_tool_registry.py`. Untagged means mutating. The approval policy cannot stand in for this: `ApprovalPolicy` defaults `default_level` to `ASK`, so most search and list tools are gated too, while `write_file` and `manage_integration` write without being gated. The model-swap evaluator counts an unrequested mutation as a safety finding, so a read left untagged charges both models for every lookup (and stops a replay from continuing past it), and a writer left unlisted lets a candidate rewrite MEMORY.md with nothing reported. A tool whose actions differ (`manage_integration`'s `status`) stays untagged and sets `read_only_when`; argument checks that live in the tool body belong in `precheck`, so the evaluator does not count a call the tool would refuse as a write. The global test `test_every_tool_is_classified_read_or_write` in `test_tool_registry.py` enforces it, reaching integration tools through their own builders rather than the registry factories.
 
 8. **Write tests** at `tests/test_<name>_tools.py`. Call the factory function directly (e.g., `_create_calculator_tools()`) and invoke the tool function. No database needed for stateless tools.
 

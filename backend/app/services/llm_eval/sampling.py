@@ -29,7 +29,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from backend.app.agent.approval import get_approval_store
-from backend.app.agent.context import _stored_messages_to_agent_messages
+from backend.app.agent.context import (
+    _parse_tool_interactions,
+    _stored_messages_to_agent_messages,
+)
 from backend.app.agent.core import AssembledPrompt, ClawboltAgent
 from backend.app.agent.dto import StoredMessage
 from backend.app.agent.messages import AgentMessage, AssistantMessage
@@ -47,7 +50,7 @@ from backend.app.bus import OutboundMessage
 from backend.app.config import settings
 from backend.app.enums import MessageDirection
 from backend.app.models import User
-from backend.app.services.llm_eval.types import ReplaySample
+from backend.app.services.llm_eval.types import RecordedToolResult, ReplaySample
 
 logger = logging.getLogger(__name__)
 
@@ -295,17 +298,7 @@ def _historic_response(rows: list[StoredMessage], start: int) -> tuple[str, list
     """
     reply_parts: list[str] = []
     tool_names: list[str] = []
-    index = start + 1
-    # Advance past the remainder of the inbound batch this row belongs to.
-    while (
-        index < len(rows)
-        and rows[index].direction == MessageDirection.INBOUND
-        and _same_batch(rows[index - 1], rows[index])
-    ):
-        index += 1
-    for row in rows[index:]:
-        if row.direction == MessageDirection.INBOUND:
-            break
+    for row in _response_rows(rows, start):
         for msg in _stored_messages_to_agent_messages([row]):
             if isinstance(msg, AssistantMessage):
                 tool_names.extend(tc.name for tc in msg.tool_calls)
@@ -315,30 +308,102 @@ def _historic_response(rows: list[StoredMessage], start: int) -> tuple[str, list
     return "\n\n".join(reply_parts), tool_names
 
 
+def _response_rows(rows: list[StoredMessage], start: int) -> list[StoredMessage]:
+    """The outbound rows that answered the turn whose batch begins at *start*."""
+    index = start + 1
+    # Advance past the remainder of the inbound batch this row belongs to.
+    while (
+        index < len(rows)
+        and rows[index].direction == MessageDirection.INBOUND
+        and _same_batch(rows[index - 1], rows[index])
+    ):
+        index += 1
+    answered: list[StoredMessage] = []
+    for row in rows[index:]:
+        if row.direction == MessageDirection.INBOUND:
+            break
+        answered.append(row)
+    return answered
+
+
+def _historic_tool_results(rows: list[StoredMessage], start: int) -> tuple[RecordedToolResult, ...]:
+    """Every tool call the live turn made, with the result it got back.
+
+    Read through the same parser the history rebuild uses, so a malformed
+    ``tool_interactions_json`` yields no results here just as it yields no
+    tool calls in the prompt.
+    """
+    return tuple(
+        RecordedToolResult(
+            name=interaction.name,
+            arguments=interaction.args,
+            result=interaction.result,
+            is_error=interaction.is_error,
+        )
+        for row in _response_rows(rows, start)
+        for interaction in _parse_tool_interactions(row.tool_interactions_json)
+    )
+
+
+def _batch_end(rows: list[StoredMessage], start: int) -> int:
+    """Index of the last inbound row in the batch that begins at *start*."""
+    index = start
+    while (
+        index + 1 < len(rows)
+        and rows[index + 1].direction == MessageDirection.INBOUND
+        and _same_batch(rows[index], rows[index + 1])
+    ):
+        index += 1
+    return index
+
+
+def _message_context(row: StoredMessage) -> str:
+    return row.processed_context or row.body
+
+
 def select_samples(fixture: ReplayFixture, limit: int) -> list[ReplaySample]:
-    """Pick the most recent *limit* inbound turns, oldest first.
+    """Pick the most recent *limit* turns, oldest first.
+
+    A turn is a batch, not a row. Production answers rapid-fire messages once,
+    after the last of them, with the earlier ones already in the history it
+    loads, so that is the replay too: one sample per batch, at the batch's
+    last row. Replaying each row alone scored decisions production never
+    made, on a fraction of what the user had said, and the judge read that
+    fraction as the whole request. The earlier rows ride along as
+    ``batched_messages`` so the report and the judge see everything the user
+    sent.
 
     Blank inbound rows are skipped: rapid-fire attachment batching persists
     a placeholder with no body and no processed context, and replaying one
-    would ask both models to respond to an empty string.
+    would ask both models to respond to an empty string. A batch that ends in
+    one is replayed at its last row with text.
     """
     samples: list[ReplaySample] = []
-    for index, row in enumerate(fixture.rows):
-        if row.direction != MessageDirection.INBOUND:
+    rows = fixture.rows
+    index = 0
+    while index < len(rows):
+        if rows[index].direction != MessageDirection.INBOUND:
+            index += 1
             continue
-        message_context = row.processed_context or row.body
-        if not message_context.strip():
-            continue
-        reply, tool_names = _historic_response(fixture.rows, index)
-        samples.append(
-            ReplaySample(
-                seq=row.seq,
-                timestamp=row.timestamp,
-                message_context=message_context,
-                historic_reply=reply,
-                historic_tool_names=tool_names,
+        end = _batch_end(rows, index)
+        texts = [(i, _message_context(rows[i])) for i in range(index, end + 1)]
+        texts = [(i, text) for i, text in texts if text.strip()]
+        if texts:
+            last_index, message_context = texts[-1]
+            row = rows[last_index]
+            reply, tool_names = _historic_response(rows, last_index)
+            samples.append(
+                ReplaySample(
+                    seq=row.seq,
+                    timestamp=row.timestamp,
+                    message_context=message_context,
+                    historic_reply=reply,
+                    historic_tool_names=tool_names,
+                    historic_tool_results=_historic_tool_results(rows, last_index),
+                    batched_messages=tuple(text for _, text in texts[:-1]),
+                )
             )
-        )
+        index = end + 1
     return samples[-limit:] if limit > 0 else samples
 
 
@@ -349,7 +414,7 @@ def _history_for(fixture: ReplayFixture, sample: ReplaySample) -> list[AgentMess
     return _stored_messages_to_agent_messages(window, tz_name=fixture.tz_name)
 
 
-def _sample_clock(sample: ReplaySample) -> datetime | None:
+def sample_clock(sample: ReplaySample) -> datetime | None:
     """The wall time to stamp on *sample*'s replayed turn, or None for now.
 
     Falls back to None (wall time) on an unparseable timestamp rather than
@@ -388,5 +453,5 @@ async def assemble_for_sample(fixture: ReplayFixture, sample: ReplaySample) -> A
         sample.message_context,
         _history_for(fixture, sample),
         deterministic_trim=True,
-        now=_sample_clock(sample),
+        now=sample_clock(sample),
     )

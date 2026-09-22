@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
 
@@ -21,6 +22,31 @@ class SendMediaReplyParams(BaseModel):
     media_url: str = Field(description="URL of the media to attach")
 
 
+def media_url_error(media_url: str) -> str | None:
+    """Why ``send_media_reply`` would refuse *media_url*, or None if it would send.
+
+    Shared by the tool body and its ``precheck`` so the model-swap evaluator
+    sees the same refusal production applies: an empty or ``about:blank`` URL
+    sends nothing, and counting it as a message to the user reports a write
+    that never happens.
+    """
+    if not media_url or not media_url.strip():
+        return "media_url cannot be empty."
+    url = media_url.strip()
+    is_url = url.startswith("http://") or url.startswith("https://")
+    if not is_url and not Path(url).is_file():
+        return (
+            f"media_url '{url}' is not a valid URL (must start with "
+            f"http:// or https://) and does not exist as a local file."
+        )
+    return None
+
+
+def _send_media_precheck(args: dict[str, Any]) -> str | None:
+    media_url = args.get("media_url")
+    return media_url_error(media_url if isinstance(media_url, str) else "")
+
+
 def create_messaging_tools(
     publish_outbound: Callable[[OutboundMessage], Awaitable[None]],
     channel: str,
@@ -30,28 +56,16 @@ def create_messaging_tools(
 
     async def send_media_reply(message: str, media_url: str) -> ToolResult:
         """Send a reply with a media attachment."""
-        from pathlib import Path
-
         from backend.app.bus import OutboundMessage as OMsg
 
-        if not media_url or not media_url.strip():
+        error = media_url_error(media_url)
+        if error is not None:
             return ToolResult(
-                content="Error: media_url cannot be empty.",
+                content=f"Error: {error}",
                 is_error=True,
                 error_kind=ToolErrorKind.VALIDATION,
             )
         url = media_url.strip()
-        is_url = url.startswith("http://") or url.startswith("https://")
-        is_local_file = Path(url).is_file()
-        if not is_url and not is_local_file:
-            return ToolResult(
-                content=(
-                    f"Error: media_url '{url}' is not a valid URL (must start with "
-                    f"http:// or https://) and does not exist as a local file."
-                ),
-                is_error=True,
-                error_kind=ToolErrorKind.VALIDATION,
-            )
         outbound = OMsg(channel=channel, chat_id=to_address, content=message, media=[url])
         await publish_outbound(outbound)
         return ToolResult(content="Sent media message")
@@ -71,6 +85,7 @@ def create_messaging_tools(
             # Preserve send order if the model batches multiple replies in one
             # turn. The user's channel is the shared resource here.
             concurrency_group="user_outbound",
+            precheck=_send_media_precheck,
         ),
     ]
 

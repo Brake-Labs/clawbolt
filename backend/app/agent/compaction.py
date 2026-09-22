@@ -35,7 +35,11 @@ from backend.app.agent.prompts import load_prompt
 from backend.app.agent.stores import HeartbeatStore
 from backend.app.config import settings
 from backend.app.services.llm_endpoints import resolve_target, role_selection
-from backend.app.services.llm_service import amessages_streamed, prepare_system_with_caching
+from backend.app.services.llm_service import (
+    amessages_streamed,
+    fit_max_tokens_to_reasoning,
+    prepare_system_with_caching,
+)
 from backend.app.services.llm_usage import log_llm_usage
 
 logger = logging.getLogger(__name__)
@@ -379,6 +383,10 @@ async def compact_session(
     compaction_system = prepare_system_with_caching(COMPACTION_SYSTEM_PROMPT, target)
     compaction_reasoning = target.reasoning_kwargs(settings.reasoning_effort)
     compaction_thinking = compaction_reasoning.get("thinking")
+    # A thinking budget must fit under ``max_tokens``. See ``fit_max_tokens_to_reasoning``.
+    compaction_max_tokens = fit_max_tokens_to_reasoning(
+        settings.compaction_max_tokens, compaction_reasoning
+    )
 
     started_at = datetime.datetime.now(UTC)
     try:
@@ -391,7 +399,7 @@ async def compact_session(
                 request_id=None,
                 model=model,
                 provider=provider,
-                max_tokens=settings.compaction_max_tokens,
+                max_tokens=compaction_max_tokens,
                 thinking=compaction_thinking,
                 system=compaction_system,
                 messages=messages,
@@ -412,7 +420,7 @@ async def compact_session(
             **target.connection_kwargs(),
             system=compaction_system,
             messages=messages,
-            max_tokens=settings.compaction_max_tokens,
+            max_tokens=compaction_max_tokens,
             **compaction_reasoning,
         )
     except Exception:
