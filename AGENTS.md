@@ -57,7 +57,7 @@ All structured data is stored in PostgreSQL (configurable via `DATABASE_URL`). T
 | `calendar_configs` | Per-user calendar integration settings |
 | `oauth_tokens` | Encrypted OAuth tokens for integrations (Google Calendar, Google Drive, QuickBooks, etc.) |
 
-Ten more tables exist for `AUTH_MODE=multi_user` and stay empty in a single-user deployment: `subscriptions`, `usage_quotas`, `deleted_user_usage`, `allowed_emails`, `waitlist_entries`, `admin_api_keys`, `admin_audit_logs`, `llm_payload_captures`, `llm_eval_runs`, `llm_eval_turn_results`. See "Multi-user mode" below.
+Ten more tables exist for `AUTH_MODE=multi_user` and stay empty in a single-user deployment: `subscriptions`, `usage_quotas`, `deleted_user_usage`, `allowed_emails`, `waitlist_entries`, `admin_api_keys`, `admin_audit_logs`, `llm_payload_captures`, `model_comparison_runs`, `model_comparison_turns`. See "Multi-user mode" below.
 
 Saved files are not tracked in Postgres. The Google Drive integration is the source of truth for filenames, locations, and descriptions. The agent quotes saved files by their storage path (e.g. `/Astro Home Management - 123 Main Street/photos/foo.jpg`).
 
@@ -197,7 +197,7 @@ What the mode switches on, and where it lives:
 | Account page, data export, deletion | `routers/account.py`, `services/data_export.py`, `services/user_deletion.py`, `services/inactive_cleanup.py` |
 | Per-tenant quotas and plans | `billing/` |
 | Operator monitoring and email | `routers/monitoring.py`, `services/health_monitor.py`, `services/admin_alerts.py`, `services/email_service.py` |
-| Model-swap evaluation | `routers/admin_llm_eval.py`, `services/llm_eval/` |
+| Model comparison report | `routers/admin_model_comparison.py`, `services/model_comparison/` |
 | Request middleware (security headers, SEO meta, admin config guard) | `middleware/` |
 | KMS envelope encryption | `security/kms.py`, `security/dek_cache.py`, `security/validate.py` |
 
@@ -211,74 +211,97 @@ Three rules when touching this:
 - **The agent-level hooks are process-global,** so they are installed at `main.py` import under `if MULTI_USER`: the quota pipeline, the `ChannelRoute` allowlist override, the heartbeat usage hook, the per-user LLM resolver, and the payload-capture observers. They cannot be per-app, which is why `create_app()` does not touch them.
 - **`get_kek_provider()` in `auth/loader.py` is load-bearing for data.** Returning a different provider than the one that wrote a row makes every `EncryptedString` column on it unreadable. Changing its resolution order is a data migration, not a refactor.
 
-### Model-swap evaluation
+### Model comparison report
 
-`services/llm_eval/` answers "can this user be moved to a different model" by
-replaying their own recent turns through the incumbent and a candidate and
-diffing the two decisions. The admin console drives it; `routers/admin_llm_eval.py`
+`services/model_comparison/` answers "what would change if this user moved to
+a different model" by replaying their own recent turns through one candidate
+and laying each decision beside what production actually did, which is already
+in the transcript. The admin console drives it; `routers/admin_model_comparison.py`
 owns the job lifecycle.
 
-Three invariants, each of which the feature is worthless without:
+It returns no verdict, and adding one back is the change this rewrite exists
+to prevent. The evaluator it replaced scored each turn's first decision
+against a live replay of the incumbent and converted that diff into a
+recommendation through sign tests, ceilings, confounder guards and blocking
+tiers. Four rounds of review kept finding artifacts in the machinery rather
+than in the models: identical candidates blocked, bad candidates approved,
+judge blinding that leaked. This deployment has three users whose transcripts
+the operator reads anyway.
+
+Invariants, each of which the feature is worthless without:
 
 - **A replay never executes a tool.** Executing would text real customers and
-  mutate real job records on every evaluation. A replay continues past a
-  lookup only when every call in the response is read-only
-  (`metrics.is_mutating_call`) and matches a call the live turn made; it then
-  feeds back the result that turn recorded, for at most
-  `MAX_REPLAY_READ_ROUNDS` extra rounds (`execution.call_model`). Anything
-  else, a write included, is the decision scored. Feeding a recorded result is
-  not execution; calling a tool to get a fresh one would be.
+  mutate real job records on every run. A replay continues past a lookup only
+  when every call in the response is read-only (`checks.is_mutating_call`) and
+  matches a call the live turn made; it then feeds back the result that turn
+  recorded, for at most `MAX_REPLAY_READ_ROUNDS` extra rounds
+  (`execution.call_model`). Anything else, a write included, is the decision
+  recorded. Feeding a recorded result is not execution: it copies a string out
+  of the user's transcript, and nothing in `execution` can invoke a `Tool`,
+  which it holds only to read `params_model` and the read-only tag. The tool
+  context the fixture builds passes `_refuse_outbound`, which raises rather
+  than publishing, so a broken invariant fails a run loudly instead of
+  messaging a real user.
 - **Prompts are built by `ClawboltAgent.assemble_prompt`,** the same method the
-  live loop calls. A second assembly implementation would score prompts no user
-  ever received. If you change how the agent assembles a turn, the evaluator
+  live loop calls. A second assembly implementation would report on prompts no
+  user ever received. If you change how the agent assembles a turn, the replay
   follows automatically; keep it that way.
-- **Safety findings are never averaged into a quality score.** `metrics.py`
-  keeps them in their own tier. Both models get the same checks
-  (`check_safety` runs once per side, and the judge's unsafe flags become
-  `JUDGED_UNSAFE` findings on the side they name), and the recommendation
-  compares the two: a candidate materially worse than the incumbent blocks,
-  one at parity or better does not. "Materially" is a one-sided sign test on
-  the turns where only one side had a finding (`SAFETY_ALPHA`, plus
-  `MIN_SAFETY_EXCESS_RATE`). `FABRICATED_ID` also blocks on its own under a
-  looser version of the same test (`FABRICATED_ID_ALPHA` plus
-  `SEVERE_FINDING_MIN_EXCESS`), so a small excess can block but parity cannot. Only `SAFETY_FINDINGS` are compared; the rest
-  (a provider error, a tool name the replayed history carries but the current
-  schema does not) describe the fixture or the measurement, so they surface as
-  run warnings. Anything reading `bool(safety_issues)` as "disqualified" is a
-  bug, and so is anything that reads one finding as decisive.
+- **The baseline is the record, not a second call.** Only the candidate is
+  sent anywhere. A live incumbent replay would re-sample a model whose answer
+  for that turn is already stored, doubling the spend to reintroduce the
+  sampling noise the old verdict machinery existed to reason about. The run
+  records the user's current model as a label so the report says what the
+  candidate would replace; nothing is sent there.
+- **A count of findings is only readable beside the other side's.** The
+  deterministic checks run against the record too, so the report can say the
+  incumbent does this as well. Three cannot be asked of a recorded turn and
+  are candidate-only: `UNREQUESTED_WRITE` (production's own writes are the
+  standard it compares to), `UNKNOWN_TOOL` (a tool it called existed when it
+  called it) and `TRUNCATED` (a delivered reply carries no spent budget).
+  `types.PRODUCTION_CHECKED` is the set that is asked of both, it ships on the
+  summary, and the console renders the rest as "not applicable" rather than as
+  a clean zero. A zero for a check nobody ran is a measurement nobody took.
+- **Not every finding is a violation.** `types.HARD_VIOLATIONS` is what the
+  counts total. `TOOL_NOT_IN_SCHEMA` describes the replayed fixture (a name in
+  this user's history that the current schema lacks) and `CALL_FAILED` is a
+  failure to measure, so both are recorded on the turn and excluded. Anything
+  reading `bool(findings)` as "this model is unsafe" is a bug.
 - **A write's record IDs must come from what the model saw.** `FABRICATED_ID`
   is deterministic: an ID-shaped argument of a mutating call (named `*_id`,
   `*_ids`, `*_ref` or described as an ID in the params model) that appears
-  nowhere in the prompt, the user's message, or a replayed lookup result is a
-  guess. Name new ID parameters that way so the check covers them.
+  nowhere in the prompt, the user's message, or a lookup result it had by then
+  is a guess. Checked on both sides, and on the production side the haystack
+  grows call by call in recorded order, so a write is judged against what that
+  turn had read when it made it. Name new ID parameters that way so the check
+  covers them.
 - **Whether a tool mutates comes from `ToolTags.READ_ONLY`, not the approval
   policy.** Untagged means mutating. See step 7 of "Adding a New Agent Tool".
-- **A finding is judged against what the turn actually did,** not against the
-  other model's decision alone. `check_safety` takes the turn's
-  `historic_tool_names`: a mutation the live agent went on to make is not
-  unrequested, and a tool name the other model also reaches for is a fixture
-  artifact (`UNRESOLVED_TOOL_NAME`, not compared) rather than a
-  hallucination. Both mistakes produced almost every finding in the first
-  real runs.
-- **Quality is a net preference, and divergence is read against noise.** The
-  judge's verdicts reduce to (worse - better) / judged, which blocks only
-  above `MAX_NET_WORSE_BLOCKING` and with a significant sign test. Divergence
-  never blocks; its caution fires above the incumbent's own divergence from
-  itself plus `DIVERGENCE_MARGIN`. To calibrate a user, start a run whose
-  candidate is the incumbent (same endpoint, model and effort) over at least
-  `MIN_TURNS_FOR_VERDICT` turns; later runs for that user pick it up
-  (`runner.divergence_noise_floor`), and a shorter one is ignored. Bump
-  `runner.HARNESS_VERSION` when the replay changes what it measures, so old
-  calibrations stop applying.
+- **The write comparison is conservative in one direction.** For every write
+  the live turn made, `report.compare_writes` reports whether the candidate
+  reached the same tool with the same key arguments. Key arguments are the
+  write's record IDs when it has any, and its whole validated argument set
+  when it has none, so a rephrased message body lands in
+  `SAME_TOOL_DIFFERENT_ARGS` rather than in `MATCHED`. The middle bucket is on
+  the report for that reason: a paraphrase and a note filed against the wrong
+  job both land there, and only reading the turn tells them apart. The
+  headline rate counts `MATCHED` only, which understates the candidate rather
+  than flattering it.
+- **Cost is `None` when nothing can price it, never zero.** A model served
+  through a gateway is billed by whoever is behind it, which the (provider,
+  model) pair no longer names, so `LLMTarget.priced` suppresses the figure and
+  the summary carries the reason instead. The old column reported `0.000000`
+  next to a warning, and the number beat the warning every time. Wiring a real
+  per-endpoint price would need price columns on `llm_endpoints`, which do not
+  exist.
 - **A failing provider stops the run.** `MAX_CONSECUTIVE_CALL_FAILURES`
   consecutive errored turns end it with `FAILED`, the evidence already
-  gathered, and `inconclusive` stamped on both the column and the summary. A
-  run competes with live traffic at the same gateway, so it must not spend a
+  gathered, and the reason in both the `error` column and the summary's notes.
+  A run competes with live traffic at the same gateway, so it must not spend a
   200-sample budget rediscovering that the provider is down.
 
 Consent-gated like `/admin/shared-data`: a run reads real conversations and the
 report renders them back, so both require `User.data_sharing_consent`. Content is
-PII-redacted at serialization, after the comparison, so verdicts are computed on
+PII-redacted at serialization, after the checks, so findings are computed on
 real values and only the human-readable drill-down is masked.
 
 ## Adding a New Agent Tool
@@ -306,7 +329,7 @@ The agent's capabilities are extended by adding tools. Tools follow a factory/re
 
 6. **Set a `concurrency_group` if your tool mutates shared state.** The agent runs all approved tool calls from a single LLM turn concurrently by default. Tools with the same non-None `concurrency_group` serialize in submission order; tools with different keys (or `None`) may run in parallel. Set this whenever your tool could race with another tool in the same turn against a shared resource, for example a DB row, a workspace document, a disk file, or the user-facing message stream. Read-only and stateless tools should leave it `None`. Accepts either a static string or a callable that takes the validated args and returns a key, for the case where a single tool routes to distinct resources by argument (e.g. workspace writers keyed by file path). Existing keys: `"workspace_path:<path>"` for workspace document mutations (resolved per call by `_workspace_path_concurrency_key`), `"user_outbound"` for reply senders, `"user_integrations"` for integration toggles. The global test `test_state_mutating_tools_have_concurrency_group` in `test_tool_registry.py` enforces that any tool tagged `MODIFIES_PROFILE` or `SENDS_REPLY` declares one.
 
-7. **Classify the tool as a read or a write.** Tag it `tags={ToolTags.READ_ONLY}` if calling it only looks something up; otherwise add its name to `_MUTATING_TOOLS` in `tests/test_tool_registry.py`. Untagged means mutating. The approval policy cannot stand in for this: `ApprovalPolicy` defaults `default_level` to `ASK`, so most search and list tools are gated too, while `write_file` and `manage_integration` write without being gated. The model-swap evaluator counts an unrequested mutation as a safety finding, so a read left untagged charges both models for every lookup (and stops a replay from continuing past it), and a writer left unlisted lets a candidate rewrite MEMORY.md with nothing reported. A tool whose actions differ (`manage_integration`'s `status`) stays untagged and sets `read_only_when`; argument checks that live in the tool body belong in `precheck`, so the evaluator does not count a call the tool would refuse as a write. The global test `test_every_tool_is_classified_read_or_write` in `test_tool_registry.py` enforces it, reaching integration tools through their own builders rather than the registry factories.
+7. **Classify the tool as a read or a write.** Tag it `tags={ToolTags.READ_ONLY}` if calling it only looks something up; otherwise add its name to `_MUTATING_TOOLS` in `tests/test_tool_registry.py`. Untagged means mutating. The approval policy cannot stand in for this: `ApprovalPolicy` defaults `default_level` to `ASK`, so most search and list tools are gated too, while `write_file` and `manage_integration` write without being gated. The model comparison report counts an unrequested write as a finding and reads this tag to tell production's writes from its lookups, so a read left untagged is charged on both sides and stops a replay from continuing past it, and a writer left unlisted lets a candidate rewrite MEMORY.md with nothing reported. A tool whose actions differ (`manage_integration`'s `status`) stays untagged and sets `read_only_when`; argument checks that live in the tool body belong in `precheck`, so a call the tool would refuse is not counted as a write. The global test `test_every_tool_is_classified_read_or_write` in `test_tool_registry.py` enforces it, reaching integration tools through their own builders rather than the registry factories.
 
 8. **Write tests** at `tests/test_<name>_tools.py`. Call the factory function directly (e.g., `_create_calculator_tools()`) and invoke the tool function. No database needed for stateless tools.
 

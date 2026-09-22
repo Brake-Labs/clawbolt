@@ -1,4 +1,4 @@
-"""Model dispatch for the model-swap evaluator.
+"""Model dispatch for the model comparison report.
 
 The replay has to ask a model the way production asks it. Where the two
 differ, the report charges the model for the harness: a reply production
@@ -17,9 +17,9 @@ from pydantic import BaseModel
 from backend.app.agent.core import AssembledPrompt
 from backend.app.agent.messages import SystemMessage, UserMessage
 from backend.app.agent.tools.base import Tool, ToolResult, ToolTags
-from backend.app.services.llm_eval.execution import MAX_REPLAY_READ_ROUNDS, call_model
-from backend.app.services.llm_eval.types import RecordedToolResult
 from backend.app.services.llm_service import LLMTarget
+from backend.app.services.model_comparison.execution import MAX_REPLAY_READ_ROUNDS, call_model
+from backend.app.services.model_comparison.types import RecordedToolResult
 
 TARGET = LLMTarget(provider="anthropic", model="m")
 
@@ -58,7 +58,7 @@ def _response(
 
 
 async def _call(mock: AsyncMock, *, effort: str = "", target: LLMTarget = TARGET) -> Any:
-    with patch("backend.app.services.llm_eval.execution.amessages", mock):
+    with patch("backend.app.services.model_comparison.execution.amessages", mock):
         return await call_model(_prompt(), None, target=target, reasoning_effort=effort)
 
 
@@ -165,7 +165,7 @@ NOTE = {"name": "add_note", "input": {"work_order_id": "71002", "body": "done"}}
 
 
 async def _replay(mock: AsyncMock, recorded: tuple[RecordedToolResult, ...] = RECORDED) -> Any:
-    with patch("backend.app.services.llm_eval.execution.amessages", mock):
+    with patch("backend.app.services.model_comparison.execution.amessages", mock):
         return await call_model(
             _prompt(),
             None,
@@ -232,6 +232,6 @@ async def test_the_replay_gives_up_after_its_round_budget() -> None:
 
 async def test_without_a_tool_set_the_replay_is_single_round() -> None:
     mock = AsyncMock(return_value=_response(tool=SEARCH))
-    with patch("backend.app.services.llm_eval.execution.amessages", mock):
+    with patch("backend.app.services.model_comparison.execution.amessages", mock):
         await call_model(_prompt(), None, target=TARGET, reasoning_effort="", recorded=RECORDED)
     assert mock.await_count == 1
