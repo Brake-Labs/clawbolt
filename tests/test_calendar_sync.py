@@ -9,6 +9,8 @@ import pytest
 
 from backend.app.integrations.calendar.provider import CalendarInfo
 from backend.app.integrations.calendar.service import (
+    CalendarAvailabilityError,
+    CalendarListTruncatedError,
     CalendarNotVisibleError,
     GoogleCalendarService,
 )
@@ -85,8 +87,25 @@ async def test_list_calendars_follows_pages_and_shows_hidden(
 
     assert [c.id for c in cals] == ["a@example.com", "b@example.com"]
     assert req.call_count == 2
-    assert req.call_args_list[0].kwargs["params"] == {"showHidden": "true"}
-    assert req.call_args_list[1].kwargs["params"] == {"showHidden": "true", "pageToken": "p2"}
+    assert req.call_args_list[0].kwargs["params"] == {"maxResults": "250", "showHidden": "true"}
+    assert req.call_args_list[1].kwargs["params"] == {
+        "maxResults": "250",
+        "showHidden": "true",
+        "pageToken": "p2",
+    }
+
+
+async def test_list_calendars_raises_instead_of_truncating(
+    service: GoogleCalendarService,
+) -> None:
+    """A listing cut off at the page cap must not look complete: the resync
+    would delete every saved calendar on the pages it never read."""
+    page = {"items": [{"id": "a@example.com", "primary": True}], "nextPageToken": "more"}
+    with (
+        patch.object(service, "_request", new_callable=AsyncMock, return_value=page),
+        pytest.raises(CalendarListTruncatedError),
+    ):
+        await service.list_calendars(show_hidden=True)
 
 
 async def test_check_availability_raises_when_calendar_not_visible(
@@ -103,4 +122,23 @@ async def test_check_availability_raises_when_calendar_not_visible(
     ):
         await service.check_availability(
             "gone@example.com", datetime(2026, 3, 25, tzinfo=UTC), datetime(2026, 3, 26, tzinfo=UTC)
+        )
+
+
+async def test_check_availability_raises_on_other_per_calendar_errors(
+    service: GoogleCalendarService,
+) -> None:
+    """Any per-calendar freeBusy error comes with no busy data, so it must not
+    read as 'free' either."""
+    body = {
+        "calendars": {
+            "a@example.com": {"errors": [{"domain": "global", "reason": "internalError"}]}
+        }
+    }
+    with (
+        patch.object(service, "_request", new_callable=AsyncMock, return_value=body),
+        pytest.raises(CalendarAvailabilityError),
+    ):
+        await service.check_availability(
+            "a@example.com", datetime(2026, 3, 25, tzinfo=UTC), datetime(2026, 3, 26, tzinfo=UTC)
         )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import urllib.parse
@@ -156,6 +157,19 @@ async def test_post_connect_hook_failure_does_not_fail_connect(user: User) -> No
     assert token.access_token == "at"
     hook.assert_awaited_once()
     assert hook.call_args.args[0] == user.id
+
+
+async def test_slow_post_connect_hook_is_bounded(user: User) -> None:
+    svc = OAuthService()
+
+    async def _hang(user_id: str, token: OAuthTokenData) -> None:
+        await asyncio.sleep(60)
+
+    svc.register_post_connect_hook("google_calendar", _hang)
+    with patch("backend.app.services.oauth._POST_CONNECT_HOOK_TIMEOUT_S", 0.01):
+        token, _ = await _connect(svc, user.id, "google_calendar", _json({"id": ACCOUNT}))
+    assert token.access_token == "at"
+    assert await svc.get_account_email(user.id, "google_calendar") == ACCOUNT
 
 
 async def test_unknown_account_for_legacy_token(user: User) -> None:

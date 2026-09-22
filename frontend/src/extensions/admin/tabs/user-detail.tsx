@@ -1305,7 +1305,7 @@ function OAuthConnectionsSection({ items }: { items: AdminOAuthConnectionEntry[]
               <tr className="text-left text-[10px] uppercase tracking-wide text-muted-foreground">
                 <th scope="col" className="px-2 py-1.5 font-medium">Integration</th>
                 <th scope="col" className="px-2 py-1.5 font-medium">Account</th>
-                <th scope="col" className="px-2 py-1.5 font-medium">Connected</th>
+                <th scope="col" className="px-2 py-1.5 font-medium">Token updated</th>
               </tr>
             </thead>
             <tbody>

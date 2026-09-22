@@ -31,10 +31,18 @@ GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 # Refresh 5 minutes before expiry.
 _REFRESH_BUFFER_SECONDS = 300
 
-# Upper bound on calendarList pages followed in one listing. Google caps a
-# page at 250 entries, so this covers any real account while keeping a
-# misbehaving pagination loop finite.
+# calendarList page size. Google defaults to 100 and caps it at 250.
+_CALENDAR_LIST_PAGE_SIZE = 250
+
+# Upper bound on calendarList pages followed in one listing (5000 calendars),
+# which keeps a misbehaving pagination loop finite. Hitting it raises rather
+# than returning a truncated list, because the reconnect resync deletes saved
+# calendars missing from the listing.
 _MAX_CALENDAR_LIST_PAGES = 20
+
+
+class CalendarListTruncatedError(Exception):
+    """calendarList still had pages left after ``_MAX_CALENDAR_LIST_PAGES``."""
 
 
 class CalendarNotVisibleError(Exception):
@@ -47,6 +55,13 @@ class CalendarNotVisibleError(Exception):
     def __init__(self, calendar_id: str) -> None:
         super().__init__("Calendar not visible to the connected account")
         self.calendar_id = calendar_id
+
+
+class CalendarAvailabilityError(Exception):
+    """freeBusy reported a per-calendar error other than notFound.
+
+    The busy list is empty in that case too, so it must not read as free.
+    """
 
 
 def _encode_cal_id(calendar_id: str) -> str:
@@ -160,17 +175,18 @@ class GoogleCalendarService:
         against this list (the reconnect resync) would otherwise treat the
         calendars on later pages as unreachable. *show_hidden* includes
         calendars the user hid in Google Calendar's sidebar, which are still
-        readable and writable through the API.
+        readable and writable through the API. Raises
+        ``CalendarListTruncatedError`` rather than return a partial list.
         """
         calendars: list[CalendarInfo] = []
         page_token = ""
         for _ in range(_MAX_CALENDAR_LIST_PAGES):
-            params: dict[str, str] = {}
+            params: dict[str, str] = {"maxResults": str(_CALENDAR_LIST_PAGE_SIZE)}
             if show_hidden:
                 params["showHidden"] = "true"
             if page_token:
                 params["pageToken"] = page_token
-            data = await self._request("GET", "/users/me/calendarList", params=params or None)
+            data = await self._request("GET", "/users/me/calendarList", params=params)
             body = data or {}
             calendars.extend(
                 CalendarInfo(
@@ -183,8 +199,8 @@ class GoogleCalendarService:
             )
             page_token = body.get("nextPageToken", "")
             if not isinstance(page_token, str) or not page_token:
-                break
-        return calendars
+                return calendars
+        raise CalendarListTruncatedError(f"calendarList exceeded {_MAX_CALENDAR_LIST_PAGES} pages")
 
     async def list_events(
         self,
@@ -285,6 +301,12 @@ class GoogleCalendarService:
             errors = cal_data.get("errors") or []
             if any(isinstance(e, dict) and e.get("reason") == "notFound" for e in errors):
                 raise CalendarNotVisibleError(calendar_id)
+            # Any other reason (internalError, or one Google adds later) also
+            # comes with no busy data.
+            if errors:
+                raise CalendarAvailabilityError(
+                    "Google could not report free/busy for this calendar right now"
+                )
             busy_list.extend(cal_data.get("busy", []))
         return [
             BusySlot(

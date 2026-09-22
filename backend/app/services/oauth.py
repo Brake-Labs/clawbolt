@@ -246,6 +246,11 @@ ACCOUNT_TRACKED_INTEGRATIONS = frozenset(_GOOGLE_ACCOUNT_IDENTITY_ENDPOINTS)
 # (``register_post_connect_hook``) so this module never imports integrations.
 PostConnectHook = Callable[[str, "OAuthTokenData"], Awaitable[None]]
 
+# Both run inside the OAuth callback request, before the user is redirected,
+# so each is bounded well under typical proxy timeouts.
+_ACCOUNT_LOOKUP_TIMEOUT_S = 10.0
+_POST_CONNECT_HOOK_TIMEOUT_S = 20.0
+
 
 def parse_extra_json(raw: str) -> dict[str, Any]:
     """Decode an ``oauth_tokens.extra_json`` value, tolerating empty or corrupt rows."""
@@ -483,6 +488,7 @@ class OAuthService:
                 url,
                 params=params,
                 headers={"Authorization": f"Bearer {access_token}"},
+                timeout=_ACCOUNT_LOOKUP_TIMEOUT_S,
             )
             resp.raise_for_status()
             value: Any = resp.json()
@@ -507,7 +513,7 @@ class OAuthService:
     ) -> None:
         for hook in self._post_connect_hooks.get(integration, []):
             try:
-                await hook(user_id, token)
+                await asyncio.wait_for(hook(user_id, token), _POST_CONNECT_HOOK_TIMEOUT_S)
             except Exception:
                 logger.exception(
                     "Post-connect hook failed, connect still succeeded: user=%s integration=%s",
