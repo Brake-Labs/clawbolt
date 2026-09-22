@@ -949,21 +949,37 @@ class OAuthService:
                 integration,
                 exc,
             )
-            if self._is_permanent_refresh_failure(exc):
-                logger.warning(
-                    "Permanent OAuth failure, deleting token: user=%s integration=%s",
-                    user_id,
-                    integration,
-                )
-                await self.delete_token(user_id, integration)
-                await self._notify_reauth_needed(user_id, integration)
-            else:
+            if not await self.handle_permanent_refresh_failure(user_id, integration, exc):
                 logger.info(
                     "Transient OAuth failure, keeping token for retry: user=%s integration=%s",
                     user_id,
                     integration,
                 )
             return None
+
+    async def handle_permanent_refresh_failure(
+        self,
+        user_id: str,
+        integration: str,
+        error: Exception,
+    ) -> bool:
+        """Retire the token when *error* means the user has to reconnect.
+
+        Deletes the stored token and tells the user, then returns True. Returns
+        False for a transient error, leaving the token for a later retry. Shared
+        by the inline path and the background sweep: a sweep that skipped this
+        kept a dead token due for refresh and retried it on every tick, forever.
+        """
+        if not self._is_permanent_refresh_failure(error):
+            return False
+        logger.warning(
+            "Permanent OAuth failure, deleting token: user=%s integration=%s",
+            user_id,
+            integration,
+        )
+        await self.delete_token(user_id, integration)
+        await self._notify_reauth_needed(user_id, integration)
+        return True
 
     async def _notify_reauth_needed(
         self,
@@ -1089,8 +1105,10 @@ class OAuthRefreshScheduler:
     critical path: by the time the user texts, the token is already
     fresh and ``get_valid_token`` returns immediately.
 
-    Failures are logged and swallowed; a single bad token never stops
-    the sweep from processing the rest. Inline refresh in
+    Failures never stop the sweep from processing the rest. A permanent
+    failure (revoked grant, rejected client) retires the token and asks the
+    user to reconnect, as the inline path does; a transient one is logged
+    and retried next tick. Inline refresh in
     ``get_valid_token`` remains the safety net for tokens the sweep
     missed (e.g. process just started, sweep hasn't run yet).
     """
@@ -1175,12 +1193,26 @@ class OAuthRefreshScheduler:
         for user_id, integration in rows:
             try:
                 result = await self._service.refresh_token(user_id, integration)
-            except Exception:
-                logger.exception(
-                    "Background OAuth refresh failed: user=%s integration=%s",
-                    user_id,
-                    integration,
-                )
+            except Exception as exc:
+                try:
+                    retired = await self._service.handle_permanent_refresh_failure(
+                        user_id, integration, exc
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not retire OAuth token after permanent failure: "
+                        "user=%s integration=%s",
+                        user_id,
+                        integration,
+                    )
+                    continue
+                if not retired:
+                    logger.error(
+                        "Background OAuth refresh failed: user=%s integration=%s",
+                        user_id,
+                        integration,
+                        exc_info=exc,
+                    )
                 continue
             if result is not None:
                 refreshed += 1
