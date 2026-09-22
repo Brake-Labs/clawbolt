@@ -12,7 +12,8 @@ import json
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
-from any_llm.types.messages import TextBlock
+from any_llm.exceptions import InvalidRequestError
+from any_llm.types.messages import TextBlock, ToolUseBlock
 
 from backend.app.services.llm_eval.judge import (
     _describe,
@@ -44,6 +45,16 @@ class _Response:
     def __init__(self, text: str, stop_reason: str = "end_turn") -> None:
         self.content = [TextBlock(type="text", text=text)]
         self.stop_reason = stop_reason
+
+
+class _ToolResponse:
+    """A judge that answered through the forced verdict tool."""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.content = [
+            ToolUseBlock(type="tool_use", id="toolu_1", name="record_verdict", input=payload)
+        ]
+        self.stop_reason = "tool_use"
 
 
 def _judge_reply(**payload: Any) -> AsyncMock:
@@ -177,3 +188,41 @@ def test_slot_assignment_varies_across_a_realistic_transcript() -> None:
         for seq in range(1, 60, 2)
     }
     assert slots == {True, False}
+
+
+async def test_verdict_arrives_through_the_forced_tool() -> None:
+    mock = AsyncMock(
+        return_value=_ToolResponse({"winner": "A", "unsafe": "none", "rationale": "acted"})
+    )
+    verdict, rationale = await _judge(SEQ_CANDIDATE_IS_A, mock)
+    assert verdict is JudgeVerdict.CANDIDATE_BETTER
+    assert rationale == "acted"
+    kwargs = mock.await_args.kwargs
+    assert kwargs["tool_choice"] == {"type": "tool", "name": "record_verdict"}
+    assert kwargs["tools"][0]["name"] == "record_verdict"
+
+
+async def test_judge_has_headroom_to_think_before_answering() -> None:
+    """Regression: 1024 tokens ran out before a thinking judge reached its verdict."""
+    mock = _judge_reply(winner="equivalent", unsafe="none", rationale="same")
+    await _judge(SEQ_CANDIDATE_IS_A, mock)
+    assert mock.await_args.kwargs["max_tokens"] >= 4096
+
+
+async def test_unescaped_quotes_in_the_rationale_do_not_lose_the_verdict() -> None:
+    """Regression: judges quote the user without escaping the quotes.
+
+    Strict JSON parsing threw those verdicts away, unsafe flags included.
+    """
+    raw = '{"winner": "B", "unsafe": "A", "rationale": "A texts "the tenant" instead of the owner"}'
+    verdict, rationale = await _judge(SEQ_CANDIDATE_IS_A, AsyncMock(return_value=_Response(raw)))
+    assert verdict is JudgeVerdict.CANDIDATE_UNSAFE
+    assert "the tenant" in rationale
+
+
+async def test_endpoint_that_refuses_a_forced_tool_is_asked_for_json() -> None:
+    reply = _Response(json.dumps({"winner": "B", "unsafe": "none", "rationale": "ok"}))
+    mock = AsyncMock(side_effect=[InvalidRequestError("tool_choice unsupported"), reply])
+    verdict, _ = await _judge(SEQ_CANDIDATE_IS_B, mock)
+    assert verdict is JudgeVerdict.CANDIDATE_BETTER
+    assert "tool_choice" not in mock.await_args_list[1].kwargs
