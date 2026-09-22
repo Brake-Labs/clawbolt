@@ -617,10 +617,9 @@ async def test_find_saved_files_empty_drive_warns_files_may_be_hidden(
 ) -> None:
     """A connection that sees no files at all must not read as "never saved".
 
-    ``drive.file`` only exposes files the current OAuth grant created. After
-    a Drive reconnect (new OAuth client or another Google account) every
-    earlier file still exists in the user's Drive but is invisible, so a
-    miss is not evidence the file was never saved.
+    After a Drive reconnect under a different OAuth app or Google account,
+    earlier files are invisible to ``drive.file``, so a miss is not evidence
+    the file was never saved.
     """
     storage = MockStorageBackend()
     tools = create_file_tools(test_user, storage)
@@ -629,8 +628,25 @@ async def test_find_saved_files_empty_drive_warns_files_may_be_hidden(
     result = await find_saved(query=query)
 
     assert result.is_error is True
-    assert "earlier Drive connection" in result.content
-    assert "never saved" in result.content
+    assert "sees no saved files at all" in result.content
+    assert "earlier Drive connection" in result.hint
+    assert "never saved" in result.hint
+
+
+async def test_find_saved_files_empty_drive_check_failure_keeps_plain_miss(
+    test_user: User,
+) -> None:
+    """A failing empty-Drive probe must not turn a plain miss into a tool crash."""
+    storage = MockStorageBackend()
+    storage.search_files = AsyncMock(side_effect=[[], ConnectionError("drive down")])  # type: ignore[method-assign]
+    tools = create_file_tools(test_user, storage)
+    find_saved = next(t for t in tools if t.name == ToolName.FIND_SAVED_FILES).function
+
+    result = await find_saved(query="Acme deck")
+
+    assert result.is_error is True
+    assert result.content == 'No saved files matched "Acme deck".'
+    assert result.hint == ""
 
 
 async def test_find_saved_files_miss_with_visible_files_keeps_plain_message(
