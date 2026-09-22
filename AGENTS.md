@@ -214,9 +214,40 @@ Three rules when touching this:
 ### Model-swap evaluation
 
 `services/llm_eval/` answers "can this user be moved to a different model" by
-replaying their own recent turns through the incumbent and a candidate and
-diffing the two decisions. The admin console drives it; `routers/admin_llm_eval.py`
-owns the job lifecycle.
+replaying their own recent turns through a candidate and diffing its decisions
+against the incumbent's. The admin console drives it;
+`routers/admin_llm_eval.py` owns the job lifecycle.
+
+**Where the incumbent's side comes from is chosen per run**
+(`types.IncumbentSource`, frozen onto `llm_eval_runs.incumbent_source`).
+`historic`, the default, never calls the incumbent: the incumbent's answer to
+each turn was bought once already, in production, and `sampling` reconstructs
+that turn's *first decision* from its recorded tool interactions. `replay`
+calls it live on every turn and doubles the bill. Choose `replay` when the
+prompt or tool schema has changed since the turns happened, when the incumbent
+has never run them, or to calibrate a model against itself; `divergence_noise_floor`
+ignores a historic run for that reason.
+
+Two things make `historic` honest rather than merely cheap, and both are easy
+to break:
+
+- **First decision against first decision.** The candidate is scored on its
+  first response that would need a live tool, so the incumbent side has to be
+  the same thing: `ReplaySample.historic_first_calls`, not `historic_reply`,
+  which is the prose the user saw after every round had run. Comparing against
+  the reply reads every lookup-then-act turn as the candidate acting where the
+  incumbent talked.
+- **Nothing the incumbent was not asked may be reported as a zero.** It made
+  no call, so its safety findings, tokens, latency and cost were never
+  measured: `SideComparison.comparable` goes False, the safety sign test does
+  not run (a fabricated incumbent zero would block candidates at parity), cost
+  is marked `not_replayed`, and no run in this mode can return
+  `safe_to_switch`. A turn whose interactions did not parse is
+  `TurnSource.UNAVAILABLE` and leaves every paired comparison rather than
+  reading as "the agent did nothing", which is the reading that exempts a
+  candidate's write from `UNREQUESTED_MUTATION`. The run also reports which
+  models `llm_usage_logs` says actually answered over the sampled window,
+  because that turn may not have run on the model the report names.
 
 Three invariants, each of which the feature is worthless without:
 
@@ -264,9 +295,11 @@ Three invariants, each of which the feature is worthless without:
   judge's verdicts reduce to (worse - better) / judged, which blocks only
   above `MAX_NET_WORSE_BLOCKING` and with a significant sign test. Divergence
   never blocks; its caution fires above the incumbent's own divergence from
-  itself plus `DIVERGENCE_MARGIN`. To calibrate a user, start a run whose
-  candidate is the incumbent (same endpoint, model and effort) over at least
-  `MIN_TURNS_FOR_VERDICT` turns; later runs for that user pick it up
+  itself plus `DIVERGENCE_MARGIN`. To calibrate a user, start a run in
+  `replay` mode whose candidate is the incumbent (same endpoint, model and
+  effort) over at least `MIN_TURNS_FOR_VERDICT` turns; a historic run of the
+  same pair measures drift from the transcript, not self-divergence, and is
+  ignored. Later runs for that user pick the floor up
   (`runner.divergence_noise_floor`), and a shorter one is ignored. Bump
   `runner.HARNESS_VERSION` when the replay changes what it measures, so old
   calibrations stop applying.
