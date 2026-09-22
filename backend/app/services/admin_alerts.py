@@ -12,11 +12,18 @@ Design:
   convention in both repos.
 - **Grouped by fingerprint.** A broken integration logs the same error
   thousands of times a minute. Records collapse on
-  ``(logger, exception type, log template)`` and each group emails at most
-  once per ``alert_dedupe_minutes``, carrying the suppressed occurrence count.
-  The log *template* (``record.msg`` before %-substitution) is the grouping
-  key rather than the formatted message, so "user abc failed" and "user def
-  failed" are one group instead of two.
+  ``(logger, exception type, log template)``. The log *template*
+  (``record.msg`` before %-substitution) is the grouping key rather than the
+  formatted message, so "user abc failed" and "user def failed" are one group
+  instead of two.
+- **Emailed on transitions, not on recurrence.** A group is an incident: its
+  first occurrence emails, repeats while it is open are counted silently, and
+  once it has gone ``alert_dedupe_minutes`` without recurring a single
+  "resolved" email closes it, carrying the total count and duration. A
+  background sweep failing the same way every two minutes for a day is two
+  emails, not 48. Open incidents live in memory, so a restart forgets them: a
+  problem still happening after a deploy opens again, and one that stopped
+  across the deploy never gets its resolved email.
 - **Batched.** A flush loop coalesces every eligible group into a single email
   per tick, so one deploy going bad is one email listing five problems.
 - **Never blocks the logging call.** ``emit()`` only mutates an in-memory dict
@@ -25,7 +32,7 @@ Design:
   be a deadlock and latency risk.
 - **Tracebacks are formatted immediately.** Holding a live ``exc_info`` tuple
   pins every frame's locals (request objects, DB sessions, LLM payloads) alive
-  for the whole dedupe window. Format to text on capture, drop the tuple.
+  until the next flush. Format to text on capture, drop the tuple.
 - **Dormant without config.** No SMTP host or no resolvable recipient means
   the handler is never installed, so dev/local and CI never send.
 
@@ -43,7 +50,7 @@ import time
 import traceback
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from backend.app.config import settings
 from backend.app.observability import get_request_id
@@ -136,6 +143,48 @@ class ToolFailureSummary:
     last_seen: datetime
 
 
+@dataclass(frozen=True)
+class ResolvedSummary:
+    """One incident that has stopped recurring, ready for the resolved email.
+
+    ``count`` is every occurrence since the incident opened, including the
+    ones in its opening email. ``user_count`` is populated for tool failures
+    only; application errors are not attributed to users.
+    """
+
+    title: str
+    count: int
+    user_count: int
+    first_seen: datetime
+    last_seen: datetime
+
+
+@dataclass
+class _OpenIncident:
+    """A group whose opening email has gone out, tracked until it goes quiet."""
+
+    title: str
+    first_seen: datetime
+    last_seen: datetime
+    count: int
+    user_ids: set[str] = field(default_factory=set)
+
+    def touch(self, user_id: str | None = None) -> None:
+        self.count += 1
+        self.last_seen = datetime.now(UTC)
+        if user_id is not None:
+            self.user_ids.add(user_id)
+
+    def to_resolved(self) -> ResolvedSummary:
+        return ResolvedSummary(
+            title=self.title,
+            count=self.count,
+            user_count=len(self.user_ids),
+            first_seen=self.first_seen,
+            last_seen=self.last_seen,
+        )
+
+
 @dataclass
 class _PendingToolFailure:
     """Mutable accumulator for one (tool, error kind) between flushes."""
@@ -218,17 +267,20 @@ class _PendingGroup:
 
 @dataclass
 class _AlertStore:
-    """Thread-safe accumulator + throttle state.
+    """Thread-safe accumulator and incident state.
 
-    ``_pending`` is written from arbitrary threads via ``emit()`` and drained
-    by the flush task, so every access takes ``_lock``. The lock is held only
-    for dict mutation, never across the SMTP call.
+    ``_pending`` holds groups whose opening email has not gone out yet.
+    ``_open`` holds groups that have been emailed and are still recurring; a
+    record for one of those only bumps its count. Both are written from
+    arbitrary threads via ``emit()`` and drained by the flush task, so every
+    access takes ``_lock``. The lock is held only for dict mutation, never
+    across the SMTP call.
     """
 
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _pending: dict[str, _PendingGroup] = field(default_factory=dict)
     _pending_tools: dict[str, _PendingToolFailure] = field(default_factory=dict)
-    _last_emailed: dict[str, float] = field(default_factory=dict)
+    _open: dict[str, _OpenIncident] = field(default_factory=dict)
     _email_times: deque[float] = field(default_factory=deque)
     _overflow_dropped: int = 0
 
@@ -245,6 +297,11 @@ class _AlertStore:
         """Accumulate one error occurrence. Cheap, non-blocking, thread-safe."""
         now = datetime.now(UTC)
         with self._lock:
+            incident = self._open.get(fingerprint)
+            if incident is not None:
+                # Already reported and still happening: count it, stay quiet.
+                incident.touch()
+                return
             existing = self._pending.get(fingerprint)
             if existing is not None:
                 existing.merge(message, traceback_text, request_id)
@@ -284,6 +341,10 @@ class _AlertStore:
         now = datetime.now(UTC)
         fingerprint = f"tool|{tool_name}|{error_kind}"
         with self._lock:
+            incident = self._open.get(fingerprint)
+            if incident is not None:
+                incident.touch(user_id)
+                return
             existing = self._pending_tools.get(fingerprint)
             if existing is not None:
                 existing.merge(user_id, sample)
@@ -303,147 +364,182 @@ class _AlertStore:
                 group.samples.append(sample)
             self._pending_tools[fingerprint] = group
 
-    def _take_eligible_tools(self) -> list[tuple[str, _PendingToolFailure]]:
-        """Remove and return tool-failure groups past their dedupe cooldown.
+    def _at_hourly_cap(self) -> bool:
+        """True when the hourly email ceiling has been reached.
 
-        Shares ``_last_emailed`` with the error groups so both kinds obey one
-        cooldown window, and shares the per-email cap so a tool-failure storm
-        cannot crowd application errors out of the message.
+        Counts emails sent, not alerts raised. Caller holds ``_lock``.
         """
-        cooldown = max(0, settings.alert_dedupe_minutes) * 60
-        now = time.monotonic()
-        with self._lock:
-            # The accumulator is returned, not a summary: a failed send has to
-            # put the group back, and a summary has already collapsed the
-            # distinct-user sets into counts that cannot be merged with new
-            # arrivals without double counting.
-            eligible: list[tuple[str, _PendingToolFailure]] = []
-            for fingerprint, group in list(self._pending_tools.items()):
-                last = self._last_emailed.get(fingerprint)
-                if last is not None and now - last < cooldown:
-                    continue
-                eligible.append((fingerprint, group))
-                del self._pending_tools[fingerprint]
-                if len(eligible) >= _MAX_GROUPS_PER_EMAIL:
-                    break
-            return eligible
-
-    def _take_eligible(self) -> tuple[list[tuple[str, AlertSummary]], int]:
-        """Remove and return groups past their dedupe cooldown.
-
-        Returns ``(eligible, dropped)``. Groups still inside their cooldown
-        stay pending and keep accumulating, so the eventual email reports the
-        true occurrence count rather than resetting.
-        """
-        cooldown = max(0, settings.alert_dedupe_minutes) * 60
         cap = max(1, settings.alert_max_emails_per_hour)
         now = time.monotonic()
-        with self._lock:
-            # Hourly cap counts emails sent, not alerts raised.
-            while self._email_times and now - self._email_times[0] > 3600:
-                self._email_times.popleft()
-            if len(self._email_times) >= cap:
-                return [], 0
+        while self._email_times and now - self._email_times[0] > 3600:
+            self._email_times.popleft()
+        return len(self._email_times) >= cap
 
-            eligible: list[tuple[str, AlertSummary]] = []
-            for fingerprint, group in list(self._pending.items()):
-                last = self._last_emailed.get(fingerprint)
-                if last is not None and now - last < cooldown:
-                    continue
-                eligible.append((fingerprint, group.to_summary()))
+    def _take_new(
+        self,
+    ) -> tuple[list[tuple[str, _PendingGroup]], list[tuple[str, _PendingToolFailure]], int]:
+        """Remove and return the groups whose opening email is due.
+
+        Returns ``(errors, tools, dropped)``. The accumulators are returned
+        rather than summaries: a failed send has to put them back, and a tool
+        summary has already collapsed its distinct-user sets into counts that
+        cannot be merged with new arrivals without double counting. Both kinds
+        share the per-email cap, so a tool-failure storm cannot crowd
+        application errors out of the message.
+        """
+        with self._lock:
+            errors: list[tuple[str, _PendingGroup]] = []
+            for fingerprint, group in list(self._pending.items())[:_MAX_GROUPS_PER_EMAIL]:
+                errors.append((fingerprint, group))
                 del self._pending[fingerprint]
-                if len(eligible) >= _MAX_GROUPS_PER_EMAIL:
-                    break
-
+            tools: list[tuple[str, _PendingToolFailure]] = []
+            for fingerprint, tool_group in list(self._pending_tools.items())[
+                :_MAX_GROUPS_PER_EMAIL
+            ]:
+                tools.append((fingerprint, tool_group))
+                del self._pending_tools[fingerprint]
             dropped = self._overflow_dropped
-            if eligible:
-                self._overflow_dropped = 0
+            self._overflow_dropped = 0
+            return errors, tools, dropped
 
-            # Prune cooldown bookkeeping for fingerprints nobody is hitting
-            # any more, so a long-lived process does not leak keys.
-            stale_cutoff = now - max(cooldown * 2, 3600)
-            for fingerprint, stamp in list(self._last_emailed.items()):
-                if stamp < stale_cutoff and fingerprint not in self._pending:
-                    del self._last_emailed[fingerprint]
+    def _take_resolved(self) -> list[tuple[str, ResolvedSummary]]:
+        """Return open incidents that have gone quiet for the whole window.
 
-            return eligible, dropped
-
-    def _mark_emailed(self, fingerprints: list[str]) -> None:
-        """Start the cooldown for successfully emailed fingerprints."""
-        now = time.monotonic()
+        They stay in ``_open`` until the resolved email is confirmed sent, so a
+        failed send retries on the next tick instead of losing the notice.
+        """
+        quiet = timedelta(minutes=max(0, settings.alert_dedupe_minutes))
+        now = datetime.now(UTC)
         with self._lock:
-            self._email_times.append(now)
-            for fingerprint in fingerprints:
-                self._last_emailed[fingerprint] = now
+            resolved: list[tuple[str, ResolvedSummary]] = []
+            for fingerprint, incident in self._open.items():
+                if now - incident.last_seen < quiet:
+                    continue
+                resolved.append((fingerprint, incident.to_resolved()))
+                if len(resolved) >= _MAX_GROUPS_PER_EMAIL:
+                    break
+            return resolved
+
+    def _mark_sent(
+        self,
+        errors: list[tuple[str, _PendingGroup]],
+        tools: list[tuple[str, _PendingToolFailure]],
+        resolved: list[tuple[str, ResolvedSummary]],
+    ) -> None:
+        """Open the newly reported incidents and close the resolved ones."""
+        with self._lock:
+            self._email_times.append(time.monotonic())
+            for fingerprint, _ in resolved:
+                self._open.pop(fingerprint, None)
+            for fingerprint, group in errors:
+                incident = _OpenIncident(
+                    title=group.to_summary().title,
+                    first_seen=group.first_seen,
+                    last_seen=group.last_seen,
+                    count=group.count,
+                )
+                # Occurrences that arrived during the send landed in pending,
+                # because the incident was not open yet. Fold them in.
+                late = self._pending.pop(fingerprint, None)
+                if late is not None:
+                    incident.count += late.count
+                    incident.last_seen = late.last_seen
+                self._open[fingerprint] = incident
+            for fingerprint, tool_group in tools:
+                incident = _OpenIncident(
+                    title=f"{tool_group.tool_name} {tool_group.error_kind}",
+                    first_seen=tool_group.first_seen,
+                    last_seen=tool_group.last_seen,
+                    count=tool_group.count,
+                    user_ids=set(tool_group.user_ids),
+                )
+                late_tool = self._pending_tools.pop(fingerprint, None)
+                if late_tool is not None:
+                    incident.count += late_tool.count
+                    incident.last_seen = late_tool.last_seen
+                    incident.user_ids |= late_tool.user_ids
+                self._open[fingerprint] = incident
 
     async def flush(self) -> bool:
-        """Send one batched email for everything currently eligible.
+        """Send one batched email: new incidents opened, old ones resolved.
 
-        Returns True when an email was sent. Best-effort: on send failure the
-        cooldown is deliberately *not* started, so the next occurrence tries
-        again rather than going quiet for the whole dedupe window. The
-        accumulated count for the failed batch is lost; the underlying errors
-        are still in the application log.
+        Returns True when an email was sent. Best-effort: on send failure every
+        group goes back where it came from, so the next tick retries the same
+        notice rather than dropping it.
         """
-        eligible, dropped = self._take_eligible()
-        tool_eligible = self._take_eligible_tools()
-        if not eligible and not tool_eligible:
+        with self._lock:
+            if self._at_hourly_cap():
+                return False
+        errors, tools, dropped = self._take_new()
+        resolved = self._take_resolved()
+        if not errors and not tools and not resolved:
+            # Nothing to send; an overflow count alone waits for a real email.
+            self._restore(errors, tools, dropped)
             return False
-        summaries = [summary for _, summary in eligible]
-        tool_summaries = [group.to_summary() for _, group in tool_eligible]
         sent = await email_service.send_admin_alert(
-            _recipient(), summaries, dropped, tool_failures=tool_summaries
+            _recipient(),
+            [group.to_summary() for _, group in errors],
+            dropped,
+            tool_failures=[group.to_summary() for _, group in tools],
+            resolved=[summary for _, summary in resolved],
         )
         if sent:
-            self._mark_emailed(
-                [fingerprint for fingerprint, _ in eligible]
-                + [fingerprint for fingerprint, _ in tool_eligible]
-            )
+            self._mark_sent(errors, tools, resolved)
         else:
-            # Put the tool groups back so the next tick retries them. The error
-            # groups already behave this way by never starting their cooldown;
-            # these were removed from the pending dict, so returning them has to
-            # be explicit or the batch is lost outright.
-            self._restore_tool_groups(tool_eligible)
+            self._restore(errors, tools, dropped)
         return sent
 
-    def _restore_tool_groups(self, taken: list[tuple[str, _PendingToolFailure]]) -> None:
+    def _restore(
+        self,
+        errors: list[tuple[str, _PendingGroup]],
+        tools: list[tuple[str, _PendingToolFailure]],
+        dropped: int,
+    ) -> None:
         """Return groups to pending after a failed send, merging with new arrivals.
 
-        Without this a failed SMTP call silently discards the batch. The error
-        groups accept that loss (the underlying errors are still in the log);
-        a tool failure has no such second record, so it is put back.
+        Without this a failed SMTP call silently discards the opening email,
+        and since the group never opened, nothing would ever report it.
         """
-        if not taken:
-            return
         with self._lock:
-            for fingerprint, group in taken:
-                current = self._pending_tools.get(fingerprint)
+            self._overflow_dropped += dropped
+            for fingerprint, group in errors:
+                current = self._pending.get(fingerprint)
                 if current is None:
-                    self._pending_tools[fingerprint] = group
+                    self._pending[fingerprint] = group
                     continue
-                # Arrivals during the send attempt merge into the restored one.
+                # Arrivals during the send attempt are newer; keep their detail.
                 current.count += group.count
                 current.first_seen = min(current.first_seen, group.first_seen)
-                current.user_ids |= group.user_ids
-                current.consented_user_ids |= group.consented_user_ids
-                for sample in group.samples:
+            for fingerprint, tool_group in tools:
+                current_tool = self._pending_tools.get(fingerprint)
+                if current_tool is None:
+                    self._pending_tools[fingerprint] = tool_group
+                    continue
+                current_tool.count += tool_group.count
+                current_tool.first_seen = min(current_tool.first_seen, tool_group.first_seen)
+                current_tool.user_ids |= tool_group.user_ids
+                current_tool.consented_user_ids |= tool_group.consented_user_ids
+                for sample in tool_group.samples:
                     if (
-                        len(current.samples) < _MAX_SAMPLES_PER_GROUP
-                        and sample not in current.samples
+                        len(current_tool.samples) < _MAX_SAMPLES_PER_GROUP
+                        and sample not in current_tool.samples
                     ):
-                        current.samples.append(sample)
+                        current_tool.samples.append(sample)
 
     def pending_count(self) -> int:
         with self._lock:
             return len(self._pending) + len(self._pending_tools)
+
+    def open_count(self) -> int:
+        with self._lock:
+            return len(self._open)
 
     def reset(self) -> None:
         """Clear all state. For tests."""
         with self._lock:
             self._pending.clear()
             self._pending_tools.clear()
-            self._last_emailed.clear()
+            self._open.clear()
             self._email_times.clear()
             self._overflow_dropped = 0
 
@@ -489,7 +585,7 @@ class AdminAlertHandler(logging.Handler):
                 exc_class, exc_value, exc_tb = record.exc_info
                 exc_type = type(exc_value).__name__ if exc_class is not None else None
                 # Format now: holding exc_tb would pin every frame's locals
-                # alive for the whole dedupe window.
+                # alive until the next flush.
                 traceback_text = "".join(traceback.format_exception(exc_class, exc_value, exc_tb))[
                     :_MAX_TRACEBACK_CHARS
                 ]
@@ -575,8 +671,8 @@ def start_alert_flusher() -> bool:
     if _flush_task is None or _flush_task.done():
         _flush_task = asyncio.create_task(_flush_loop(), name="admin-alert-flush")
     logger.info(
-        "Admin error alerts active: grouped ERROR logs email every %ds, "
-        "at most one per fingerprint per %dm",
+        "Admin error alerts active: checked every %ds, one email when a group "
+        "starts and one when it has been quiet for %dm",
         settings.alert_flush_interval_seconds,
         settings.alert_dedupe_minutes,
     )

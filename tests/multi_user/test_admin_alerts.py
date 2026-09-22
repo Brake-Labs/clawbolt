@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Generator
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from backend.app.services import admin_alerts
+from backend.app.services import admin_alerts, email_service
 
 
 @pytest.fixture(autouse=True)
@@ -203,7 +204,7 @@ class TestTracebackCapture:
 
 
 class TestThrottling:
-    async def test_flush_sends_once_then_dedupes_within_cooldown(
+    async def test_flush_sends_once_then_stays_quiet_while_open(
         self, alerts_configured: None, send_mock: AsyncMock
     ) -> None:
         admin_alerts.install_alert_handler()
@@ -211,7 +212,7 @@ class TestThrottling:
         assert await admin_alerts._store.flush() is True
         assert send_mock.await_count == 1
 
-        # Same fingerprint recurs inside the dedupe window: accumulates, no email.
+        # Same fingerprint recurs while the incident is open: counted, no email.
         _log_error("backend.app.x", "boom")
         assert await admin_alerts._store.flush() is False
         assert send_mock.await_count == 1
@@ -222,23 +223,11 @@ class TestThrottling:
         assert await admin_alerts._store.flush() is False
         send_mock.assert_not_awaited()
 
-    async def test_cooldown_expiry_allows_a_resend(
+    async def test_failed_send_keeps_the_opening_email_queued(
         self, alerts_configured: None, send_mock: AsyncMock
     ) -> None:
-        admin_alerts.install_alert_handler()
-        _log_error("backend.app.x", "boom")
-        assert await admin_alerts._store.flush() is True
-
-        with patch.object(admin_alerts.settings, "alert_dedupe_minutes", 0):
-            _log_error("backend.app.x", "boom")
-            assert await admin_alerts._store.flush() is True
-        assert send_mock.await_count == 2
-
-    async def test_failed_send_does_not_start_the_cooldown(
-        self, alerts_configured: None, send_mock: AsyncMock
-    ) -> None:
-        # A transient SES failure must not silence the fingerprint for 30
-        # minutes; the next occurrence should try again.
+        # A transient SES failure must not open the incident, or the problem
+        # would never be reported at all.
         send_mock.return_value = False
         admin_alerts.install_alert_handler()
         _log_error("backend.app.x", "boom")
@@ -287,6 +276,130 @@ class TestThrottling:
         assert send_mock.await_args is not None
         summaries = send_mock.await_args.args[1]
         assert len(summaries) == admin_alerts._MAX_GROUPS_PER_EMAIL
+
+
+def _age_open_incidents(minutes: int) -> None:
+    """Pretend every open incident last recurred *minutes* ago."""
+    for incident in admin_alerts._store._open.values():
+        incident.last_seen -= timedelta(minutes=minutes)
+
+
+class TestIncidents:
+    """A group emails when it starts and when it stops, never in between."""
+
+    async def test_a_failure_recurring_for_hours_is_two_emails(
+        self, alerts_configured: None, send_mock: AsyncMock
+    ) -> None:
+        # Regression: a background OAuth sweep failing every two minutes
+        # emailed once per dedupe window for as long as the token stayed dead.
+        admin_alerts.install_alert_handler()
+        _log_error("backend.app.services.oauth", "refresh failed: user=%s", "u1")
+        assert await admin_alerts._store.flush() is True
+
+        for _ in range(30):
+            _age_open_incidents(5)
+            _log_error("backend.app.services.oauth", "refresh failed: user=%s", "u1")
+            assert await admin_alerts._store.flush() is False
+        assert send_mock.await_count == 1
+
+        _age_open_incidents(31)
+        assert await admin_alerts._store.flush() is True
+        assert send_mock.await_count == 2
+        assert admin_alerts._store.open_count() == 0
+
+    async def test_resolved_email_carries_the_whole_incident(
+        self, alerts_configured: None, send_mock: AsyncMock
+    ) -> None:
+        admin_alerts.install_alert_handler()
+        _log_error("backend.app.x", "boom", exc=RuntimeError("down"))
+        await admin_alerts._store.flush()
+        for _ in range(3):
+            _log_error("backend.app.x", "boom", exc=RuntimeError("down"))
+
+        _age_open_incidents(31)
+        assert await admin_alerts._store.flush() is True
+        assert send_mock.await_args is not None
+        assert send_mock.await_args.args[1] == []
+        resolved = send_mock.await_args.kwargs["resolved"]
+        assert len(resolved) == 1
+        assert resolved[0].count == 4
+        assert resolved[0].title == "RuntimeError: boom"
+
+    async def test_an_incident_inside_the_quiet_window_stays_open(
+        self, alerts_configured: None, send_mock: AsyncMock
+    ) -> None:
+        admin_alerts.install_alert_handler()
+        _log_error("backend.app.x", "boom")
+        await admin_alerts._store.flush()
+
+        _age_open_incidents(29)
+        assert await admin_alerts._store.flush() is False
+        assert admin_alerts._store.open_count() == 1
+
+    async def test_a_recurrence_after_resolution_opens_a_new_alert(
+        self, alerts_configured: None, send_mock: AsyncMock
+    ) -> None:
+        admin_alerts.install_alert_handler()
+        _log_error("backend.app.x", "boom")
+        await admin_alerts._store.flush()
+        _age_open_incidents(31)
+        await admin_alerts._store.flush()
+
+        _log_error("backend.app.x", "boom")
+        assert await admin_alerts._store.flush() is True
+        assert send_mock.await_args is not None
+        assert len(send_mock.await_args.args[1]) == 1
+        assert send_mock.await_args.kwargs["resolved"] == []
+
+    async def test_a_failed_resolved_email_is_retried(
+        self, alerts_configured: None, send_mock: AsyncMock
+    ) -> None:
+        admin_alerts.install_alert_handler()
+        _log_error("backend.app.x", "boom")
+        await admin_alerts._store.flush()
+        _age_open_incidents(31)
+
+        send_mock.return_value = False
+        assert await admin_alerts._store.flush() is False
+        assert admin_alerts._store.open_count() == 1
+
+        send_mock.return_value = True
+        assert await admin_alerts._store.flush() is True
+        assert send_mock.await_args is not None
+        assert len(send_mock.await_args.kwargs["resolved"]) == 1
+        assert admin_alerts._store.open_count() == 0
+
+    async def test_tool_failure_incident_counts_users_until_resolved(
+        self, alerts_configured: None, send_mock: AsyncMock
+    ) -> None:
+        admin_alerts.record_tool_failure("qb_query", "service", "user-a", None)
+        assert await admin_alerts._store.flush() is True
+
+        admin_alerts.record_tool_failure("qb_query", "service", "user-b", None)
+        assert await admin_alerts._store.flush() is False
+
+        _age_open_incidents(31)
+        assert await admin_alerts._store.flush() is True
+        assert send_mock.await_args is not None
+        resolved = send_mock.await_args.kwargs["resolved"]
+        assert [(r.title, r.count, r.user_count) for r in resolved] == [("qb_query service", 2, 2)]
+
+    def test_resolved_only_email_is_labeled_resolved(self, alerts_configured: None) -> None:
+        now = datetime.now(UTC)
+        summary = admin_alerts.ResolvedSummary(
+            title="HTTPStatusError: refresh failed",
+            count=48,
+            user_count=0,
+            first_seen=now - timedelta(minutes=95),
+            last_seen=now,
+        )
+        message = email_service._admin_alert_message("admin@example.com", [], 0, (), [summary])
+        assert message["Subject"] == "[clawbolt] RESOLVED: HTTPStatusError: refresh failed"
+        text = message.get_body(("plain",))
+        assert text is not None
+        body = text.get_content()
+        assert "Resolved" in body
+        assert "48 occurrences over 1h 35m" in body
 
 
 class TestHandlerRobustness:

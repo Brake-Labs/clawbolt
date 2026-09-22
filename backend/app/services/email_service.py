@@ -42,7 +42,11 @@ from backend.app.web_paths import LOGIN_PATH
 if TYPE_CHECKING:
     # Runtime import would be circular: both alert modules import this one for
     # the shared ``_send`` transport.
-    from backend.app.services.admin_alerts import AlertSummary, ToolFailureSummary
+    from backend.app.services.admin_alerts import (
+        AlertSummary,
+        ResolvedSummary,
+        ToolFailureSummary,
+    )
     from backend.app.services.health_monitor import HealthTransition
 
 logger = logging.getLogger(__name__)
@@ -614,8 +618,15 @@ async def send_waitlist_approved(to_email: str, name: str = "") -> bool:
 def _alert_subject(
     alerts: Sequence[AlertSummary],
     tool_failures: Sequence[ToolFailureSummary] = (),
+    resolved: Sequence[ResolvedSummary] = (),
 ) -> str:
     """Front-load the subject with what broke, so triage happens in the inbox."""
+    if resolved:
+        if not alerts and not tool_failures:
+            if len(resolved) == 1:
+                return f"[clawbolt] RESOLVED: {resolved[0].title}"
+            return f"[clawbolt] RESOLVED: {len(resolved)} alerts"
+        return f"{_alert_subject(alerts, tool_failures)} + {len(resolved)} resolved"
     if not alerts and tool_failures:
         if len(tool_failures) == 1:
             t = tool_failures[0]
@@ -711,14 +722,65 @@ def _tool_failure_text(t: ToolFailureSummary) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _resolved_window(r: ResolvedSummary) -> str:
+    """Describe how long a resolved incident ran, for both email parts."""
+    minutes = max(0, int((r.last_seen - r.first_seen).total_seconds() // 60))
+    duration = f"{minutes // 60}h {minutes % 60}m" if minutes >= 60 else f"{minutes}m"
+    occurrences = f"{r.count} occurrence{'s' if r.count != 1 else ''}"
+    users = f" across {r.user_count} user{'s' if r.user_count != 1 else ''}" if r.user_count else ""
+    return f"{occurrences}{users} over {duration}, last at {r.last_seen:%Y-%m-%d %H:%M:%S} UTC"
+
+
+def _resolved_text(resolved: Sequence[ResolvedSummary]) -> str:
+    """Render the resolved section for the plain-text part, or empty."""
+    if not resolved:
+        return ""
+    quiet = settings.alert_dedupe_minutes
+    lines = [f"{r.title}\n  {_resolved_window(r)}\n" for r in resolved]
+    return (
+        "\n\nResolved\n========\n\n"
+        + "\n".join(lines)
+        + f"\nNo recurrence for {quiet} minutes. A recurrence opens a new alert.\n"
+    )
+
+
+def _resolved_html(resolved: Sequence[ResolvedSummary]) -> str:
+    """Render the resolved section for the HTML part, or empty."""
+    if not resolved:
+        return ""
+    rows = "".join(
+        f"""
+        <tr>
+          <td style="padding: 16px 0; border-bottom: 1px solid {_OPS_BORDER};">
+            <p style="margin: 0 0 4px; font-family: {_OPS_MONO}; font-size: 14px; font-weight: 700; color: {_OPS_UP}; word-break: break-word;">
+              {html.escape(r.title)}
+            </p>
+            <p style="margin: 0; font-family: {_OPS_FONT}; font-size: 12px; color: {_OPS_MUTED};">{html.escape(_resolved_window(r))}</p>
+          </td>
+        </tr>"""
+        for r in resolved
+    )
+    return f"""
+              <h2 style="margin: 24px 0 0; font-family: {_OPS_FONT}; font-size: 16px; font-weight: 700; color: {_OPS_TEXT};">
+                Resolved
+              </h2>
+              <p style="margin: 6px 0 0; font-family: {_OPS_FONT}; font-size: 12px; color: {_OPS_MUTED};">
+                No recurrence for {settings.alert_dedupe_minutes} minutes. A recurrence opens a new alert.
+              </p>
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                {rows}
+              </table>"""
+
+
 def _admin_alert_message(
     to_email: str,
     alerts: Sequence[AlertSummary],
     dropped: int,
     tool_failures: Sequence[ToolFailureSummary] = (),
+    resolved: Sequence[ResolvedSummary] = (),
 ) -> EmailMessage:
     """Build the grouped error-alert email."""
-    subject = _alert_subject(alerts, tool_failures)
+    subject = _alert_subject(alerts, tool_failures, resolved)
 
     text_parts: list[str] = []
     html_parts: list[str] = []
@@ -788,16 +850,24 @@ def _admin_alert_message(
             "declined approval prompts are normal and excluded.\n"
         )
 
-    header = "Clawbolt application errors" if alerts else "Clawbolt tool failures"
+    if alerts:
+        header = "Clawbolt application errors"
+    elif tool_failures:
+        header = "Clawbolt tool failures"
+    else:
+        header = "Clawbolt alerts resolved"
     body_parts = "\n".join(text_parts) + dropped_note if alerts else ""
-    text_body = f"{header}\n{'=' * len(header)}\n\n" + body_parts + tool_text
+    text_body = (
+        f"{header}\n{'=' * len(header)}\n\n" + body_parts + tool_text + _resolved_text(resolved)
+    )
 
     html_body = _ops_page(
         subject,
         _ops_header(
-            "Application errors",
-            "Grouped by logger and exception type. Repeats within the dedupe "
-            "window are counted, not resent.",
+            "Application errors" if alerts or tool_failures else "Alerts resolved",
+            "Grouped by logger and exception type. Each problem emails once when it "
+            f"starts and once when it has been quiet for {settings.alert_dedupe_minutes} "
+            "minutes.",
         )
         + f"""
           <tr>
@@ -807,6 +877,7 @@ def _admin_alert_message(
               </table>
               {dropped_html}
               {_tool_failure_html(tool_failures)}
+              {_resolved_html(resolved)}
             </td>
           </tr>""",
     )
@@ -819,16 +890,17 @@ async def send_admin_alert(
     alerts: Sequence[AlertSummary],
     dropped: int = 0,
     tool_failures: Sequence[ToolFailureSummary] = (),
+    resolved: Sequence[ResolvedSummary] = (),
 ) -> bool:
-    """Email a batch of grouped application errors to the operator.
+    """Email newly opened and newly resolved alert groups to the operator.
 
     Best-effort like every sender here. Returns False on misconfiguration or
-    send failure; the caller decides whether to retry (``admin_alerts`` does not
-    start the dedupe cooldown on failure, so the next occurrence tries again).
+    send failure; the caller decides whether to retry (``admin_alerts`` keeps
+    every group where it was, so the next flush sends the same notice).
     """
-    if not alerts and not tool_failures:
+    if not alerts and not tool_failures and not resolved:
         return False
-    return await _send(_admin_alert_message(to_email, alerts, dropped, tool_failures))
+    return await _send(_admin_alert_message(to_email, alerts, dropped, tool_failures, resolved))
 
 
 def _health_subject(transitions: Sequence[HealthTransition]) -> str:
