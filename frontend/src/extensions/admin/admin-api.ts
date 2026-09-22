@@ -1290,10 +1290,20 @@ export type EvalRecommendation =
 
 export type EvalModelTotals = components['schemas']['AdminLLMEvalModelTotals'];
 
+export type EvalIncumbentSource = 'historic' | 'replay';
+
 export interface EvalSummary {
   turns_total: number;
   turns_completed: number;
   turns_failed: number;
+  /** Where the run took the incumbent's decisions, and where they actually
+   * came from, keyed by live/historic/unavailable. null on a run recorded
+   * before the modes existed, which replayed every turn. */
+  incumbent_source?: string | null;
+  incumbent_source_counts?: Record<string, number> | null;
+  /** Sampled turns with no reconstructable incumbent decision. In neither
+   * turns_completed nor turns_failed: nothing about them is comparable. */
+  turns_incumbent_unavailable?: number;
   agreement_counts: Record<string, number>;
   /** The candidate's findings by kind. */
   safety_counts: Record<string, number>;
@@ -1343,6 +1353,10 @@ interface EvalSideComparison {
   candidate_only: number;
   baseline_only: number;
   p_value: number;
+  /** False when the incumbent side was never measured, i.e. a historic run.
+   * Every count above is then zero for want of a measurement, not for want
+   * of a finding, so nothing may be read off them. */
+  comparable?: boolean;
 }
 
 export interface EvalRun {
@@ -1363,6 +1377,13 @@ export interface EvalRun {
   candidate_model: string;
   candidate_reasoning_effort: string;
   judge_model: string;
+  /** Where this run takes the incumbent's decisions. */
+  incumbent_source: EvalIncumbentSource;
+  /** Sampled turns whose incumbent side could not be reconstructed. */
+  baseline_turns_unavailable: number;
+  /** Agent calls over the sampled window that ran on a model this run does
+   * not name. Only meaningful for a historic run. */
+  historic_other_config_calls: number;
   requested_samples: number;
   status: EvalRunStatus;
   progress_completed: number;
@@ -1428,6 +1449,9 @@ export interface EvalTurn {
   historic_reply: string;
   historic_tool_names: string[];
   baseline: EvalDecision;
+  /** Where the incumbent's decision for this turn came from: 'live', the
+   * 'historic' transcript, or 'unavailable' when there was none to read. */
+  baseline_source?: string;
   candidate: EvalDecision;
   agreement: string;
   safety_issues: EvalSafetyIssue[];
@@ -1498,6 +1522,9 @@ export async function startEvalRun(
     candidateReasoningEffort?: string;
     sampleCount: number;
     judgeEnabled: boolean;
+    /** Where the incumbent's decisions come from. 'historic' reads them
+     * from the transcript and never calls the model. */
+    incumbentSource: EvalIncumbentSource;
   },
 ): Promise<EvalRun> {
   const { data, error } = await client.POST(
@@ -1511,6 +1538,7 @@ export async function startEvalRun(
         candidate_reasoning_effort: body.candidateReasoningEffort ?? '',
         sample_count: body.sampleCount,
         judge_enabled: body.judgeEnabled,
+        incumbent_source: body.incumbentSource,
       },
     } as never,
   );

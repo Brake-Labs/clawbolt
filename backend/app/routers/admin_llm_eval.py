@@ -65,6 +65,7 @@ from backend.app.services.llm_eval.types import (
     JudgeVerdict,
     RunStatus,
     Side,
+    TurnSource,
 )
 from backend.app.services.pii_redaction import redact_pii, redact_pii_recursive
 
@@ -133,6 +134,9 @@ def _run_item(
         candidate_model=run.candidate_model,
         candidate_reasoning_effort=run.candidate_reasoning_effort,
         judge_model=run.judge_model,
+        incumbent_source=run.incumbent_source,
+        baseline_turns_unavailable=run.baseline_turns_unavailable,
+        historic_other_config_calls=run.historic_other_config_calls,
         requested_samples=run.requested_samples,
         status=run.status,
         progress_completed=run.progress_completed,
@@ -229,6 +233,8 @@ def _judge_skip_reason(turn: LLMEvalTurnResult, *, run_has_judge: bool) -> str:
         return ""
     if not run_has_judge:
         return str(JudgeSkipReason.JUDGE_DISABLED)
+    if turn.baseline_source == str(TurnSource.UNAVAILABLE):
+        return str(JudgeSkipReason.INCUMBENT_UNAVAILABLE)
     if turn.baseline_error or turn.candidate_error:
         return str(JudgeSkipReason.CALL_FAILED)
     if turn.agreement == str(AgreementClass.IDENTICAL):
@@ -264,6 +270,7 @@ def _turn_item(turn: LLMEvalTurnResult, *, run_has_judge: bool = True) -> AdminL
             latency_ms=turn.baseline_latency_ms,
             error=turn.baseline_error,
         ),
+        baseline_source=turn.baseline_source,
         candidate=AdminLLMEvalDecision(
             text=redact_pii(turn.candidate_text),
             tool_calls=_tool_calls(turn.candidate_tool_calls),
@@ -428,6 +435,7 @@ async def start_run(
         candidate_provider=payload.candidate_provider,
         candidate_model=payload.candidate_model,
         candidate_reasoning_effort=candidate_effort,
+        incumbent_source=payload.incumbent_source,
         # The incumbent judges, since it is the behavior being defended.
         # ``judge_turn`` blinds and shuffles the two responses so it cannot
         # simply vote for itself.
@@ -442,12 +450,13 @@ async def start_run(
 
     launch_run(run.id, concurrency=settings.llm_eval_concurrency)
     logger.info(
-        "Started LLM eval run %d for user %s: %s/%s (%s) vs %s/%s (%s) over %d turns",
+        "Started LLM eval run %d for user %s: %s/%s (%s, incumbent %s) vs %s/%s (%s) over %d turns",
         run.id,
         user_id,
         baseline_endpoint or baseline_provider,
         baseline_model,
         baseline_effort,
+        payload.incumbent_source,
         payload.candidate_endpoint or payload.candidate_provider,
         payload.candidate_model,
         candidate_effort,

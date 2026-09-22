@@ -125,7 +125,37 @@ describe('ModelEvalTab', () => {
         candidateReasoningEffort: '',
         sampleCount: 65,
         judgeEnabled: true,
+        // The incumbent already answered these turns in production, and a
+        // run that replays it anyway pays twice for one answer.
+        incumbentSource: 'historic',
       }),
+    );
+  });
+
+  it('can pay to replay the incumbent instead of reading the recorded turns', async () => {
+    // The escape hatch, for a prompt or tool schema that has moved since the
+    // turns happened, an incumbent that has never run them, or a calibration
+    // of a model against itself.
+    const api = await import('../admin-api');
+    vi.mocked(api.startEvalRun).mockResolvedValue(run({ status: 'pending' }));
+    renderTab();
+
+    await screen.findByRole('option', { name: 'consenting@example.com' });
+    await userEvent.selectOptions(screen.getByRole('combobox', { name: 'User' }), 'user-1');
+    await userEvent.type(screen.getByLabelText('provider'), 'anthropic');
+    await userEvent.type(screen.getByLabelText('model'), 'candidate');
+    await userEvent.selectOptions(
+      screen.getByRole('combobox', { name: 'Incumbent decisions' }),
+      'replay',
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: 'Run analysis' }));
+
+    await waitFor(() =>
+      expect(api.startEvalRun).toHaveBeenCalledWith(
+        'user-1',
+        expect.objectContaining({ incumbentSource: 'replay' }),
+      ),
     );
   });
 

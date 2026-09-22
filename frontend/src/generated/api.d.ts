@@ -3468,6 +3468,12 @@ export interface components {
              * @default true
              */
             judge_enabled: boolean;
+            /**
+             * Incumbent Source
+             * @default historic
+             * @enum {string}
+             */
+            incumbent_source: "historic" | "replay";
         };
         /**
          * AdminLLMEvalRunItem
@@ -3518,6 +3524,21 @@ export interface components {
             candidate_reasoning_effort: string;
             /** Judge Model */
             judge_model: string;
+            /**
+             * Incumbent Source
+             * @default replay
+             */
+            incumbent_source: string;
+            /**
+             * Baseline Turns Unavailable
+             * @default 0
+             */
+            baseline_turns_unavailable: number;
+            /**
+             * Historic Other Config Calls
+             * @default 0
+             */
+            historic_other_config_calls: number;
             /** Requested Samples */
             requested_samples: number;
             /** Status */
@@ -3637,6 +3658,11 @@ export interface components {
              * @default 1
              */
             p_value: number;
+            /**
+             * Comparable
+             * @default true
+             */
+            comparable: boolean;
         };
         /**
          * AdminLLMEvalSummary
@@ -3658,6 +3684,17 @@ export interface components {
              * @default 0
              */
             turns_failed: number;
+            /** Incumbent Source */
+            incumbent_source?: string | null;
+            /** Incumbent Source Counts */
+            incumbent_source_counts?: {
+                [key: string]: number;
+            } | null;
+            /**
+             * Turns Incumbent Unavailable
+             * @default 0
+             */
+            turns_incumbent_unavailable: number;
             /** Agreement Counts */
             agreement_counts?: {
                 [key: string]: number;
@@ -3752,6 +3789,11 @@ export interface components {
             /** Historic Tool Names */
             historic_tool_names?: string[];
             baseline: components["schemas"]["AdminLLMEvalDecision"];
+            /**
+             * Baseline Source
+             * @default live
+             */
+            baseline_source: string;
             candidate: components["schemas"]["AdminLLMEvalDecision"];
             /** Agreement */
             agreement: string;

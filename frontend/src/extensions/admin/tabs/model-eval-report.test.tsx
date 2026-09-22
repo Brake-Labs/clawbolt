@@ -517,4 +517,70 @@ describe('ModelEvalReportPage', () => {
     expect(await screen.findByText('That evaluation run does not exist.')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'Back to model comparison' })).toBeInTheDocument();
   });
+
+  it('says where the incumbent came from and what that saved', async () => {
+    const api = await import('../admin-api');
+    vi.mocked(api.getEvalReport).mockResolvedValue(
+      report({
+        run: run({
+          summary: summary({
+            incumbent_source: 'historic',
+            incumbent_source_counts: { historic: 38, unavailable: 2 },
+          }),
+        }),
+      }),
+    );
+    renderReport();
+
+    expect(
+      await screen.findByText(/38 provider call\(s\) this run did not pay for/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/2 turn\(s\) had no incumbent decision to read/)).toBeInTheDocument();
+  });
+
+  it('does not report the unmeasured incumbent as having no findings', async () => {
+    // The zero on that side is an absence of measurement. Printing it beside
+    // the candidate's count is the reading this whole mode must not produce.
+    const api = await import('../admin-api');
+    vi.mocked(api.getEvalReport).mockResolvedValue(
+      report({
+        run: run({
+          summary: summary({
+            incumbent_source: 'historic',
+            blocking_findings: 3,
+            safety_comparison: {
+              candidate_turns: 3,
+              baseline_turns: 0,
+              candidate_only: 3,
+              baseline_only: 0,
+              p_value: 1,
+              comparable: false,
+            },
+          }),
+        }),
+      }),
+    );
+    renderReport();
+
+    expect(
+      await screen.findByText('Incumbent not replayed, so there is nothing to compare this with'),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/incumbent 0/)).not.toBeInTheDocument();
+  });
+
+  it('does not report the unreplayed incumbent as instant and free', async () => {
+    // Its latency, caching and cost columns are zero because no call was
+    // made. Rendering them as measurements gives the incumbent a 0ms p95.
+    const api = await import('../admin-api');
+    vi.mocked(api.getEvalReport).mockResolvedValue(
+      report({ run: run({ summary: summary({ incumbent_source: 'historic' }) }) }),
+    );
+    renderReport();
+
+    expect(await screen.findByText('Incumbent not replayed')).toBeInTheDocument();
+    expect(
+      screen.getByText('Cached share of prompt tokens. Incumbent not replayed'),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/^Incumbent 0ms$/)).not.toBeInTheDocument();
+  });
 });

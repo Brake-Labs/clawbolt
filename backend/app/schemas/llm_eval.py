@@ -28,6 +28,14 @@ class AdminLLMEvalRunCreate(BaseModel):
     candidate_reasoning_effort: ReasoningEffort | Literal[""] = ""
     sample_count: int = Field(default=100, ge=1)
     judge_enabled: bool = True
+    # Where the incumbent's decisions come from. ``historic`` is the default
+    # and halves the run's provider bill: the incumbent already answered
+    # these turns once, in production, and its first decision is recorded.
+    # ``replay`` calls it live on every turn, which is worth paying for when
+    # the prompt or tool schema has moved since the turns happened, when the
+    # deployment has never run the incumbent on them, or to calibrate a
+    # model against itself.
+    incumbent_source: Literal["historic", "replay"] = "historic"
 
 
 class AdminLLMEvalModelTotals(BaseModel):
@@ -63,6 +71,11 @@ class AdminLLMEvalSideComparison(BaseModel):
     candidate_only: int = 0
     baseline_only: int = 0
     p_value: float = 1.0
+    # False when the incumbent side was never measured, which is the case in
+    # ``historic`` mode. Every count above is then zero for want of a
+    # measurement, not for want of a finding, and nothing may be read off
+    # them. True on a run recorded before the modes existed, which replayed.
+    comparable: bool = True
 
 
 class AdminLLMEvalJudgePreference(BaseModel):
@@ -81,6 +94,15 @@ class AdminLLMEvalSummary(BaseModel):
     turns_total: int = 0
     turns_completed: int = 0
     turns_failed: int = 0
+    # Where the run took the incumbent's decisions, and where they actually
+    # came from, keyed by ``live``/``historic``/``unavailable``. Both are
+    # ``None`` on a run recorded before the modes existed, which replayed
+    # every turn; a report must not read a missing count as a measured zero.
+    incumbent_source: str | None = None
+    incumbent_source_counts: dict[str, int] | None = None
+    # Sampled turns with no reconstructable incumbent decision, left out of
+    # every comparison. In neither ``turns_completed`` nor ``turns_failed``.
+    turns_incumbent_unavailable: int = 0
     agreement_counts: dict[str, int] = Field(default_factory=dict)
     safety_counts: dict[str, int] = Field(default_factory=dict)
     # The incumbent's findings, by kind. ``None`` on a run recorded before
@@ -154,6 +176,13 @@ class AdminLLMEvalRunItem(BaseModel):
     candidate_model: str
     candidate_reasoning_effort: str = ""
     judge_model: str
+    # Where this run takes the incumbent's decisions, how many sampled turns
+    # had none to read, and how many agent calls over the window those turns
+    # fall in ran on a model this run does not name. All three are counted as
+    # the run goes, so they are readable while it is still in flight.
+    incumbent_source: str = "replay"
+    baseline_turns_unavailable: int = 0
+    historic_other_config_calls: int = 0
     requested_samples: int
     status: str
     progress_completed: int
@@ -275,6 +304,12 @@ class AdminLLMEvalTurn(BaseModel):
     historic_reply: str = ""
     historic_tool_names: list[str] = Field(default_factory=list)
     baseline: AdminLLMEvalDecision
+    # Where the incumbent's decision for this turn came from: a ``live``
+    # call, the ``historic`` transcript, or ``unavailable`` when there was
+    # none to read. Per turn rather than per run, because a historic run
+    # cannot reconstruct every turn. ``live`` on rows recorded before the
+    # modes existed.
+    baseline_source: str = "live"
     candidate: AdminLLMEvalDecision
     agreement: str
     safety_issues: list[AdminLLMEvalSafetyIssue] = Field(default_factory=list)

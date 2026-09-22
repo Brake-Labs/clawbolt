@@ -74,6 +74,17 @@ const SKIP_COPY: Record<string, string> = {
   blocking_finding: 'Not judged: already disqualified by the finding above',
   call_failed: 'Not judged: a provider call failed, so there was no decision',
   judge_disabled: 'Not judged: this run had the judge turned off',
+  incumbent_unavailable: 'Not judged: the incumbent decision for this turn could not be read',
+};
+
+/** How the incumbent side of one turn was obtained, when it was not a call.
+ *
+ * Absent on a live turn: that is the assumption a reader already has, and
+ * labelling every turn of a replayed run would be noise.
+ */
+const BASELINE_SOURCE_COPY: Record<string, string> = {
+  historic: 'from the recorded turn',
+  unavailable: 'could not be read',
 };
 
 const VERDICT_COPY: Record<string, string> = {
@@ -172,6 +183,12 @@ function Stat({ label, value, hint }: { label: string; value: string; hint?: str
  * candidate and say so. */
 function safetyHint(summary: EvalSummary, advisory: number): string {
   const comparison = summary.safety_comparison;
+  // comparable === false means the incumbent was never asked, so its zero is
+  // an absence of measurement. Printing "incumbent 0" beside the candidate's
+  // count is the one reading this whole mode must not produce.
+  if (comparison?.comparable === false) {
+    return 'Incumbent not replayed, so there is nothing to compare this with';
+  }
   if (comparison) {
     return `Turns with one: candidate ${comparison.candidate_turns}, incumbent ${comparison.baseline_turns}`;
   }
@@ -195,6 +212,10 @@ function SummaryGrid({ summary }: { summary: EvalSummary }) {
   // gateway alias never resolves, so this tile is usually "unknown" and must
   // not imply "free".
   const costKnown = summary.candidate.pricing_available && summary.baseline.pricing_available;
+  // Whether the incumbent side is a decision this harness elicited. In a
+  // historic run it is not, and every column it would otherwise fill is
+  // zero for want of a measurement.
+  const measured = summary.incumbent_source !== 'historic';
   return (
     <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
       <Stat
@@ -203,7 +224,7 @@ function SummaryGrid({ summary }: { summary: EvalSummary }) {
         hint={safetyHint(summary, advisory)}
       />
       <Stat
-        label="Matched the incumbent"
+        label={measured ? 'Matched the incumbent' : 'Matched the recorded turn'}
         value={pct(summary.identical_rate)}
         hint={`${summary.turns_completed} turns compared`}
       />
@@ -215,23 +236,39 @@ function SummaryGrid({ summary }: { summary: EvalSummary }) {
             ? `${noopConceded} of ${Math.round(
                 summary.silent_noop_rate * summary.turns_completed,
               )} silent no-ops; the judge preferred the rest`
-            : 'Turns the incumbent acted on'
+            : measured
+              ? 'Turns the incumbent acted on'
+              : 'Turns production acted on'
         }
       />
       <Stat
         label="Cost per run"
         value={costKnown ? money(summary.candidate) : 'not priced'}
-        hint={costKnown ? `Incumbent ${money(summary.baseline)}` : 'No pricing for these models'}
+        hint={
+          costKnown
+            ? `Incumbent ${money(summary.baseline)}`
+            : measured
+              ? 'No pricing for these models'
+              : 'Candidate only; the incumbent made no calls to price'
+        }
       />
       <Stat
         label="Candidate latency (p95)"
         value={ms(summary.candidate.latency_p95_ms)}
-        hint={`Incumbent ${ms(summary.baseline.latency_p95_ms)}`}
+        // Not "Incumbent 0ms". It was never called, so there is no latency to
+        // report, and a zero here reads as an instantaneous incumbent.
+        hint={
+          measured ? `Incumbent ${ms(summary.baseline.latency_p95_ms)}` : 'Incumbent not replayed'
+        }
       />
       <Stat
         label="Candidate prompt caching"
         value={pct(summary.candidate.cache_participation_ratio)}
-        hint={`Incumbent ${pct(summary.baseline.cache_participation_ratio)}. Cached share of prompt tokens`}
+        hint={
+          measured
+            ? `Incumbent ${pct(summary.baseline.cache_participation_ratio)}. Cached share of prompt tokens`
+            : 'Cached share of prompt tokens. Incumbent not replayed'
+        }
       />
       <Stat
         label="Turns that diverged"
@@ -278,7 +315,34 @@ const SKIP_REASON_SHORT: Record<string, string> = {
   blocking_finding: 'already disqualified by a finding',
   call_failed: 'where a provider call failed',
   judge_disabled: 'with the judge turned off',
+  incumbent_unavailable: 'whose incumbent decision could not be read',
 };
+
+/** Where the incumbent's decisions came from, and what that cost.
+ *
+ * Rendered for every run that records a mode, including a replayed one: how
+ * the two sides were obtained is the first thing that decides how much the
+ * numbers above it are worth. Older runs record nothing here and replayed
+ * every turn, and get no line rather than a fabricated one.
+ */
+function IncumbentSourceNote({ summary }: { summary: EvalSummary }) {
+  const source = summary.incumbent_source;
+  if (!source) return null;
+  const counts = summary.incumbent_source_counts ?? {};
+  const live = counts.live ?? 0;
+  const historic = counts.historic ?? 0;
+  const unavailable = counts.unavailable ?? 0;
+  return (
+    <p className="text-xs text-muted-foreground">
+      {source === 'historic'
+        ? `Incumbent read from the recorded turns on ${historic} turn(s), never called. That is ${historic} provider call(s) this run did not pay for.`
+        : `Incumbent replayed live on ${live} turn(s), at ${live} provider call(s) on top of the candidate's.`}
+      {unavailable > 0
+        ? ` ${unavailable} turn(s) had no incumbent decision to read and were left out of every comparison.`
+        : ''}
+    </p>
+  );
+}
 
 function DecisionColumn({ title, decision }: { title: string; decision: EvalDecision }) {
   return (
@@ -442,7 +506,14 @@ function TurnCard({ turn }: { turn: EvalTurn }) {
             </ul>
           ) : null}
           <div className="flex flex-col gap-4 sm:flex-row">
-            <DecisionColumn title="Incumbent" decision={turn.baseline} />
+            <DecisionColumn
+              title={
+                turn.baseline_source && BASELINE_SOURCE_COPY[turn.baseline_source]
+                  ? `Incumbent (${BASELINE_SOURCE_COPY[turn.baseline_source]})`
+                  : 'Incumbent'
+              }
+              decision={turn.baseline}
+            />
             <DecisionColumn title="Candidate" decision={turn.candidate} />
           </div>
           {/* Billed prompt tokens, not ``input_tokens``. The two are wildly
@@ -701,6 +772,7 @@ export default function ModelEvalReportPage({ runId }: { runId: string }) {
           ))}
 
           <SummaryGrid summary={run.summary} />
+          <IncumbentSourceNote summary={run.summary} />
           <JudgeAccounting summary={run.summary} />
         </>
       ) : (

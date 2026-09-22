@@ -6052,6 +6052,15 @@
             "type": "boolean",
             "title": "Judge Enabled",
             "default": true
+          },
+          "incumbent_source": {
+            "type": "string",
+            "enum": [
+              "historic",
+              "replay"
+            ],
+            "title": "Incumbent Source",
+            "default": "historic"
           }
         },
         "type": "object",
@@ -6120,6 +6129,21 @@
           "judge_model": {
             "type": "string",
             "title": "Judge Model"
+          },
+          "incumbent_source": {
+            "type": "string",
+            "title": "Incumbent Source",
+            "default": "replay"
+          },
+          "baseline_turns_unavailable": {
+            "type": "integer",
+            "title": "Baseline Turns Unavailable",
+            "default": 0
+          },
+          "historic_other_config_calls": {
+            "type": "integer",
+            "title": "Historic Other Config Calls",
+            "default": 0
           },
           "requested_samples": {
             "type": "integer",
@@ -6336,6 +6360,11 @@
             "type": "number",
             "title": "P Value",
             "default": 1.0
+          },
+          "comparable": {
+            "type": "boolean",
+            "title": "Comparable",
+            "default": true
           }
         },
         "type": "object",
@@ -6357,6 +6386,36 @@
           "turns_failed": {
             "type": "integer",
             "title": "Turns Failed",
+            "default": 0
+          },
+          "incumbent_source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Incumbent Source"
+          },
+          "incumbent_source_counts": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "integer"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Incumbent Source Counts"
+          },
+          "turns_incumbent_unavailable": {
+            "type": "integer",
+            "title": "Turns Incumbent Unavailable",
             "default": 0
           },
           "agreement_counts": {
@@ -6560,6 +6619,11 @@
           },
           "baseline": {
             "$ref": "#/components/schemas/AdminLLMEvalDecision"
+          },
+          "baseline_source": {
+            "type": "string",
+            "title": "Baseline Source",
+            "default": "live"
           },
           "candidate": {
             "$ref": "#/components/schemas/AdminLLMEvalDecision"

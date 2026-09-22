@@ -7,6 +7,7 @@ import {
   listEvalRuns,
   startEvalRun,
   type AdminUser,
+  type EvalIncumbentSource,
   type EvalRecommendation,
   type EvalRun,
 } from '../admin-api';
@@ -111,6 +112,11 @@ export default function ModelEvalTab() {
   // reasoning differently can reject the other side's spelling outright.
   const [baselineEffort, setBaselineEffort] = useState('');
   const [candidateEffort, setCandidateEffort] = useState('');
+  // Where the incumbent's decisions come from. Historic by default: the
+  // incumbent already answered these turns in production and its first
+  // decision is recorded, so replaying it doubles the bill for an answer the
+  // deployment has already bought.
+  const [incumbentSource, setIncumbentSource] = useState<EvalIncumbentSource>('historic');
   const [sampleCount, setSampleCount] = useState(SAMPLE_DEFAULT);
   const [sampleMax, setSampleMax] = useState(SAMPLE_MAX_FALLBACK);
   // The API's own ceiling on ``limit``. Growing past it 422s, and because the
@@ -232,6 +238,7 @@ export default function ModelEvalTab() {
         candidateReasoningEffort: candidateEffort,
         sampleCount,
         judgeEnabled,
+        incumbentSource,
       });
       setRuns(prev => [run, ...prev]);
       navigate(`${adminPath('model-eval')}/${run.id}`);
@@ -408,6 +415,28 @@ export default function ModelEvalTab() {
         <p className="mt-2 text-xs text-muted-foreground">
           Set these separately when the two models disagree about what effort means. Whatever a run
           used is recorded on it, so two reports stay comparable.
+        </p>
+
+        {/* The incumbent side is the run's whole avoidable cost: a hundred
+            turns replayed against both models is two hundred paid calls, and
+            the incumbent's half of them was already bought once when the
+            turns happened. */}
+        <label className="mt-3 block">
+          <span className="mb-1 block text-sm text-muted-foreground">Incumbent decisions</span>
+          <select
+            value={incumbentSource}
+            onChange={e => setIncumbentSource(e.target.value as EvalIncumbentSource)}
+            className="w-full rounded-[--radius-md] border border-border bg-card px-3 py-2 text-sm text-foreground sm:w-auto"
+          >
+            <option value="historic">From the recorded turns (half the calls)</option>
+            <option value="replay">Replay the incumbent live (double the calls)</option>
+          </select>
+        </label>
+        <p className="mt-2 text-xs text-muted-foreground">
+          Recorded turns compare the candidate against the first decision the agent actually made
+          at the time, under the prompt and tool schema of that day, and never call the incumbent.
+          Replay when the prompt or the tool set has changed since those turns, when the incumbent
+          has never run them, or to calibrate a model against itself.
         </p>
 
         <div className="mt-4 flex flex-wrap items-center gap-4">
