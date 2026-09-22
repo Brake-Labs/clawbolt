@@ -330,7 +330,7 @@ def _historic_tool_results(rows: list[StoredMessage], start: int) -> tuple[Recor
     """Every tool call the live turn made, with the result it got back.
 
     Read through the same parser the history rebuild uses, so a malformed
-    ``tool_interactions_json`` yields no results here exactly as it yields no
+    ``tool_interactions_json`` yields no results here just as it yields no
     tool calls in the prompt.
     """
     return tuple(
