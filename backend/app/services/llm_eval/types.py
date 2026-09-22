@@ -273,6 +273,31 @@ class JudgeSkipReason(StrEnum):
     scoring the candidate against nothing.
     """
 
+    FLATTENED_ROUNDS = "flattened_rounds"
+    """The record's calls share one flat list, so the two sides may not have
+    been scored on the same decision.
+
+    Only reachable in ``IncumbentSource.HISTORIC``. These are the turns
+    ``metrics.RunAggregate.turns_flattened_rounds`` counts, and withholding
+    them keeps the confounded evidence out of the judge tier rather than
+    letting it in and then discounting the whole tier for containing it. A
+    run of a hundred turns, nineteen of them a lookup and a write in one
+    response, had every one of its judged divergences come from those
+    nineteen while a run-wide confounder guard read 19% and passed.
+    """
+
+    UNBLINDABLE_SHAPE = "unblindable_shape"
+    """The candidate asked for more than one tool in one response.
+
+    Only reachable in ``IncumbentSource.HISTORIC``.
+    ``sampling._historic_first_decision`` returns exactly one call, so a
+    rendered response listing two is necessarily the candidate's however
+    carefully ``judge._describe`` blinds the rest. The judge defaults to the
+    incumbent model, so that is a self-preference channel, and there is no
+    way to render it away: the record has no second call to show, and
+    trimming the candidate's would score a decision it did not make.
+    """
+
 
 class RunStatus(StrEnum):
     PENDING = "pending"

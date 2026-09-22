@@ -115,6 +115,9 @@ class AdminLLMEvalSummary(BaseModel):
     # Turns with a safety finding per side, paired, and the one-sided sign
     # test on the turns only one side had one. ``None`` on older runs.
     safety_comparison: AdminLLMEvalSideComparison | None = None
+    # Its own tier, and the one that stays live in historic mode: the check
+    # is deterministic against the prompt text plus the side's own lookups,
+    # so ``comparable`` here is True whatever the incumbent source.
     fabricated_id_comparison: AdminLLMEvalSideComparison | None = None
     judge_counts: dict[str, int] = Field(default_factory=dict)
     # Why the unjudged turns were skipped. Added to ``judge_counts`` these
@@ -146,8 +149,9 @@ class AdminLLMEvalSummary(BaseModel):
     # Whether "the candidate replied where the incumbent acted" can block
     # this run. The two sides really were compared, so an unmeasured
     # incumbent does not rule it out; a sample too confounded to read does
-    # (``llm_eval.metrics.RunAggregate.blocking_comparable``). ``None`` on
-    # older runs.
+    # (``llm_eval.metrics.RunAggregate.silent_noop_confounders``). ``None``
+    # on older runs. Rendered as a hint on the tile carrying the rate: a rate
+    # that cannot block has to say so where it is read.
     silent_noop_comparable: bool | None = None
     baseline: AdminLLMEvalModelTotals = Field(default_factory=AdminLLMEvalModelTotals)
     candidate: AdminLLMEvalModelTotals = Field(default_factory=AdminLLMEvalModelTotals)

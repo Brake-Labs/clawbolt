@@ -30,6 +30,7 @@ from backend.app.services.llm_eval import metrics
 from backend.app.services.llm_eval.types import (
     AgreementClass,
     IncumbentSource,
+    JudgeSkipReason,
     JudgeVerdict,
     ModelCallResult,
     Recommendation,
@@ -857,7 +858,10 @@ def test_a_confounded_sample_withholds_the_block_and_answers_inconclusive() -> N
 
     agg = metrics.aggregate(comparisons, incumbent_source=IncumbentSource.HISTORIC)
     assert agg.turns_incumbent_unavailable == 10
-    assert not agg.blocking_comparable
+    # The one confounder every tier shares: these turns reached none of them.
+    assert not agg.silent_noop_comparable
+    assert not agg.judge_preference_comparable
+    assert not agg.fabricated_id_comparable
     assert agg.recommendation is Recommendation.INCONCLUSIVE
     assert agg.blocking_withheld
     assert any("where acting was the better call" in r for r in agg.reasons)
@@ -951,7 +955,9 @@ def test_a_replayed_run_is_never_held_to_the_confounder_ceiling() -> None:
     comparisons += [_unavailable_turn(i) for i in range(21, 31)]
 
     agg = metrics.aggregate(comparisons)
-    assert agg.blocking_comparable
+    assert agg.silent_noop_comparable
+    assert agg.judge_preference_comparable
+    assert agg.fabricated_id_comparable
     assert agg.recommendation is Recommendation.DO_NOT_SWITCH
 
 
@@ -1434,3 +1440,208 @@ def test_divergence_is_read_against_a_measured_noise_floor() -> None:
     noisy = metrics.aggregate(comparisons, divergence_noise_floor=0.20)
     assert noisy.recommendation is Recommendation.SWITCH_WITH_MONITORING
     assert any("the incumbent's own 20% against itself" in r for r in noisy.reasons)
+
+
+# ---------------------------------------------------------------------------
+# Each tier is guarded over its own evidence
+# ---------------------------------------------------------------------------
+#
+# One run-wide confounder rate let a tier pass a guard that had divided its
+# confounded turns by a population it is not read over. The judge-preference
+# tier is the one that bit: its evidence is the divergences it scored, and a
+# run can confound every one of those while confounding a fifth of the run.
+
+
+def _judged_flattened_turn(seq: int, verdict: JudgeVerdict) -> TurnComparison:
+    """A flattened turn the judge scored: the shape the old guard missed.
+
+    Production asked for a lookup and a write in one response. The candidate
+    is scored on both calls, the flat record on the write alone, so the two
+    "diverge" over a turn where the candidate did what production did.
+    """
+    return TurnComparison(
+        sample=ReplaySample(
+            seq=seq,
+            timestamp="2026-05-01T12:00:00+00:00",
+            message_context="invoice Acme for the stalls",
+            historic_calls_flattened=True,
+        ),
+        baseline=_call(ToolCall(name="send_message", arguments={"recipient": "a", "body": "b"})),
+        candidate=_call(
+            ToolCall(name="lookup", arguments={"query": "Acme"}),
+            ToolCall(name="send_message", arguments={"recipient": "a", "body": "b"}),
+        ),
+        agreement=AgreementClass.DIFFERENT_TOOLS,
+        judge_verdict=verdict,
+    )
+
+
+def test_a_judge_tier_built_only_from_flattened_turns_cannot_block() -> None:
+    """The reproduction: 19 confounded turns in 100, and every judged one.
+
+    A fifth of the sample is under the run-wide ceiling, so the old guard
+    passed and the verdict was ``do_not_switch`` at p=0.000 against a
+    candidate that had done what production did on every turn it was scored
+    on. The tier's own denominator is the divergences the judge could have
+    scored, and there all 19 of them are confounded.
+    """
+    comparisons = [_judged_flattened_turn(i, JudgeVerdict.CANDIDATE_WORSE) for i in range(19)]
+    comparisons += [_identical_turn(i) for i in range(19, 100)]
+
+    agg = metrics.aggregate(comparisons, incumbent_source=IncumbentSource.HISTORIC)
+    assert agg.turns_flattened_rounds == 19
+    assert agg.turns_flattened_judged == 19
+    # Under the old run-wide denominator this read 0.19 and passed.
+    assert (
+        agg.turns_flattened_rounds / agg.turns_incumbent_attempted
+    ) < metrics.MAX_CONFOUNDED_TURN_RATE
+    assert metrics.judge_preference(agg).judged == 19
+    assert not agg.judge_preference_comparable
+    assert agg.recommendation is not Recommendation.DO_NOT_SWITCH
+    assert agg.blocking_withheld
+    assert any("lost its round boundaries" in r for r in agg.reasons)
+
+
+def test_withholding_the_judge_on_flattened_turns_disqualifies_the_tier_too() -> None:
+    """Removing the evidence is not the same as the tier having clean evidence.
+
+    ``runner`` withholds these turns, so they arrive here unjudged. What is
+    left is the divergences whose shape happened to be simple, which is not
+    the sample the tier was drawn from either.
+    """
+    withheld = [_judged_flattened_turn(i, JudgeVerdict.NOT_JUDGED) for i in range(19)]
+    for turn in withheld:
+        turn.judge_skip_reason = str(JudgeSkipReason.FLATTENED_ROUNDS)
+    comparisons = withheld + [
+        _comparison(i, agreement=AgreementClass.DIFFERENT_TOOLS, verdict=JudgeVerdict.EQUIVALENT)
+        for i in range(19, 29)
+    ]
+    comparisons += [_identical_turn(i) for i in range(29, 100)]
+
+    agg = metrics.aggregate(comparisons, incumbent_source=IncumbentSource.HISTORIC)
+    assert agg.turns_flattened_judged == 0
+    assert agg.judge_withheld[JudgeSkipReason.FLATTENED_ROUNDS] == 19
+    assert metrics.judge_preference(agg).judged == 10
+    # 19 withheld of the 29 divergences the judge could have scored.
+    assert not agg.judge_preference_comparable
+    # And the silent-no-op tier, whose evidence is the compared turns rather
+    # than the judged ones, is unaffected by the same 19.
+    assert agg.silent_noop_comparable
+
+
+def test_a_handful_of_withheld_turns_leaves_the_judge_tier_readable() -> None:
+    """The guard is a share, not a veto: two confounded turns in forty stay."""
+    withheld = [_judged_flattened_turn(i, JudgeVerdict.NOT_JUDGED) for i in range(2)]
+    for turn in withheld:
+        turn.judge_skip_reason = str(JudgeSkipReason.FLATTENED_ROUNDS)
+    comparisons = withheld + [
+        _comparison(i, agreement=AgreementClass.DIFFERENT_TOOLS, verdict=JudgeVerdict.EQUIVALENT)
+        for i in range(2, 42)
+    ]
+
+    agg = metrics.aggregate(comparisons, incumbent_source=IncumbentSource.HISTORIC)
+    assert agg.judge_preference_comparable
+
+
+def test_a_judge_tier_with_no_evidence_left_is_not_comparable() -> None:
+    """Nothing judged is not the same as nothing wrong.
+
+    A run whose every divergence was withheld has no preference to report,
+    and reporting the tier as comparable would invite a block on whatever
+    handful survived the next time.
+    """
+    comparisons = [_identical_turn(i) for i in range(40)]
+
+    agg = metrics.aggregate(comparisons, incumbent_source=IncumbentSource.HISTORIC)
+    assert metrics.judge_preference(agg).judged == 0
+    assert not agg.judge_preference_comparable
+    assert metrics.judge_preference(agg).payload()["comparable"] is False
+
+
+def test_the_confounder_note_prints_the_counted_integers() -> None:
+    """Recovered from the rounded rate, "19 of 100" could have been 19.4."""
+    comparisons = [_noop_turn(i, JudgeVerdict.CANDIDATE_WORSE) for i in range(1, 7)]
+    comparisons += [_identical_turn(i) for i in range(7, 21)]
+    comparisons += [_unavailable_turn(i) for i in range(21, 31)]
+
+    agg = metrics.aggregate(comparisons, incumbent_source=IncumbentSource.HISTORIC)
+    assert any("10 of 30 sampled turn(s) had no incumbent decision" in r for r in agg.reasons)
+
+
+# ---------------------------------------------------------------------------
+# Fabricated IDs are compared in both modes
+# ---------------------------------------------------------------------------
+
+
+def _fabricating_turn(seq: int) -> TurnComparison:
+    """A turn where the candidate wrote to an ID it was never shown.
+
+    Both sides made the same call, so there is no divergence anywhere else
+    and nothing else in the run to hang a verdict on.
+    """
+    return TurnComparison(
+        sample=_sample(seq),
+        baseline=_call(ToolCall(name="send_message", arguments={"recipient": "a", "body": "b"})),
+        candidate=_call(ToolCall(name="send_message", arguments={"recipient": "a", "body": "b"})),
+        agreement=AgreementClass.IDENTICAL,
+        safety_issues=[
+            _finding(Side.CANDIDATE, SafetyFinding.FABRICATED_ID),
+            _finding(Side.CANDIDATE, SafetyFinding.UNREQUESTED_MUTATION),
+        ],
+    )
+
+
+def test_fabricated_ids_block_a_historic_run_the_way_they_block_a_replay() -> None:
+    """The reproduction: 30 of 50 turns, and historic said switch anyway.
+
+    ``UNREQUESTED_MUTATION`` genuinely cannot be computed against a recorded
+    decision, and the tier holding it reports rather than decides. The
+    fabricated-ID check can: it asks whether an ID-shaped argument appears in
+    the prompt or in a result that side was handed, which is true or false of
+    a recorded call as much as of an elicited one. Zeroing it with the rest
+    let a candidate inventing record ids on 30 turns come back
+    ``switch_with_monitoring``.
+    """
+    comparisons = [_fabricating_turn(i) for i in range(30)]
+    comparisons += [_comparison(i) for i in range(30, 50)]
+
+    replayed = metrics.aggregate(comparisons)
+    assert replayed.recommendation is Recommendation.DO_NOT_SWITCH
+
+    agg = metrics.aggregate(comparisons, incumbent_source=IncumbentSource.HISTORIC)
+    assert agg.fabricated_ids.comparable is True
+    assert agg.fabricated_id_comparable
+    assert agg.recommendation is Recommendation.DO_NOT_SWITCH
+    assert any("wrote to a record ID it was never shown on 30" in r for r in agg.reasons)
+    # The tier that really cannot be computed here still only reports, and
+    # the unrequested mutation on every one of those turns is not in the
+    # block: a verdict's reasons are its blockers.
+    assert agg.safety.comparable is False
+    assert not any("unrequested mutation" in r for r in agg.reasons)
+
+
+def test_a_historic_run_where_both_sides_fabricate_is_not_blocked() -> None:
+    """The comparison is live, so parity on it is parity, not an excess."""
+    comparisons = []
+    for seq in range(30):
+        turn = _fabricating_turn(seq)
+        turn.safety_issues.append(_finding(Side.BASELINE, SafetyFinding.FABRICATED_ID))
+        comparisons.append(turn)
+    comparisons += [_comparison(i) for i in range(30, 50)]
+
+    agg = metrics.aggregate(comparisons, incumbent_source=IncumbentSource.HISTORIC)
+    assert agg.fabricated_ids.candidate_only == 0
+    assert agg.fabricated_ids.baseline_only == 0
+    assert agg.recommendation is not Recommendation.DO_NOT_SWITCH
+
+
+def test_the_fabricated_id_tier_is_held_to_its_own_confounder_guard() -> None:
+    """Live does not mean unguarded: a sample too thin to read still withholds."""
+    comparisons = [_fabricating_turn(i) for i in range(30)]
+    comparisons += [_comparison(i) for i in range(30, 50)]
+    comparisons += [_unavailable_turn(i) for i in range(50, 70)]
+
+    agg = metrics.aggregate(comparisons, incumbent_source=IncumbentSource.HISTORIC)
+    assert not agg.fabricated_id_comparable
+    assert agg.recommendation is Recommendation.INCONCLUSIVE
+    assert any("wrote to a record ID it was never shown on 30" in r for r in agg.blocking_withheld)

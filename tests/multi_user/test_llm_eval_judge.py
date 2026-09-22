@@ -469,3 +469,58 @@ def test_a_replayed_turn_still_gets_the_live_turns_calls_as_context() -> None:
     )
     prompt = _judge_prompt(sample, CANDIDATE, BASELINE, None)
     assert "The live assistant's tool calls" in prompt
+
+
+def test_a_multi_call_candidate_response_cannot_be_blinded() -> None:
+    """The tell that rendering cannot close, pinned where the rendering lives.
+
+    ``sampling._historic_first_decision`` returns exactly one call, so a
+    response listing two is necessarily the candidate's. Nothing in
+    ``_describe`` can hide that: the record has no second call to show, and
+    trimming the candidate's would score a decision it did not make. This
+    asserts the tell is real, which is why
+    ``runner._judge_skip_reason`` withholds the whole turn instead
+    (``JudgeSkipReason.UNBLINDABLE_SHAPE``); a change that made the two
+    shapes match would land here first.
+    """
+    historic = ModelCallResult(
+        provider="anthropic",
+        model="incumbent",
+        tool_calls=[ToolCall(name="qb_send", arguments={"invoice_id": "1186"})],
+    )
+    candidate = ModelCallResult(
+        provider="anthropic",
+        model="candidate",
+        tool_calls=[
+            ToolCall(name="qb_find", arguments={"q": "Acme Plumbing"}),
+            ToolCall(name="qb_send", arguments={"invoice_id": "1187"}),
+        ],
+    )
+    sample = ReplaySample(seq=SEQ_CANDIDATE_IS_A, timestamp="", message_context=TURN_TEXT)
+    prompt = _judge_prompt(sample, candidate, historic, None, historic_side_shown=True)
+    first, second = _responses(prompt)
+    # Same labelled blocks, so the blinding that can be done is done.
+    assert _blocks(first) == _blocks(second) == ["Tool calls"]
+    # And the candidate is still the only side that can list two calls.
+    assert first.count("\n- ") == 2
+    assert second.count("\n- ") == 1
+
+
+def test_a_single_call_candidate_is_indistinguishable_after_the_withholding() -> None:
+    """What is left once the batched turns are withheld: one call each side."""
+    candidate = ModelCallResult(
+        provider="anthropic",
+        model="candidate",
+        tool_calls=[ToolCall(name="qb_send", arguments={"invoice_id": "1187"})],
+        text="Sending that one now.",
+    )
+    historic = ModelCallResult(
+        provider="anthropic",
+        model="incumbent",
+        tool_calls=[ToolCall(name="qb_send", arguments={"invoice_id": "1186"})],
+    )
+    sample = ReplaySample(seq=SEQ_CANDIDATE_IS_A, timestamp="", message_context=TURN_TEXT)
+    prompt = _judge_prompt(sample, candidate, historic, None, historic_side_shown=True)
+    first, second = _responses(prompt)
+    assert _blocks(first) == _blocks(second) == ["Tool calls"]
+    assert first.count("\n- ") == second.count("\n- ") == 1

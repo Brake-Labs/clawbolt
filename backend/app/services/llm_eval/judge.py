@@ -280,6 +280,16 @@ def _judge_prompt(
     turn's own tool calls: they are context on a replayed run, but here the
     historic side is literally the head of that list. And prose alongside a
     tool call, which only the candidate can have (see ``_describe``).
+
+    A third tell cannot be withheld from the prompt, only kept out of it:
+    ``sampling._historic_first_decision`` returns exactly one call, so a
+    response listing two is necessarily the candidate's. There is nothing to
+    render differently, since the record has no second call to show and
+    trimming the candidate's would score a decision it did not make, so
+    ``runner._judge_skip_reason`` withholds the whole turn
+    (``JudgeSkipReason.UNBLINDABLE_SHAPE``). Anything reaching this function
+    in historic mode therefore has at most one call per side, which is what
+    makes the blinding above complete rather than merely thorough.
     """
     sections: list[str] = []
     if context is not None and context.current_time:

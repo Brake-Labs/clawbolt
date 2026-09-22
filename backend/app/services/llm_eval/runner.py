@@ -529,15 +529,22 @@ async def _compare_turn(
     # Both sides get the same checks against the same evidence. Checking only
     # the candidate charged it for everything the incumbent also did.
     #
-    # Except when the incumbent side was not replayed. Nothing is checked on
-    # a decision read out of the transcript, because every finding would be
-    # an artifact of the reading rather than a fact about the incumbent: its
-    # tool names are the very ``historic_tool_names`` the mutation check
-    # exempts, so it can never raise one, and the turn ran against a tool
-    # schema that is not today's, so the args validator would reject calls
-    # production accepted. Recording zero findings there and comparing them
-    # with the candidate's would read as a flawless incumbent, which is why
-    # ``metrics`` marks the comparison incomparable in this mode instead.
+    # Except when the incumbent side was not replayed. Most of the checks
+    # would then be an artifact of the reading rather than a fact about the
+    # incumbent: its tool names are the very ``historic_tool_names`` the
+    # mutation check exempts, so it can never raise one, and the turn ran
+    # against a tool schema that is not today's, so the args validator would
+    # reject calls production accepted. Recording zero findings there and
+    # comparing them with the candidate's would read as a flawless incumbent,
+    # which is why ``metrics`` marks the ``SAFETY_FINDINGS`` comparison
+    # incomparable in this mode instead.
+    #
+    # ``FABRICATED_ID`` is the exception and is checked on both sides in both
+    # modes. It asks whether an ID-shaped argument appears in the prompt that
+    # turn was assembled from or in a result that side was handed, which is
+    # deterministic and needs no second model and no current schema. Zeroing
+    # it along with the rest cost the mode the one finding that lands on a
+    # real customer's record. See ``metrics.check_fabricated_ids``.
     seen = metrics.prompt_text(assembled.messages)
     safety_issues: list[SafetyIssue] = []
     # An unavailable incumbent means nothing about the candidate is compared,
@@ -564,6 +571,12 @@ async def _compare_turn(
                 historic_tool_names=sample.historic_tool_names,
                 seen=seen,
                 side=Side.BASELINE,
+            )
+        )
+    elif baseline_source is TurnSource.HISTORIC:
+        safety_issues.extend(
+            metrics.check_fabricated_ids(
+                baseline, fixture.tools_by_name, seen=seen, side=Side.BASELINE
             )
         )
     comparison = TurnComparison(
@@ -643,6 +656,11 @@ def _judge_skip_reason(
     Recorded rather than inferred so the report can account for every turn.
     A summary whose judge counts add up to 26 of 40 turns, with nothing
     saying where the other 14 went, reads as a broken judge.
+
+    The last two are ``IncumbentSource.HISTORIC`` only, and are checked after
+    the ones above so that what they count is turns the judge would otherwise
+    have scored. ``metrics.RunAggregate.judge_confounders`` divides them by
+    exactly that population, so their order here is load-bearing.
     """
     if not run_has_judge:
         return JudgeSkipReason.JUDGE_DISABLED
@@ -654,6 +672,14 @@ def _judge_skip_reason(
         return JudgeSkipReason.IDENTICAL
     if same_prose:
         return JudgeSkipReason.SAME_PROSE
+    if comparison.baseline_source is TurnSource.HISTORIC:
+        # Two shapes the blinding in ``judge._describe`` cannot cover, so the
+        # turn is withheld rather than shown to a judge that can tell which
+        # side is which. Both are about the record, not about either model.
+        if comparison.sample.historic_calls_flattened:
+            return JudgeSkipReason.FLATTENED_ROUNDS
+        if len(comparison.candidate.tool_calls) > 1:
+            return JudgeSkipReason.UNBLINDABLE_SHAPE
     return None
 
 
@@ -1009,8 +1035,9 @@ def _summary_payload(aggregate: metrics.RunAggregate) -> dict:
         # Whether "the candidate replied where the incumbent acted" can block
         # this run. It compares two decisions that were really made, so
         # historic mode does not rule it out on its own; a sample too
-        # confounded to read does (``RunAggregate.blocking_comparable``).
-        "silent_noop_comparable": aggregate.blocking_comparable,
+        # confounded to read does
+        # (``RunAggregate.silent_noop_confounders``).
+        "silent_noop_comparable": aggregate.silent_noop_comparable,
         # Blocking findings this run saw and could not adjudicate. Non-empty
         # means the verdict is ``inconclusive`` and these are why.
         "blocking_withheld": aggregate.blocking_withheld,

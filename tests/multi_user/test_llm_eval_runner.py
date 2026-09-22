@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -1161,7 +1162,10 @@ async def test_historic_mode_reports_the_unmeasured_incumbent_as_unavailable(
     summary = run.summary_json
     assert summary is not None
     assert summary["safety_comparison"]["comparable"] is False
-    assert summary["fabricated_id_comparison"]["comparable"] is False
+    # Not the fabricated-ID tier. That check is deterministic against the
+    # prompt text plus each side's own lookups, so the historic side really
+    # is measured and its zero is a zero.
+    assert summary["fabricated_id_comparison"]["comparable"] is True
     assert summary["baseline"]["pricing_available"] is False
     assert summary["baseline"]["pricing_unknown_reason"] == "not_replayed"
     assert summary["baseline"]["input_tokens"] == 0
@@ -1664,3 +1668,222 @@ async def test_the_judge_is_not_told_which_side_came_from_the_transcript(
         await execute_run(run_id, concurrency=1)
 
     assert judge.await_args_list[-1].kwargs["historic_side_shown"] is True
+
+
+# ---------------------------------------------------------------------------
+# Shapes the judge cannot be shown blind
+# ---------------------------------------------------------------------------
+#
+# ``_historic_first_decision`` returns exactly one call and never prose
+# beside it, so two shapes identify the recorded side however carefully
+# ``judge._describe`` blinds the rest. The judge defaults to the incumbent
+# model, so both are self-preference channels. The turn is withheld, which
+# also keeps the confounded evidence out of the judge tier.
+
+
+def _flattened_historic_sample() -> list[ReplaySample]:
+    """A turn whose record holds several calls in one flat list."""
+    sample = _historic_samples(1)[0]
+    return [replace(sample, historic_calls_flattened=True)]
+
+
+async def test_the_judge_is_withheld_on_a_flattened_turn(
+    db_session: Session, test_user: User
+) -> None:
+    """The record lost its round boundaries, so the divergence may be that.
+
+    Letting the turn through and discounting the tier afterwards was the old
+    shape, and it left a run whose every judged divergence was one of these
+    passing a guard that divided them by the whole sample.
+    """
+    run_id = _make_run(
+        db_session, test_user.id, samples=1, judge=True, incumbent_source=IncumbentSource.HISTORIC
+    )
+    judge = AsyncMock(return_value=JudgeOutcome(JudgeVerdict.CANDIDATE_WORSE, "worse"))
+    a, b, c, d = _patched_run(
+        samples=_flattened_historic_sample(),
+        call_side_effect=lambda *a, **k: _result(text="I'll answer instead."),
+        tools_by_name={"lookup": _lookup_tool()},
+    )
+    with a, b, c, d, patch("backend.app.services.llm_eval.runner.judge_turn", judge):
+        await execute_run(run_id, concurrency=1)
+
+    judge.assert_not_awaited()
+    run = db_session.execute(select(LLMEvalRun).where(LLMEvalRun.id == run_id)).scalar_one()
+    assert run.summary_json is not None
+    assert run.summary_json["judge_skip_counts"] == {str(JudgeSkipReason.FLATTENED_ROUNDS): 1}
+
+
+async def test_the_judge_is_withheld_when_the_candidate_batches_its_calls(
+    db_session: Session, test_user: User
+) -> None:
+    """Two calls in one response can only be the candidate's.
+
+    The record is walked call by call and yields one, so there is no second
+    call to show on that side and no way to render the difference away.
+    Trimming the candidate's would score a decision it did not make.
+    """
+    run_id = _make_run(
+        db_session, test_user.id, samples=1, judge=True, incumbent_source=IncumbentSource.HISTORIC
+    )
+    judge = AsyncMock(return_value=JudgeOutcome(JudgeVerdict.CANDIDATE_WORSE, "worse"))
+    batched = _result(
+        tools=[
+            ToolCall(name="lookup", arguments={"q": "a1"}),
+            ToolCall(name="lookup", arguments={"q": "a2"}),
+        ]
+    )
+    a, b, c, d = _patched_run(
+        samples=_historic_samples(1),
+        call_side_effect=lambda *a, **k: batched,
+        tools_by_name={"lookup": _lookup_tool()},
+    )
+    with a, b, c, d, patch("backend.app.services.llm_eval.runner.judge_turn", judge):
+        await execute_run(run_id, concurrency=1)
+
+    judge.assert_not_awaited()
+    run = db_session.execute(select(LLMEvalRun).where(LLMEvalRun.id == run_id)).scalar_one()
+    assert run.summary_json is not None
+    assert run.summary_json["judge_skip_counts"] == {str(JudgeSkipReason.UNBLINDABLE_SHAPE): 1}
+    assert any("several tools in one response" in w for w in run.summary_json["warnings"])
+
+
+async def test_a_replayed_run_judges_a_batched_candidate(
+    db_session: Session, test_user: User
+) -> None:
+    """Both sides were elicited, so either may carry two calls and neither is marked."""
+    run_id = _make_run(db_session, test_user.id, samples=1, judge=True)
+    judge = AsyncMock(return_value=JudgeOutcome(JudgeVerdict.EQUIVALENT, "same"))
+    responses = [
+        _result(tools=[ToolCall(name="lookup", arguments={"q": "a"})]),
+        _result(
+            tools=[
+                ToolCall(name="lookup", arguments={"q": "a"}),
+                ToolCall(name="lookup", arguments={"q": "b"}),
+            ]
+        ),
+    ]
+    a, b, c, d = _patched_run(
+        samples=_samples(1),
+        call_side_effect=responses,
+        tools_by_name={"lookup": _lookup_tool()},
+    )
+    with a, b, c, d, patch("backend.app.services.llm_eval.runner.judge_turn", judge):
+        await execute_run(run_id, concurrency=1)
+
+    judge.assert_awaited_once()
+    run = db_session.execute(select(LLMEvalRun).where(LLMEvalRun.id == run_id)).scalar_one()
+    assert run.summary_json is not None
+    assert run.summary_json["judge_skip_counts"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Fabricated IDs are checked on the recorded side too
+# ---------------------------------------------------------------------------
+
+
+class _InvoiceParams(BaseModel):
+    invoice_id: str
+
+
+def _invoice_tool() -> Tool:
+    """A mutating tool with an ID-shaped argument, untagged so it is a write."""
+
+    async def _unused(**_kwargs: object) -> ToolResult:  # pragma: no cover
+        raise AssertionError("a tool was executed during an evaluation")
+
+    return Tool(
+        name="send_invoice",
+        description="send an invoice",
+        function=_unused,
+        params_model=_InvoiceParams,
+    )
+
+
+def _invoice_sample(invoice_id: str) -> list[ReplaySample]:
+    """A turn whose recorded decision wrote to *invoice_id*."""
+    return [
+        ReplaySample(
+            seq=1,
+            timestamp="2026-05-01T12:00:00+00:00",
+            message_context="current ask",
+            historic_reply="sent it",
+            historic_tool_names=["send_invoice"],
+            historic_first_calls=(
+                ToolCall(name="send_invoice", arguments={"invoice_id": invoice_id}),
+            ),
+        )
+    ]
+
+
+async def test_the_recorded_side_is_checked_for_fabricated_ids(
+    db_session: Session, test_user: User
+) -> None:
+    """Both sides invent the same ID, so the comparison is parity, not an excess.
+
+    Checking only the candidate made this run read as a candidate that writes
+    to record ids against an incumbent that never does. The check needs no
+    second model and no current schema: it asks whether the ID is in the
+    prompt that turn was assembled from.
+    """
+    run_id = _make_run(
+        db_session, test_user.id, samples=1, incumbent_source=IncumbentSource.HISTORIC
+    )
+    a, b, c, d = _patched_run(
+        samples=_invoice_sample("77771"),
+        call_side_effect=lambda *a, **k: _result(
+            tools=[ToolCall(name="send_invoice", arguments={"invoice_id": "77771"})]
+        ),
+        tools_by_name={"send_invoice": _invoice_tool()},
+    )
+    with a, b, c, d:
+        await execute_run(run_id, concurrency=1)
+
+    turn = _turns_of(db_session, run_id)[0]
+    fabricated = {
+        issue["side"]
+        for issue in json.loads(turn.safety_issues)
+        if issue["finding"] == str(SafetyFinding.FABRICATED_ID)
+    }
+    assert fabricated == {"candidate", "baseline"}
+    run = db_session.execute(select(LLMEvalRun).where(LLMEvalRun.id == run_id)).scalar_one()
+    assert run.summary_json is not None
+    comparison = run.summary_json["fabricated_id_comparison"]
+    assert comparison["comparable"] is True
+    assert comparison["candidate_only"] == 0
+    assert comparison["baseline_only"] == 0
+
+
+async def test_only_the_fabricated_id_check_runs_on_the_recorded_side(
+    db_session: Session, test_user: User
+) -> None:
+    """The rest would be artifacts of the reading.
+
+    The recorded call's own tool name is what ``UNREQUESTED_MUTATION``
+    exempts, so it can never raise one, and validating that day's arguments
+    against today's schema would reject calls production accepted. Only the
+    deterministic check is run, and only its finding is recorded.
+    """
+    run_id = _make_run(
+        db_session, test_user.id, samples=1, incumbent_source=IncumbentSource.HISTORIC
+    )
+    a, b, c, d = _patched_run(
+        samples=_invoice_sample("77771"),
+        call_side_effect=lambda *a, **k: _result(text="I'll check first."),
+        tools_by_name={"send_invoice": _invoice_tool()},
+    )
+    with a, b, c, d:
+        await execute_run(run_id, concurrency=1)
+
+    turn = _turns_of(db_session, run_id)[0]
+    baseline_findings = {
+        issue["finding"] for issue in json.loads(turn.safety_issues) if issue["side"] == "baseline"
+    }
+    assert baseline_findings == {str(SafetyFinding.FABRICATED_ID)}
+    run = db_session.execute(select(LLMEvalRun).where(LLMEvalRun.id == run_id)).scalar_one()
+    assert run.summary_json is not None
+    # It counts on the recorded side of the broader tier too, which is real
+    # rather than a measured zero. That tier still reports rather than
+    # decides, because the checks it would compare were not run there.
+    assert run.summary_json["safety_comparison"]["comparable"] is False
+    assert run.summary_json["safety_comparison"]["baseline_turns"] == 1
