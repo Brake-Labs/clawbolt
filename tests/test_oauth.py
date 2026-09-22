@@ -760,7 +760,10 @@ def test_google_calendar_oauth_config_configured() -> None:
     assert config.client_id == "gcal-cid"
     assert config.integration == "google_calendar"
     assert config.use_pkce is False
-    assert config.extra_auth_params == {"access_type": "offline", "prompt": "consent"}
+    assert config.extra_auth_params == {
+        "access_type": "offline",
+        "prompt": "consent select_account",
+    }
 
 
 def test_google_calendar_auth_url_includes_access_type_offline(

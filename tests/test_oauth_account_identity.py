@@ -6,7 +6,7 @@ import asyncio
 import logging
 import time
 import urllib.parse
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -26,6 +26,9 @@ from backend.app.services.oauth import (
     OAuthConfig,
     OAuthService,
     OAuthTokenData,
+    get_gmail_oauth_config,
+    get_google_calendar_oauth_config,
+    get_google_drive_oauth_config,
     oauth_service,
 )
 
@@ -235,3 +238,35 @@ async def test_manage_integration_status_reports_account(user: User) -> None:
     assert f"Google account: {ACCOUNT}" in calendar_line
     gmail_line = next(ln for ln in result.content.splitlines() if ln.startswith("- gmail"))
     assert "Google account: unknown" in gmail_line
+
+
+@pytest.mark.parametrize(
+    "config_factory",
+    [
+        get_gmail_oauth_config,
+        get_google_calendar_oauth_config,
+        get_google_drive_oauth_config,
+    ],
+)
+def test_google_connect_links_ask_which_account(
+    config_factory: Callable[[], OAuthConfig | None],
+) -> None:
+    """Without select_account Google silently uses the browser's current
+    account, so a user with two accounts connects the wrong one and their
+    saved calendars and files read as missing."""
+    with patch.multiple(
+        settings,
+        gmail_client_id="cid",
+        gmail_client_secret="secret",
+        google_calendar_client_id="cid",
+        google_calendar_client_secret="secret",
+        google_drive_client_id="cid",
+        google_drive_client_secret="secret",
+    ):
+        config = config_factory()
+    assert config is not None
+    url = OAuthService().get_authorization_url(config, "user-1")
+    prompt = httpx.URL(url).params["prompt"]
+    assert "select_account" in prompt
+    # consent still has to be there: Google only returns a refresh token with it.
+    assert "consent" in prompt
