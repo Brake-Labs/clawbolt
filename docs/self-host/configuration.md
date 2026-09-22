@@ -181,7 +181,7 @@ Photos and files the user sends over a messaging channel are cached on disk whil
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `APPROVAL_TIMEOUT_SECONDS` | `120` | Seconds to wait for user approval of a tool call before automatically denying |
-| `AGENT_PROCESSING_TIMEOUT_SECONDS` | `300` | Maximum seconds for a single message's agent processing (includes waiting for the per-user lock). Prevents one hung LLM call from blocking all subsequent messages for the same user |
+| `AGENT_PROCESSING_TIMEOUT_SECONDS` | `600` | Maximum seconds for a single agent turn. The clock starts once the turn holds the per-user lock, so time spent queued behind another turn does not count. Prevents one hung LLM call from blocking all subsequent messages for the same user |
 | `MESSAGE_BATCH_WINDOW_MS` | `1500` | Milliseconds to wait for more messages before processing. Groups rapid-fire messages into one agent call |
 | `INBOUND_RECOVERY_LOOKBACK_MINUTES` | `30` | On startup, sweep for inbound messages persisted but never dispatched to the agent (worker died during the batcher window). Re-dispatch each one. Older orphans are skipped. Set to `0` to disable |
 | `COMPACTION_RETRY_LOOKBACK_MINUTES` | `10080` | On startup, retry compaction events stuck in `pending` (the background compaction LLM call crashed or the process restarted mid-call). Rows older than a week or already retried 3 times are skipped. Set to `0` to disable |

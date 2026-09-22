@@ -121,8 +121,7 @@ async def run_unless_folded(coro: Coroutine[Any, Any, None], consumed: asyncio.E
     first and it was cancelled while still waiting. The claim can only
     happen while another task holds the lock, and the entry is unregistered
     as soon as *coro* acquires it, so a cancelled *coro* has not started the
-    pipeline. Cancelling this function (e.g. the dispatch timeout) cancels
-    *coro* too.
+    pipeline. Cancelling this function cancels *coro* too.
     """
     run = asyncio.ensure_future(coro)
     folded = asyncio.ensure_future(consumed.wait())

@@ -352,6 +352,13 @@ async def _dispatch_to_pipeline(
     Handles timeout and exception fallbacks. Used by both the direct
     (non-batched) path and the ``MessageBatcher`` flush path.
 
+    ``agent_processing_timeout_seconds`` bounds the turn itself and starts
+    once the per-user lock is held. Time spent queued behind another turn
+    does not count against it, so a follow-up that waits out a long turn
+    still gets its full budget. The wait is not bounded separately: every
+    lock holder is either a turn bounded by this same timeout or a short
+    DB operation, so the wait is bounded by the turns queued ahead of it.
+
     While waiting for the per-user lock, a background task polls for a
     stale approval gate left by the previous pipeline. If found, it
     resolves the gate as INTERRUPTED so the previous pipeline can finish
@@ -408,63 +415,86 @@ async def _dispatch_to_pipeline(
             return
 
     async def _run_locked() -> None:
-        nonlocal user, session, pipeline_error
+        nonlocal user, session, pipeline_error, timed_out
         async with user_locks.acquire(user_id):
             interrupt_task.cancel()
+            long_wait_warning.cancel()
             if fold_entry is not None:
                 # From here on this dispatch is the running turn and must
                 # not be claimed by its own drain.
                 midturn_inbox.unregister(fold_entry)
+            # The processing budget starts now that the turn owns the lock,
+            # not when the dispatch began waiting for it.
+            turn_timeout = asyncio.timeout(settings.agent_processing_timeout_seconds)
             try:
-                # Defensive User reload: pull the latest row so any
-                # writes from a previous pipeline that was holding
-                # the lock (e.g. via ingestion or admin updates)
-                # land on this turn.
-                async with db_session_async() as db:
-                    fresh = (
-                        await db.execute(select(User).filter_by(id=user_id))
-                    ).scalar_one_or_none()
-                    if fresh is not None:
-                        db.expunge(fresh)
-                        user = fresh
-                # Reload session messages from DB so we see any
-                # messages persisted by a previous pipeline that
-                # was holding the lock (e.g. tool interactions
-                # from an interrupted approval).
-                fresh_session = await get_session_store(user_id).load_session_async(
-                    session.session_id
-                )
-                if fresh_session is not None:
-                    session = fresh_session
-                await handle_inbound_message(
-                    user=user,
-                    session=session,
-                    message=message,
-                    media_urls=media_urls,
-                    downloaded_media=downloaded_media,
-                    channel=channel,
-                    request_id=request_id,
-                    download_media=download_media,
-                )
+                async with turn_timeout:
+                    # Defensive User reload: pull the latest row so any
+                    # writes from a previous pipeline that was holding
+                    # the lock (e.g. via ingestion or admin updates)
+                    # land on this turn.
+                    async with db_session_async() as db:
+                        fresh = (
+                            await db.execute(select(User).filter_by(id=user_id))
+                        ).scalar_one_or_none()
+                        if fresh is not None:
+                            db.expunge(fresh)
+                            user = fresh
+                    # Reload session messages from DB so we see any
+                    # messages persisted by a previous pipeline that
+                    # was holding the lock (e.g. tool interactions
+                    # from an interrupted approval).
+                    fresh_session = await get_session_store(user_id).load_session_async(
+                        session.session_id
+                    )
+                    if fresh_session is not None:
+                        session = fresh_session
+                    await handle_inbound_message(
+                        user=user,
+                        session=session,
+                        message=message,
+                        media_urls=media_urls,
+                        downloaded_media=downloaded_media,
+                        channel=channel,
+                        request_id=request_id,
+                        download_media=download_media,
+                    )
+            except TimeoutError as exc:
+                # Only this turn's own deadline counts as a processing
+                # timeout. A TimeoutError raised from inside the pipeline
+                # is an ordinary pipeline error.
+                if turn_timeout.expired():
+                    timed_out = True
+                else:
+                    pipeline_error = exc
             except Exception as exc:
                 pipeline_error = exc
 
+    def _warn_long_lock_wait() -> None:
+        # The wait has no bound of its own, so this is the only signal
+        # that a lock holder has outlived its turn timeout.
+        logger.warning(
+            "Message seq %d for user %s has waited over %.0fs for the per-user lock",
+            message.seq,
+            user_id,
+            settings.agent_processing_timeout_seconds,
+        )
+
     folded = False
+    interrupt_task = asyncio.create_task(_interrupt_stale_approval())
+    long_wait_warning = asyncio.get_running_loop().call_later(
+        settings.agent_processing_timeout_seconds, _warn_long_lock_wait
+    )
     try:
-        async with asyncio.timeout(settings.agent_processing_timeout_seconds):
-            interrupt_task = asyncio.create_task(_interrupt_stale_approval())
-            try:
-                if fold_entry is None:
-                    await _run_locked()
-                else:
-                    midturn_inbox.register(fold_entry)
-                    folded = not await run_unless_folded(_run_locked(), fold_entry.consumed)
-            finally:
-                interrupt_task.cancel()
-                if fold_entry is not None:
-                    midturn_inbox.unregister(fold_entry)
-    except TimeoutError:
-        timed_out = True
+        if fold_entry is None:
+            await _run_locked()
+        else:
+            midturn_inbox.register(fold_entry)
+            folded = not await run_unless_folded(_run_locked(), fold_entry.consumed)
+    finally:
+        interrupt_task.cancel()
+        long_wait_warning.cancel()
+        if fold_entry is not None:
+            midturn_inbox.unregister(fold_entry)
 
     if folded:
         logger.info(
