@@ -118,6 +118,72 @@ _HEARTBEAT_STALE_AFTER = timedelta(minutes=15)
 MAX_CONSECUTIVE_CALL_FAILURES = 3
 
 
+# Stamped on every summary. The replay's shape moves the numbers a run
+# reports: continuing through lookups and grouping batches both change how
+# often two models diverge. A calibration run is only a noise floor for runs
+# measured the same way, so ``divergence_noise_floor`` ignores summaries from
+# another version. Bump it when the replay changes what it measures.
+HARNESS_VERSION = 2
+
+
+def is_self_comparison(run: LLMEvalRun) -> bool:
+    """Whether *run* replays the incumbent against itself, as a calibration run."""
+    return (
+        run.candidate_endpoint,
+        run.candidate_provider,
+        run.candidate_model,
+        run.candidate_reasoning_effort,
+    ) == (
+        run.baseline_endpoint,
+        run.baseline_provider,
+        run.baseline_model,
+        run.baseline_reasoning_effort,
+    )
+
+
+async def divergence_noise_floor(run: LLMEvalRun) -> float | None:
+    """How often this user's incumbent diverges from itself, if it was measured.
+
+    Read from the newest completed calibration run (the incumbent as its own
+    candidate, same endpoint and effort) for the same user, measured by this
+    harness version. ``metrics._decide`` cautions on divergence only above
+    this floor plus ``metrics.DIVERGENCE_MARGIN``; without one it uses the
+    uncalibrated ceiling.
+    """
+    async with db_session_async() as db:
+        candidates = (
+            (
+                await db.execute(
+                    select(LLMEvalRun)
+                    .where(
+                        LLMEvalRun.user_id == run.user_id,
+                        LLMEvalRun.id != run.id,
+                        LLMEvalRun.status == str(RunStatus.COMPLETED),
+                        LLMEvalRun.baseline_endpoint == run.baseline_endpoint,
+                        LLMEvalRun.baseline_provider == run.baseline_provider,
+                        LLMEvalRun.baseline_model == run.baseline_model,
+                        LLMEvalRun.baseline_reasoning_effort == run.baseline_reasoning_effort,
+                        LLMEvalRun.candidate_endpoint == LLMEvalRun.baseline_endpoint,
+                        LLMEvalRun.candidate_provider == LLMEvalRun.baseline_provider,
+                        LLMEvalRun.candidate_model == LLMEvalRun.baseline_model,
+                        LLMEvalRun.candidate_reasoning_effort
+                        == LLMEvalRun.baseline_reasoning_effort,
+                    )
+                    .order_by(LLMEvalRun.completed_at.desc())
+                    .limit(10)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    for calibration in candidates:
+        summary = calibration.summary_json or {}
+        rate = summary.get("divergence_rate")
+        if summary.get("harness_version") == HARNESS_VERSION and isinstance(rate, int | float):
+            return float(rate)
+    return None
+
+
 class _CancellationWatcher:
     """Caches the cancelled flag for a run across closely-spaced checks."""
 
@@ -536,7 +602,18 @@ async def execute_run(run_id: int, *, concurrency: int) -> None:
         raise
 
     comparisons.sort(key=lambda c: c.sample.seq)
-    aggregate = metrics.aggregate(comparisons, targets)
+    self_comparison = is_self_comparison(run)
+    aggregate = metrics.aggregate(
+        comparisons,
+        targets,
+        divergence_noise_floor=None if self_comparison else await divergence_noise_floor(run),
+    )
+    if self_comparison:
+        aggregate.warnings.append(
+            f"This run replays the incumbent against itself. Its divergence rate, "
+            f"{aggregate.divergence_rate:.0%}, is the noise floor later runs against this "
+            f"incumbent for this user are measured against."
+        )
     if breaker_error:
         # The evidence gathered before the provider went down is kept and
         # still readable, but it cannot endorse a switch: the run stopped
@@ -596,6 +673,7 @@ def _summary_payload(aggregate: metrics.RunAggregate) -> dict:
     silently rewrites the verdict of a run an operator already acted on.
     """
     return {
+        "harness_version": HARNESS_VERSION,
         "turns_total": aggregate.turns_total,
         "turns_completed": aggregate.turns_completed,
         "turns_failed": aggregate.turns_failed,
@@ -607,8 +685,13 @@ def _summary_payload(aggregate: metrics.RunAggregate) -> dict:
         "fabricated_id_comparison": aggregate.fabricated_ids.payload(),
         "judge_counts": aggregate.judge_counts,
         "judge_skip_counts": aggregate.judge_skip_counts,
+        "judge_preference": metrics.judge_preference(aggregate).payload(),
         "identical_rate": round(aggregate.identical_rate, 4),
         "divergence_rate": round(aggregate.divergence_rate, 4),
+        "divergence_noise_floor": aggregate.divergence_noise_floor,
+        "divergence_threshold": round(
+            metrics.divergence_threshold(aggregate.divergence_noise_floor), 4
+        ),
         "silent_noop_rate": round(aggregate.silent_noop_rate, 4),
         "silent_noop_blocking_rate": round(aggregate.silent_noop_blocking_rate, 4),
         "baseline": _model_totals_payload(aggregate.baseline),

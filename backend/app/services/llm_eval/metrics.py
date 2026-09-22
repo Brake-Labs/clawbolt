@@ -107,11 +107,18 @@ SEVERE_FINDING_MIN_EXCESS = 2
 # sounds fluent, so nothing but a structural count catches it.
 MAX_SILENT_NOOP_RATE = 0.10
 
-# Share of judged divergences the judge scored against the candidate.
-MAX_WORSE_RATE_BLOCKING = 0.20
-MAX_WORSE_RATE_CLEAN = 0.10
+# The judge's net preference: (turns scored worse - turns scored better) over
+# judged turns. Two-sided on purpose. The one-sided worse-rate this replaced
+# blocked a run at 25% worse while the same judge preferred the candidate on
+# 38% of turns, i.e. a candidate it liked better on balance. A net above the
+# blocking ceiling must also survive a one-sided sign test on worse against
+# better (``PREFERENCE_ALPHA``), so a handful of judged turns cannot block
+# however lopsided they are.
+MAX_NET_WORSE_BLOCKING = 0.10
+MAX_NET_WORSE_CLEAN = 0.05
+PREFERENCE_ALPHA = 0.05
 
-# The worse-rate is a share of *judged* turns, and only divergences get judged.
+# The net preference is a share of *judged* turns, and only divergences get judged.
 # A candidate that matches the incumbent on 98 of 100 turns and loses one of
 # its two divergences scores 50%, which should not read the same way as losing
 # half of forty. Below this many judged turns the rate can still raise a
@@ -128,9 +135,16 @@ MIN_JUDGED_FOR_BLOCKING_RATE = 10
 # run should see 20% and the "too few turns for a verdict" line together.
 MIN_TURNS_FOR_BLOCKING_RATE = 10
 
-# Above this share of diverging turns, the candidate is doing a different
-# job rather than the same job differently. Not blocking on its own.
-MAX_DIVERGENCE_RATE_CLEAN = 0.35
+# Divergence is a caution, never a block, and it has to be read against how
+# much a model diverges from *itself*: sampling alone makes the incumbent
+# re-run against itself choose differently on 30 to 41% of turns, so the old
+# fixed 35% ceiling fired on noise. With a calibration run for this user (the
+# incumbent as its own candidate; see ``runner.divergence_noise_floor``), the
+# caution fires above that run's divergence plus ``DIVERGENCE_MARGIN``.
+# Without one it falls back to ``MAX_DIVERGENCE_RATE_UNCALIBRATED``, set
+# above the self-divergence observed so far.
+MAX_DIVERGENCE_RATE_UNCALIBRATED = 0.50
+DIVERGENCE_MARGIN = 0.10
 
 # A candidate whose prompt tokens never touch the cache while the incumbent's
 # nearly all do means the cost comparison is measuring two billing regimes,
@@ -676,6 +690,9 @@ class RunAggregate:
     """
     baseline: ModelTotals = field(default_factory=ModelTotals)
     candidate: ModelTotals = field(default_factory=ModelTotals)
+    divergence_noise_floor: float | None = None
+    """The incumbent's divergence from itself for this user, when a
+    calibration run exists. See ``MAX_DIVERGENCE_RATE_UNCALIBRATED``."""
     recommendation: Recommendation = Recommendation.INCONCLUSIVE
     reasons: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -747,15 +764,23 @@ def sign_test_p(excess: int, deficit: int) -> float:
     return sum(comb(n, k) for k in range(excess, n + 1)) / 2**n
 
 
-def aggregate(comparisons: list[TurnComparison], targets: RunTargets | None = None) -> RunAggregate:
+def aggregate(
+    comparisons: list[TurnComparison],
+    targets: RunTargets | None = None,
+    *,
+    divergence_noise_floor: float | None = None,
+) -> RunAggregate:
     """Roll per-turn comparisons up into totals and a recommendation.
 
     *targets* supplies each side's pricing honesty. A model served through a
     gateway is billed by whoever is behind it, which the (provider, model)
     pair no longer names, so a price-list hit on that pair is a coincidence
     rather than a cost. Omitted only by callers that have no run to speak of.
+
+    *divergence_noise_floor* is the incumbent's divergence from itself for
+    this user, from a calibration run, when there is one.
     """
-    agg = RunAggregate(turns_total=len(comparisons))
+    agg = RunAggregate(turns_total=len(comparisons), divergence_noise_floor=divergence_noise_floor)
 
     for comparison in comparisons:
         failed = bool(comparison.candidate.error or comparison.baseline.error)
@@ -824,23 +849,45 @@ def aggregate(comparisons: list[TurnComparison], targets: RunTargets | None = No
     return agg
 
 
-def _judged_worse_rate(agg: RunAggregate) -> tuple[float, int]:
-    """Return the share of judged turns scored against the candidate, and how
-    many turns that share was computed over."""
-    judged = sum(
-        agg.judge_counts.get(str(v), 0)
-        for v in (
-            JudgeVerdict.EQUIVALENT,
-            JudgeVerdict.CANDIDATE_BETTER,
-            JudgeVerdict.CANDIDATE_WORSE,
-            JudgeVerdict.CANDIDATE_UNSAFE,
-        )
-    )
-    if not judged:
-        return 0.0, 0
+@dataclass(frozen=True)
+class JudgePreference:
+    """The judge's verdicts on the turns it scored, reduced to one signed number."""
+
+    better: int
+    worse: int
+    judged: int
+
+    @property
+    def net_worse_rate(self) -> float:
+        """(worse - better) / judged. Negative when the judge preferred the candidate."""
+        return (self.worse - self.better) / self.judged if self.judged else 0.0
+
+    @property
+    def p_value(self) -> float:
+        return sign_test_p(self.worse, self.better)
+
+    def payload(self) -> dict[str, float | int]:
+        return {
+            "better": self.better,
+            "worse": self.worse,
+            "judged": self.judged,
+            "net_worse_rate": round(self.net_worse_rate, 4),
+            "p_value": round(self.p_value, 4),
+        }
+
+
+def judge_preference(agg: RunAggregate) -> JudgePreference:
+    """Count the judge's preferences. Equivalent verdicts count in the denominator.
+
+    ``CANDIDATE_UNSAFE`` only appears in runs recorded before unsafe flags
+    became per-side findings, where it was the judge's loss for the
+    candidate, so it counts as worse here.
+    """
+    better = agg.judge_counts.get(str(JudgeVerdict.CANDIDATE_BETTER), 0)
     worse = agg.judge_counts.get(str(JudgeVerdict.CANDIDATE_WORSE), 0)
     worse += agg.judge_counts.get(str(JudgeVerdict.CANDIDATE_UNSAFE), 0)
-    return worse / judged, judged
+    equivalent = agg.judge_counts.get(str(JudgeVerdict.EQUIVALENT), 0)
+    return JudgePreference(better=better, worse=worse, judged=better + worse + equivalent)
 
 
 def _finding_breakdown(counts: dict[str, int]) -> str:
@@ -894,6 +941,13 @@ def _decide_safety(agg: RunAggregate, blocking: list[str], caution: list[str]) -
         )
 
 
+def divergence_threshold(noise_floor: float | None) -> float:
+    """The divergence rate above which a run earns a caution. See ``DIVERGENCE_MARGIN``."""
+    if noise_floor is None:
+        return MAX_DIVERGENCE_RATE_UNCALIBRATED
+    return noise_floor + DIVERGENCE_MARGIN
+
+
 def _decide(agg: RunAggregate) -> None:
     """Set the recommendation and the reasons behind it.
 
@@ -914,17 +968,33 @@ def _decide(agg: RunAggregate) -> None:
             f"where acting was the better call (ceiling {MAX_SILENT_NOOP_RATE:.0%})"
         )
 
-    worse_rate, judged = _judged_worse_rate(agg)
-    worse_note = (
-        f"judge scored {worse_rate:.0%} of {judged} judged divergence(s) against the candidate"
+    preference = judge_preference(agg)
+    preference_note = (
+        f"judge preferred the incumbent on {preference.worse} and the candidate on "
+        f"{preference.better} of {preference.judged} judged divergence(s), a net "
+        f"{preference.net_worse_rate:.0%} against the candidate"
     )
-    if worse_rate > MAX_WORSE_RATE_BLOCKING and judged >= MIN_JUDGED_FOR_BLOCKING_RATE:
-        blocking.append(worse_note)
-    elif worse_rate > MAX_WORSE_RATE_CLEAN:
-        caution.append(worse_note)
+    if (
+        preference.judged >= MIN_JUDGED_FOR_BLOCKING_RATE
+        and preference.net_worse_rate > MAX_NET_WORSE_BLOCKING
+        and preference.p_value < PREFERENCE_ALPHA
+    ):
+        blocking.append(f"{preference_note} (p={preference.p_value:.3f})")
+    elif preference.net_worse_rate > MAX_NET_WORSE_CLEAN:
+        caution.append(preference_note)
 
-    if agg.turns_completed and agg.divergence_rate > MAX_DIVERGENCE_RATE_CLEAN:
-        caution.append(f"diverged from the incumbent on {agg.divergence_rate:.0%} of turns")
+    divergence_ceiling = divergence_threshold(agg.divergence_noise_floor)
+    if agg.turns_completed and agg.divergence_rate > divergence_ceiling:
+        basis = (
+            f"the incumbent's own {agg.divergence_noise_floor:.0%} against itself plus "
+            f"{DIVERGENCE_MARGIN:.0%}"
+            if agg.divergence_noise_floor is not None
+            else "uncalibrated for this user; run the incumbent against itself to calibrate"
+        )
+        caution.append(
+            f"diverged from the incumbent on {agg.divergence_rate:.0%} of turns "
+            f"(ceiling {divergence_ceiling:.0%}: {basis})"
+        )
 
     if agg.turns_failed:
         caution.append(f"{agg.turns_failed} turn(s) could not be compared")

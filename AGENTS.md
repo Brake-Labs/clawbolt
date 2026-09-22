@@ -259,6 +259,15 @@ Three invariants, each of which the feature is worthless without:
   artifact (`UNRESOLVED_TOOL_NAME`, not compared) rather than a
   hallucination. Both mistakes produced almost every finding in the first
   real runs.
+- **Quality is a net preference, and divergence is read against noise.** The
+  judge's verdicts reduce to (worse - better) / judged, which blocks only
+  above `MAX_NET_WORSE_BLOCKING` and with a significant sign test. Divergence
+  never blocks; its caution fires above the incumbent's own divergence from
+  itself plus `DIVERGENCE_MARGIN`. To calibrate a user, start a run whose
+  candidate is the incumbent (same endpoint, model and effort); later runs
+  for that user pick it up (`runner.divergence_noise_floor`). Bump
+  `runner.HARNESS_VERSION` when the replay changes what it measures, so old
+  calibrations stop applying.
 - **A failing provider stops the run.** `MAX_CONSECUTIVE_CALL_FAILURES`
   consecutive errored turns end it with `FAILED`, the evidence already
   gathered, and `inconclusive` stamped on both the column and the summary. A

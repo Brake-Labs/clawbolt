@@ -65,6 +65,16 @@ class AdminLLMEvalSideComparison(BaseModel):
     p_value: float = 1.0
 
 
+class AdminLLMEvalJudgePreference(BaseModel):
+    """How often the judge preferred each side, over the turns it scored."""
+
+    better: int = 0
+    worse: int = 0
+    judged: int = 0
+    net_worse_rate: float = 0.0
+    p_value: float = 1.0
+
+
 class AdminLLMEvalSummary(BaseModel):
     """The frozen aggregate stored on the run when it completed."""
 
@@ -89,8 +99,17 @@ class AdminLLMEvalSummary(BaseModel):
     # account for every turn, so a report never leaves a silent remainder
     # between the judged count and the turn count.
     judge_skip_counts: dict[str, int] = Field(default_factory=dict)
+    # The judge's verdicts reduced to a net preference; see
+    # ``llm_eval.metrics.JudgePreference``. ``None`` on older runs.
+    judge_preference: AdminLLMEvalJudgePreference | None = None
     identical_rate: float = 0.0
     divergence_rate: float = 0.0
+    # The incumbent's divergence from itself for this user, from the newest
+    # calibration run, and the ceiling this run's divergence was held to.
+    # The floor is ``None`` when no calibration run exists; the threshold is
+    # ``None`` on runs recorded before it was reported.
+    divergence_noise_floor: float | None = None
+    divergence_threshold: float | None = None
     silent_noop_rate: float = 0.0
     # The subset of ``silent_noop_rate`` the judge did not score in the
     # candidate's favor, which is what the recommendation blocks on. Prose is

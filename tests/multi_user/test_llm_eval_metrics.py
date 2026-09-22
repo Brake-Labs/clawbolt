@@ -344,7 +344,7 @@ def test_silent_noop_rate_above_ceiling_blocks() -> None:
 
 def test_high_divergence_downgrades_to_monitoring() -> None:
     comparisons = [_comparison(i) for i in range(40)]
-    for c in comparisons[:20]:  # 50% diverged, none of it structurally unsafe
+    for c in comparisons[:24]:  # 60% diverged, none of it structurally unsafe
         c.agreement = AgreementClass.SAME_TOOLS_DIFFERENT_ARGS
         c.judge_verdict = JudgeVerdict.EQUIVALENT
     result = metrics.aggregate(comparisons)
@@ -1123,3 +1123,74 @@ def test_fabricated_ids_the_incumbent_also_makes_do_not_block() -> None:
         c.safety_issues = [_finding(Side.BASELINE, SafetyFinding.FABRICATED_ID)]
     result = metrics.aggregate(comparisons)
     assert result.recommendation is Recommendation.SAFE_TO_SWITCH
+
+
+# ---------------------------------------------------------------------------
+# The judge's preference is net, and divergence is read against the noise floor
+# ---------------------------------------------------------------------------
+
+
+def _judged(worse: int, better: int, equivalent: int, total: int = 100) -> list[TurnComparison]:
+    comparisons = [_comparison(i) for i in range(total)]
+    verdicts = (
+        [JudgeVerdict.CANDIDATE_WORSE] * worse
+        + [JudgeVerdict.CANDIDATE_BETTER] * better
+        + [JudgeVerdict.EQUIVALENT] * equivalent
+    )
+    for comparison, verdict in zip(comparisons, verdicts, strict=False):
+        comparison.agreement = AgreementClass.SAME_TOOLS_DIFFERENT_ARGS
+        comparison.judge_verdict = verdict
+    return comparisons
+
+
+def test_a_candidate_the_judge_prefers_on_balance_is_not_blocked() -> None:
+    """Regression: the worse-rate ignored ``candidate_better``.
+
+    A run was blocked at 25% worse while the judge preferred the candidate on
+    38% of the same turns. On balance that candidate is the better model.
+    """
+    result = metrics.aggregate(_judged(worse=10, better=15, equivalent=15, total=40))
+    preference = metrics.judge_preference(result)
+    assert preference.net_worse_rate < 0
+    assert not any("judge preferred" in r for r in result.reasons)
+    assert result.recommendation is not Recommendation.DO_NOT_SWITCH
+
+
+def test_a_candidate_the_judge_rejects_on_balance_is_blocked() -> None:
+    result = metrics.aggregate(_judged(worse=20, better=4, equivalent=16, total=40))
+    assert result.recommendation is Recommendation.DO_NOT_SWITCH
+    assert any("net 40% against the candidate" in r for r in result.reasons)
+
+
+def test_a_lopsided_but_tiny_judged_sample_is_a_caution_not_a_block() -> None:
+    """Five losses against two wins is p=0.23 on a sign test: not evidence enough."""
+    result = metrics.aggregate(_judged(worse=5, better=2, equivalent=5, total=40))
+    assert result.recommendation is Recommendation.SWITCH_WITH_MONITORING
+    assert any("judge preferred" in r for r in result.reasons)
+
+
+def test_divergence_at_the_incumbents_own_noise_floor_is_not_a_caution() -> None:
+    """Regression: the fixed 35% ceiling sat inside the incumbent's own noise.
+
+    Replayed against itself, the incumbent diverges on 30 to 41% of turns,
+    so a candidate identical in behaviour drew a divergence caution.
+    """
+    comparisons = [_comparison(i) for i in range(100)]
+    for c in comparisons[:40]:
+        c.agreement = AgreementClass.SAME_TOOLS_DIFFERENT_ARGS
+        c.judge_verdict = JudgeVerdict.EQUIVALENT
+    assert metrics.aggregate(comparisons).recommendation is Recommendation.SAFE_TO_SWITCH
+
+
+def test_divergence_is_read_against_a_measured_noise_floor() -> None:
+    comparisons = [_comparison(i) for i in range(100)]
+    for c in comparisons[:40]:
+        c.agreement = AgreementClass.SAME_TOOLS_DIFFERENT_ARGS
+        c.judge_verdict = JudgeVerdict.EQUIVALENT
+
+    quiet = metrics.aggregate(comparisons, divergence_noise_floor=0.35)
+    assert quiet.recommendation is Recommendation.SAFE_TO_SWITCH
+
+    noisy = metrics.aggregate(comparisons, divergence_noise_floor=0.20)
+    assert noisy.recommendation is Recommendation.SWITCH_WITH_MONITORING
+    assert any("the incumbent's own 20% against itself" in r for r in noisy.reasons)

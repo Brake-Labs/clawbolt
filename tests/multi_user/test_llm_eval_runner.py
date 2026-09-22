@@ -25,6 +25,7 @@ from backend.app.agent.tools.base import Tool, ToolResult, ToolTags
 from backend.app.models import LLMEvalRun, LLMEvalTurnResult, User
 from backend.app.services.llm_eval.judge import JudgeOutcome
 from backend.app.services.llm_eval.runner import (
+    HARNESS_VERSION,
     MAX_CONSECUTIVE_CALL_FAILURES,
     execute_run,
     mark_interrupted_runs,
@@ -830,3 +831,67 @@ async def test_the_judge_is_given_the_conversation_and_the_turns_clock(
     assert "earlier ask" in context.transcript
     assert "current ask" not in context.transcript
     assert "2026-05-01" in context.current_time
+
+
+# ---------------------------------------------------------------------------
+# Calibrating divergence with the incumbent against itself
+# ---------------------------------------------------------------------------
+
+
+def _calibration_run(db: Session, user_id: str, *, divergence: float, version: int) -> None:
+    db.add(
+        LLMEvalRun(
+            user_id=user_id,
+            baseline_provider="anthropic",
+            baseline_model="incumbent",
+            candidate_provider="anthropic",
+            candidate_model="incumbent",
+            requested_samples=100,
+            status=str(RunStatus.COMPLETED),
+            completed_at=datetime.now(UTC),
+            summary_json={"harness_version": version, "divergence_rate": divergence},
+        )
+    )
+    db.commit()
+
+
+async def test_a_calibration_run_sets_the_divergence_noise_floor(
+    db_session: Session, test_user: User
+) -> None:
+    _calibration_run(db_session, test_user.id, divergence=0.9, version=HARNESS_VERSION - 1)
+    _calibration_run(db_session, test_user.id, divergence=0.38, version=HARNESS_VERSION)
+    run_id = _make_run(db_session, test_user.id, samples=1)
+    a, b, c, d = _patched_run(samples=_samples(1), call_side_effect=lambda *a, **k: _result("ok"))
+    with a, b, c, d:
+        await execute_run(run_id, concurrency=1)
+
+    run = db_session.execute(select(LLMEvalRun).where(LLMEvalRun.id == run_id)).scalar_one()
+    assert run.summary_json is not None
+    assert run.summary_json["divergence_noise_floor"] == 0.38
+    assert run.summary_json["divergence_threshold"] == 0.48
+    assert run.summary_json["harness_version"] == HARNESS_VERSION
+
+
+async def test_a_self_comparison_run_says_it_is_the_calibration(
+    db_session: Session, test_user: User
+) -> None:
+    run = LLMEvalRun(
+        user_id=test_user.id,
+        baseline_provider="anthropic",
+        baseline_model="incumbent",
+        candidate_provider="anthropic",
+        candidate_model="incumbent",
+        requested_samples=1,
+        status=str(RunStatus.PENDING),
+    )
+    db_session.add(run)
+    db_session.commit()
+    a, b, c, d = _patched_run(samples=_samples(1), call_side_effect=lambda *a, **k: _result("ok"))
+    with a, b, c, d:
+        await execute_run(run.id, concurrency=1)
+
+    db_session.expire_all()
+    stored = db_session.execute(select(LLMEvalRun).where(LLMEvalRun.id == run.id)).scalar_one()
+    assert stored.summary_json is not None
+    assert stored.summary_json["divergence_noise_floor"] is None
+    assert any("against itself" in w for w in stored.summary_json["warnings"])
