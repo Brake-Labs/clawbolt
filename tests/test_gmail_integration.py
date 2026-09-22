@@ -434,6 +434,28 @@ async def test_request_refreshes_and_retries_on_401() -> None:
     assert second_headers["Authorization"] == "Bearer rotated-token"
 
 
+async def test_message_summary_requests_metadata_headers_as_repeated_params() -> None:
+    """Gmail matches ``metadataHeaders`` per repeated param; a comma-joined value returns no headers."""
+    service = _make_service()
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"id": "m1", "threadId": "t1", "snippet": "hi"})
+
+    real_client = httpx.AsyncClient
+    with patch(
+        "backend.app.integrations.gmail.service.httpx.AsyncClient",
+        side_effect=lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw),
+    ):
+        await service._get_message_summary("m1")
+
+    assert len(captured) == 1
+    params = captured[0].url.params
+    assert params["format"] == "metadata"
+    assert params.get_list("metadataHeaders") == ["From", "Subject", "Date"]
+
+
 async def test_send_message_resolves_sender_lazily() -> None:
     service = GmailService(
         access_token="t",
