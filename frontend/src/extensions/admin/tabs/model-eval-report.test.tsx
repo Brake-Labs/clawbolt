@@ -137,9 +137,33 @@ describe('ModelEvalReportPage', () => {
     vi.mocked(api.getEvalReport).mockResolvedValue(report({ run: run({ summary: s }) }));
     renderReport();
 
-    const tile = (await screen.findByText('Blocking findings')).closest('div');
+    const tile = (await screen.findByText('Candidate safety findings')).closest('div');
     expect(tile).not.toBeNull();
     expect(within(tile as HTMLElement).getByText('0')).toBeInTheDocument();
+  });
+
+  it("sets the candidate's findings against the incumbent's", async () => {
+    // One finding no longer decides a run; the comparison does, so the tile
+    // has to show both sides rather than a bare count.
+    const api = await import('../admin-api');
+    const s = summary({
+      safety_counts: { unknown_tool: 4 },
+      blocking_findings: 4,
+      baseline_safety_counts: { unknown_tool: 3 },
+      safety_comparison: {
+        candidate_turns: 4,
+        baseline_turns: 3,
+        candidate_only: 2,
+        baseline_only: 1,
+        p_value: 0.5,
+      },
+    });
+    vi.mocked(api.getEvalReport).mockResolvedValue(report({ run: run({ summary: s }) }));
+    renderReport();
+
+    expect(
+      await screen.findByText('Turns with one: candidate 4, incumbent 3'),
+    ).toBeInTheDocument();
   });
 
   // -------------------------------------------------------------------------
@@ -185,8 +209,56 @@ describe('ModelEvalReportPage', () => {
     vi.mocked(api.getEvalReport).mockResolvedValue(report({ turns: [blocking] }));
     renderReport();
 
-    const badge = await screen.findByText(/Wrote something neither/);
-    expect(badge.className).toContain('error');
+    // The badge, not the expanded detail line beneath it.
+    const [badge] = await screen.findAllByText(/Wrote something neither/);
+    expect(badge?.className).toContain('error');
+  });
+
+  it("labels the incumbent's findings as the incumbent's, not as an accusation", async () => {
+    const api = await import('../admin-api');
+    const incumbent = turn({
+      safety_issues: [
+        {
+          finding: 'fabricated_id',
+          tool_name: 'add_note',
+          detail: 'wrote to work_order_id=118600',
+          blocking: true,
+          side: 'baseline',
+        },
+      ],
+    });
+    vi.mocked(api.getEvalReport).mockResolvedValue(report({ turns: [incumbent] }));
+    renderReport();
+
+    const badge = await screen.findByText(/Incumbent: Wrote to a record ID it was never shown/);
+    expect(badge.className).not.toContain('error');
+  });
+
+  it('shows the lookups a side made before the decision it was scored on', async () => {
+    const api = await import('../admin-api');
+    const base = turn();
+    const looked = turn({
+      safety_issues: [
+        { finding: 'unknown_tool', tool_name: 'nope', detail: '', blocking: true },
+      ],
+      candidate: {
+        ...base.candidate,
+        replayed_lookups: [
+          {
+            name: 'appfolio_search_work_orders',
+            arguments: { search_term: '12 Oak St' },
+            result: 'work order 71002',
+            is_error: false,
+          },
+        ],
+      },
+    });
+    vi.mocked(api.getEvalReport).mockResolvedValue(report({ turns: [looked] }));
+    renderReport();
+
+    expect(
+      await screen.findByText('Looked up first: appfolio_search_work_orders'),
+    ).toBeInTheDocument();
   });
 
   it('explains an unjudged turn instead of leaving it blank', async () => {

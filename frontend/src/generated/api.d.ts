@@ -3250,6 +3250,8 @@ export interface components {
             text: string;
             /** Tool Calls */
             tool_calls?: components["schemas"]["AdminLLMEvalToolCall"][];
+            /** Replayed Lookups */
+            replayed_lookups?: components["schemas"]["AdminLLMEvalLookup"][];
             /**
              * Stop Reason
              * @default
@@ -3285,6 +3287,59 @@ export interface components {
              * @default
              */
             error: string;
+        };
+        /**
+         * AdminLLMEvalJudgePreference
+         * @description How often the judge preferred each side, over the turns it scored.
+         */
+        AdminLLMEvalJudgePreference: {
+            /**
+             * Better
+             * @default 0
+             */
+            better: number;
+            /**
+             * Worse
+             * @default 0
+             */
+            worse: number;
+            /**
+             * Judged
+             * @default 0
+             */
+            judged: number;
+            /**
+             * Net Worse Rate
+             * @default 0
+             */
+            net_worse_rate: number;
+            /**
+             * P Value
+             * @default 1
+             */
+            p_value: number;
+        };
+        /**
+         * AdminLLMEvalLookup
+         * @description A lookup the replay fed back from the live turn before the decision.
+         */
+        AdminLLMEvalLookup: {
+            /** Name */
+            name: string;
+            /** Arguments */
+            arguments?: {
+                [key: string]: unknown;
+            };
+            /**
+             * Result
+             * @default
+             */
+            result: string;
+            /**
+             * Is Error
+             * @default false
+             */
+            is_error: boolean;
         };
         /**
          * AdminLLMEvalModelTotals
@@ -3545,6 +3600,43 @@ export interface components {
              * @default true
              */
             blocking: boolean;
+            /**
+             * Side
+             * @default candidate
+             * @enum {string}
+             */
+            side: "baseline" | "candidate";
+        };
+        /**
+         * AdminLLMEvalSideComparison
+         * @description How often each model had something, over the turns both answered.
+         */
+        AdminLLMEvalSideComparison: {
+            /**
+             * Candidate Turns
+             * @default 0
+             */
+            candidate_turns: number;
+            /**
+             * Baseline Turns
+             * @default 0
+             */
+            baseline_turns: number;
+            /**
+             * Candidate Only
+             * @default 0
+             */
+            candidate_only: number;
+            /**
+             * Baseline Only
+             * @default 0
+             */
+            baseline_only: number;
+            /**
+             * P Value
+             * @default 1
+             */
+            p_value: number;
         };
         /**
          * AdminLLMEvalSummary
@@ -3574,11 +3666,17 @@ export interface components {
             safety_counts?: {
                 [key: string]: number;
             };
+            /** Baseline Safety Counts */
+            baseline_safety_counts?: {
+                [key: string]: number;
+            } | null;
             /**
              * Blocking Findings
              * @default 0
              */
             blocking_findings: number;
+            safety_comparison?: components["schemas"]["AdminLLMEvalSideComparison"] | null;
+            fabricated_id_comparison?: components["schemas"]["AdminLLMEvalSideComparison"] | null;
             /** Judge Counts */
             judge_counts?: {
                 [key: string]: number;
@@ -3587,6 +3685,7 @@ export interface components {
             judge_skip_counts?: {
                 [key: string]: number;
             };
+            judge_preference?: components["schemas"]["AdminLLMEvalJudgePreference"] | null;
             /**
              * Identical Rate
              * @default 0
@@ -3597,6 +3696,10 @@ export interface components {
              * @default 0
              */
             divergence_rate: number;
+            /** Divergence Noise Floor */
+            divergence_noise_floor?: number | null;
+            /** Divergence Threshold */
+            divergence_threshold?: number | null;
             /**
              * Silent Noop Rate
              * @default 0

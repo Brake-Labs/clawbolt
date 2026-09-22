@@ -1292,10 +1292,16 @@ export interface EvalSummary {
   turns_completed: number;
   turns_failed: number;
   agreement_counts: Record<string, number>;
+  /** The candidate's findings by kind. */
   safety_counts: Record<string, number>;
-  // Subset of safety_counts that actually blocks a switch. A provider error
-  // is recorded above but is a failure to measure, not candidate behavior.
+  /** The incumbent's findings by kind. null on runs recorded before the
+   * incumbent was checked too, which is not the same as "had none". */
+  baseline_safety_counts?: Record<string, number> | null;
+  // Subset of safety_counts that counts in the safety comparison. A provider
+  // error is recorded above but is a failure to measure, not candidate behavior.
   blocking_findings: number;
+  /** Turns with a safety finding per side, paired. null on older runs. */
+  safety_comparison?: EvalSideComparison | null;
   judge_counts: Record<string, number>;
   /**
    * Why the unjudged turns were skipped. Added to judge_counts these account
@@ -1305,6 +1311,12 @@ export interface EvalSummary {
   judge_skip_counts: Record<string, number>;
   identical_rate: number;
   divergence_rate: number;
+  /** The divergence ceiling this run was held to: the incumbent's own
+   * divergence from itself plus a margin, or a fixed fallback. null on
+   * older runs. */
+  divergence_threshold?: number | null;
+  /** The incumbent's divergence from itself for this user, when calibrated. */
+  divergence_noise_floor?: number | null;
   silent_noop_rate: number;
   /**
    * The subset of silent_noop_rate the judge did not score for the candidate,
@@ -1320,6 +1332,14 @@ export interface EvalSummary {
   recommendation: EvalRecommendation;
   reasons: string[];
   warnings: string[];
+}
+
+interface EvalSideComparison {
+  candidate_turns: number;
+  baseline_turns: number;
+  candidate_only: number;
+  baseline_only: number;
+  p_value: number;
 }
 
 export interface EvalRun {
@@ -1370,6 +1390,17 @@ export interface EvalDecision {
   cache_creation_tokens: number;
   latency_ms: number;
   error: string;
+  /** Read-only calls the replay answered from the live turn's recorded
+   * results before this decision. Absent on runs recorded before replays
+   * continued past a first decision. */
+  replayed_lookups?: EvalLookup[];
+}
+
+interface EvalLookup {
+  name: string;
+  arguments: Record<string, unknown>;
+  result: string;
+  is_error: boolean;
 }
 
 export interface EvalSafetyIssue {
@@ -1377,11 +1408,14 @@ export interface EvalSafetyIssue {
   tool_name: string;
   detail: string;
   /**
-   * Whether this finding disqualifies a switch on its own. Served by the API
-   * so the report does not keep its own copy of metrics.BLOCKING_FINDINGS,
-   * which decides whether a badge reads as an accusation.
+   * Whether this finding counts in the safety comparison between the models.
+   * Served by the API so the report does not keep its own copy of
+   * metrics.SAFETY_FINDINGS. One such finding does not decide a run.
    */
   blocking: boolean;
+  /** Whose finding it is. Absent on rows recorded before the incumbent was
+   * checked too, which were always the candidate's. */
+  side?: 'baseline' | 'candidate';
 }
 
 export interface EvalTurn {
