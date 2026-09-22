@@ -22,12 +22,14 @@ from backend.app.database import get_async_db
 from backend.app.models import (
     ChatSession,
     Message,
+    OAuthToken,
     Subscription,
     User,
 )
 from backend.app.query_helpers import fetch_all, iso_or_none
 from backend.app.schemas.admin import (
     AdminChannelRouteEntry,
+    AdminOAuthConnectionEntry,
     AdminToolConfigEntry,
     AdminUserDetailResponse,
     AdminUserPermissionEntry,
@@ -44,6 +46,7 @@ from backend.app.services.admin_audit import (
     AdminAuditContext,
     audit_admin,
 )
+from backend.app.services.oauth import account_email_from_extra, parse_extra_json
 from backend.app.services.user_deletion import purge_account
 
 router = APIRouter()
@@ -475,6 +478,37 @@ async def get_user_detail(
         for cr in (*routes_with_inbound, *routes_without_inbound)
     ]
 
+    # Which account each OAuth connection belongs to. Column-only select:
+    # loading ``OAuthToken`` entities would decrypt the access and refresh
+    # tokens, which this view never needs.
+    token_rows = (
+        await db.execute(
+            select(
+                OAuthToken.integration,
+                OAuthToken.extra_json,
+                OAuthToken.created_at,
+                OAuthToken.updated_at,
+            )
+            .where(OAuthToken.user_id == user_id)
+            .order_by(OAuthToken.integration)
+        )
+    ).all()
+    sign_in_email = (sub.email if sub else "").strip().lower()
+    oauth_connections_out: list[AdminOAuthConnectionEntry] = []
+    for integration, extra_json, created_at, updated_at in token_rows:
+        account = account_email_from_extra(parse_extra_json(extra_json))
+        oauth_connections_out.append(
+            AdminOAuthConnectionEntry(
+                integration=integration,
+                account_email=_mask_channel_identifier(account) if account else None,
+                matches_sign_in=(
+                    account.lower() == sign_in_email if account and sign_in_email else None
+                ),
+                connected_at=iso_or_none(created_at),
+                updated_at=iso_or_none(updated_at),
+            )
+        )
+
     # Read-only view of the user's tool / resource approval levels. We
     # delegate parsing + default-fallback to the OSS approval store so
     # the JSON shape stays a single source of truth; admins see the
@@ -499,6 +533,7 @@ async def get_user_detail(
         heartbeat_frequency=user.heartbeat_frequency,
         tool_configs=tool_configs_out,
         channel_routes=channel_routes_out,
+        oauth_connections=oauth_connections_out,
         permissions=permissions_out,
     )
 

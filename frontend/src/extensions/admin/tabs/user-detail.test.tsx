@@ -41,6 +41,22 @@ const fixtures = vi.hoisted(() => ({
     heartbeat_frequency: '30m',
     tool_configs: [],
     channel_routes: [],
+    oauth_connections: [
+      {
+        integration: 'google_calendar',
+        account_email: 'o***@e***.c**',
+        matches_sign_in: false,
+        connected_at: '2026-04-01T00:00:00Z',
+        updated_at: '2026-04-02T00:00:00Z',
+      },
+      {
+        integration: 'gmail',
+        account_email: null,
+        matches_sign_in: null,
+        connected_at: '2026-04-01T00:00:00Z',
+        updated_at: null,
+      },
+    ],
     permissions: { tools: [], resources: [] },
   },
 }));
@@ -382,6 +398,17 @@ describe('UserDetailView', () => {
       'aria-selected',
       'false',
     );
+  });
+
+  it('shows which account each OAuth connection belongs to on the Profile tab', async () => {
+    renderDetail(mockUser, undefined, 'profile');
+    await waitFor(() =>
+      expect(screen.getByRole('heading', { name: 'Connected accounts' })).toBeInTheDocument(),
+    );
+    expect(screen.getByText('o***@e***.c**')).toBeInTheDocument();
+    expect(screen.getByText('not the sign-in account')).toBeInTheDocument();
+    // A connection made before accounts were recorded reads as unknown.
+    expect(screen.getByText('gmail').closest('tr')).toHaveTextContent('unknown');
   });
 
   it('reports sub-tab clicks through onSectionChange instead of self-navigating', async () => {

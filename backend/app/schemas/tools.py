@@ -74,6 +74,10 @@ class OAuthStatusEntry(BaseModel):
     integration: str
     configured: bool
     connected: bool
+    # Email of the account the connection was granted by (Google
+    # integrations only). None when not connected, not a Google integration,
+    # or connected before the account was recorded.
+    account_email: str | None = None
 
 
 class OAuthStatusResponse(BaseModel):

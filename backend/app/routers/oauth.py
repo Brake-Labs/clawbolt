@@ -30,11 +30,16 @@ async def get_oauth_status(
     entries: list[OAuthStatusEntry] = []
     for name in list_oauth_integrations():
         config = get_oauth_config(name)
+        connected = await oauth_service.is_connected(current_user.id, name)
+        account_email = (
+            await oauth_service.get_account_email(current_user.id, name) if connected else ""
+        )
         entries.append(
             OAuthStatusEntry(
                 integration=name,
                 configured=config is not None and config.is_configured,
-                connected=await oauth_service.is_connected(current_user.id, name),
+                connected=connected,
+                account_email=account_email or None,
             )
         )
     return OAuthStatusResponse(integrations=entries)

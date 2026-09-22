@@ -6676,6 +6676,68 @@
         ],
         "title": "AdminLLMProvidersResponse"
       },
+      "AdminOAuthConnectionEntry": {
+        "properties": {
+          "integration": {
+            "type": "string",
+            "title": "Integration"
+          },
+          "account_email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Account Email"
+          },
+          "matches_sign_in": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Matches Sign In"
+          },
+          "connected_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connected At"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "integration",
+          "account_email",
+          "matches_sign_in",
+          "connected_at",
+          "updated_at"
+        ],
+        "title": "AdminOAuthConnectionEntry",
+        "description": "One stored OAuth connection and the account it was granted by.\n\n``account_email`` is masked like a channel identifier: enough to\nrecognize the account, not the raw address. ``matches_sign_in`` answers\nthe usual support question (did they connect a different Google account\nthan the one they sign in with) without unmasking. Both are None when the\nconnection predates account recording or the integration does not\nrecord one."
+      },
       "AdminStatsResponse": {
         "properties": {
           "telegram_configured": {
@@ -6840,6 +6902,13 @@
             "type": "array",
             "title": "Channel Routes"
           },
+          "oauth_connections": {
+            "items": {
+              "$ref": "#/components/schemas/AdminOAuthConnectionEntry"
+            },
+            "type": "array",
+            "title": "Oauth Connections"
+          },
           "permissions": {
             "$ref": "#/components/schemas/AdminUserPermissions"
           }
@@ -6862,6 +6931,7 @@
           "heartbeat_frequency",
           "tool_configs",
           "channel_routes",
+          "oauth_connections",
           "permissions"
         ],
         "title": "AdminUserDetailResponse",
@@ -8868,6 +8938,17 @@
           "connected": {
             "type": "boolean",
             "title": "Connected"
+          },
+          "account_email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Account Email"
           }
         },
         "type": "object",

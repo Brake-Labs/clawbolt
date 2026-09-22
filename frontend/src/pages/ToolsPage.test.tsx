@@ -119,6 +119,29 @@ describe('ToolsPage', () => {
     expect(cardElement).toBeNull();
   });
 
+  it('shows which Google account a connection belongs to, and nothing when unknown', async () => {
+    setupMocks({
+      oauth: {
+        integrations: [
+          { integration: 'google_calendar', connected: true, configured: true, account_email: 'owner@example.com' },
+        ],
+      },
+    });
+    renderWithRouter(<ToolsPage />);
+    await waitFor(() => {
+      expect(screen.getByText('Connected as owner@example.com')).toBeInTheDocument();
+    });
+  });
+
+  it('omits the account line for connections made before accounts were recorded', async () => {
+    setupMocks();
+    renderWithRouter(<ToolsPage />);
+    await waitFor(() => {
+      expect(screen.getByText('Connected')).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/Connected as/)).not.toBeInTheDocument();
+  });
+
   it('shows "Not connected" with Connect button when configured but not connected', async () => {
     setupMocks({
       oauth: {

@@ -33,6 +33,8 @@ Clawbolt: Done. Calendar tools are disabled. You can
           re-enable them anytime.
 ```
 
+For Google services (Calendar, Gmail, Drive), the assistant and the Integrations page also show which Google account each one is connected with. Connections made before this was recorded show the account as unknown; reconnect to fill it in.
+
 ## Disconnecting
 
 ```

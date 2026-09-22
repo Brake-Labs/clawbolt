@@ -37,6 +37,7 @@ from backend.app.models import (
     LLMUsageLog,
     MemoryDocument,
     Message,
+    OAuthToken,
     StagedMedia,
     Subscription,
     ToolConfig,
@@ -1364,6 +1365,65 @@ class TestUserDetail:
             for m in masked
         )
         assert "example.test" not in resp.text
+
+    async def test_oauth_connections_show_masked_account(
+        self,
+        admin_async_client: httpx.AsyncClient,
+        async_db: async_sessionmaker,
+        async_admin_user: User,
+    ) -> None:
+        """Each OAuth connection reports its Google account, masked, plus whether it
+        matches the sign-in email. Tokens stored before accounts were recorded
+        report None rather than failing."""
+        connected = "calendar-owner-7c1e@example.test"
+        async with async_db() as db:
+            db.add(
+                Subscription(
+                    user_id=async_admin_user.id,
+                    email="Sign-In-7c1e@example.test",
+                    role="admin",
+                )
+            )
+            db.add(
+                OAuthToken(
+                    user_id=async_admin_user.id,
+                    integration="google_calendar",
+                    access_token="at-cal",
+                    extra_json=json.dumps({"account_email": connected}),
+                )
+            )
+            db.add(
+                OAuthToken(
+                    user_id=async_admin_user.id,
+                    integration="gmail",
+                    access_token="at-gmail",
+                    extra_json=json.dumps({"account_email": "sign-in-7c1e@example.test"}),
+                )
+            )
+            db.add(
+                OAuthToken(
+                    user_id=async_admin_user.id,
+                    integration="google_drive",
+                    access_token="at-drive",
+                    extra_json="{}",
+                )
+            )
+            await db.commit()
+
+        resp = await admin_async_client.get(f"/api/admin/users/{async_admin_user.id}")
+        assert resp.status_code == 200
+        assert connected not in resp.text, "connected account email leaked unmasked"
+        assert "at-cal" not in resp.text
+
+        by_name = {c["integration"]: c for c in resp.json()["oauth_connections"]}
+        assert set(by_name) == {"gmail", "google_calendar", "google_drive"}
+        cal = by_name["google_calendar"]
+        assert cal["account_email"].startswith("c***@e***")
+        assert cal["matches_sign_in"] is False
+        assert by_name["gmail"]["matches_sign_in"] is True
+        assert by_name["google_drive"]["account_email"] is None
+        assert by_name["google_drive"]["matches_sign_in"] is None
+        assert cal["connected_at"] is not None
 
     def test_mask_channel_identifier_edge_cases(self) -> None:
         """Direct unit tests for ``_mask_channel_identifier``."""
