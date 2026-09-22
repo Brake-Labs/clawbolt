@@ -256,6 +256,41 @@ edit away from breaking:
   head of that list, and prose alongside a tool call, which only an elicited
   decision can carry. The judge defaults to the incumbent model, so either one
   is a self-preference channel.
+- **Two turn shapes cannot be rendered blind, so the judge is not shown
+  them at all** (`runner._judge_skip_reason`, after the ordinary skips, so
+  what it counts is turns the judge would otherwise have scored). A record
+  whose calls came back in one flat list may have been scored on a different
+  decision from the candidate's, so `JudgeSkipReason.FLATTENED_ROUNDS`
+  withholds it and the confounded evidence never enters the tier. And
+  `_historic_first_decision` returns exactly one call, so a candidate
+  response listing two is necessarily the candidate's, whatever `_describe`
+  does: there is no second call to show on the record's side and trimming
+  the candidate's would score a decision it did not make, so
+  `JudgeSkipReason.UNBLINDABLE_SHAPE` withholds that turn too. Both counts
+  are in `judge_skip_counts`, are reported, and are read back as the judge
+  tier's own confounders.
+- **Each tier is guarded over its own evidence, not over the run.**
+  `MAX_CONFOUNDED_TURN_RATE` is the one ceiling, applied to three different
+  denominators (`RunAggregate.silent_noop_confounders`, `judge_confounders`,
+  `fabricated_id_confounders`). Turns with no readable incumbent decision are
+  divided by `turns_incumbent_attempted`, because they reached no tier;
+  flattened turns by `turns_completed` for the two rate tiers read over the
+  compared turns, and by the divergences the judge could have scored for the
+  judge tier. One run-wide rate is what let a run of a hundred turns, nineteen
+  of them a lookup and a write in one response, block a candidate on a judge
+  preference every one of whose divergences came from those nineteen.
+- **The fabricated-ID comparison stays live in this mode.** It is the one
+  safety check that needs neither a second model nor today's schema: it asks
+  whether an ID-shaped argument of a mutating call appears in the prompt that
+  turn was assembled from or in a result that side was handed, which is as
+  true of a recorded call as of an elicited one. `runner` runs
+  `metrics.check_fabricated_ids` on the historic side and
+  `_decide_fabricated_ids` blocks on its own tier. The rest of
+  `SAFETY_FINDINGS` cannot be: `UNREQUESTED_MUTATION` exempts the very tool
+  names the recorded side used, and `INVALID_ARGS` would hold that day's call
+  to today's schema. Zeroing the fabricated-ID check with them let a
+  candidate inventing record ids on 30 of 50 turns come back
+  `switch_with_monitoring`.
 
 Three invariants, each of which the feature is worthless without:
 
