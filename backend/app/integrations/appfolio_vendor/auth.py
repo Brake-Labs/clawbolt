@@ -17,7 +17,9 @@ Three concerns live here:
    table: ``access_token`` holds the JWT, ``refresh_token`` holds the
    OAuth2 refresh token (both envelope-encrypted at rest via
    ``EncryptedString``), and ``extra_json`` carries the fingerprint plus
-   any AppFolio-specific metadata.
+   any AppFolio-specific metadata. Because the row lives there, refreshing
+   it goes through the shared, locked ``oauth_service.refresh_token`` (see
+   ``service.py``), which also retires it when the refresh grant is dead.
 """
 
 from __future__ import annotations
@@ -126,11 +128,17 @@ async def _load_credential_in_session(
     if not fingerprint:
         # Stale row from a previous failed connect; treat as not connected.
         return None
-    # Prefer the dedicated encrypted column; fall back to the legacy
-    # ``extra_json`` slot so credentials persisted before the column move
-    # keep working until the next refresh rewrites them. The fallback can
-    # be dropped once all live tokens have rotated past it.
-    refresh_token = row.refresh_token or extra.get("refresh_token", "")
+    # Prefer the dedicated encrypted column. A credential persisted before the
+    # column move still has its refresh token in the legacy ``extra_json``
+    # slot; move it into the column, which is where the shared OAuth refresh
+    # reads it. This can be dropped once all live tokens have rotated past it.
+    refresh_token = row.refresh_token
+    legacy_refresh_token = extra.pop("refresh_token", "")
+    if not refresh_token and legacy_refresh_token:
+        refresh_token = legacy_refresh_token
+        row.refresh_token = legacy_refresh_token
+        row.extra_json = json.dumps(extra)
+        await session.commit()
     return AppFolioCredential(
         user_id=user_id,
         jwt=row.access_token,
@@ -190,6 +198,33 @@ async def save_credential(
             row.token_type = "Bearer"
             row.extra_json = json.dumps(extra)
             row.updated_at = now
+        await session.commit()
+
+
+async def save_customer_ids(user_id: str, customer_ids: list[str]) -> None:
+    """Record discovered customer IDs on the stored credential, leaving its tokens alone.
+
+    The JWT and refresh token are owned by the shared OAuth refresh, which
+    rotates them under its lock. Rewriting them here from a copy loaded at
+    the start of the turn would put back a refresh token a peer had already
+    rotated away. A credential retired in the meantime stays retired.
+    """
+    async with db_session_async() as session:
+        stmt = (
+            sa.select(OAuthToken)
+            .where(
+                OAuthToken.user_id == user_id,
+                OAuthToken.integration == INTEGRATION_NAME,
+            )
+            .with_for_update()
+        )
+        row = (await session.execute(stmt)).scalar_one_or_none()
+        if row is None:
+            return
+        extra = json.loads(row.extra_json or "{}")
+        extra["customer_ids"] = customer_ids
+        row.extra_json = json.dumps(extra)
+        row.updated_at = datetime.now(UTC)
         await session.commit()
 
 

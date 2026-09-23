@@ -16,7 +16,7 @@ import time
 from collections.abc import Awaitable, Callable, Coroutine, Iterator
 from dataclasses import dataclass
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httplib2
 import httpx
@@ -28,8 +28,11 @@ from backend.app.agent.tools.base import Tool, ToolErrorKind, ToolResult
 from backend.app.agent.tools.file_tools import create_file_tools
 from backend.app.agent.tools.registry import ToolContext
 from backend.app.config import settings
+from backend.app.integrations.appfolio_vendor.media_resolver import resolve_staged_files
 from backend.app.integrations.calendar.factory import _calendar_factory
 from backend.app.integrations.calendar.sync import resync_after_connect
+from backend.app.integrations.companycam.photos import build_photo_tools
+from backend.app.integrations.companycam.service import CompanyCamService
 from backend.app.integrations.gmail.factory import _gmail_factory
 from backend.app.models import User
 from backend.app.services import oauth as oauth_module
@@ -598,3 +601,132 @@ async def test_gmail_attachment_from_a_dead_drive_names_drive(
     assert await _stored(test_user, "google_drive") is None
     assert await _stored(test_user, "gmail") is not None
     notify.assert_awaited_once_with(test_user.id, "google_drive")
+
+
+async def test_drive_read_by_companycam_and_appfolio_names_drive(
+    test_user: User, monkeypatch: pytest.MonkeyPatch, notify: AsyncMock
+) -> None:
+    """CompanyCam and AppFolio read saved photos from Drive; a dead Drive grant is AUTH.
+
+    Regression: both let ``ReconnectRequired`` escape, so the tool runner
+    reported INTERNAL with a traceback instead of asking for a Drive reconnect.
+    """
+    await _connect(test_user, "google_drive")
+    _wire(monkeypatch, google=_google_always(500), token_endpoint=_INVALID_GRANT)
+    _drive_http(monkeypatch, [401])
+    storage = await init_storage(test_user)
+    ctx = ToolContext(user=test_user, storage=storage)
+
+    companycam = MagicMock(spec=CompanyCamService)
+    upload = next(
+        t for t in build_photo_tools(companycam, ctx) if t.name == "companycam_upload_photo"
+    )
+    companycam_result = await upload.function(
+        project_id="p1", original_url="/Inbox/photos/roof.jpg"
+    )
+    appfolio_result = await resolve_staged_files(ctx, ["/Inbox/photos/roof.jpg"])
+
+    _assert_reconnect(companycam_result, "Google Drive")
+    assert isinstance(appfolio_result, ToolResult)
+    _assert_reconnect(appfolio_result, "Google Drive")
+    companycam.upload_photo.assert_not_awaited()
+    assert await _stored(test_user, "google_drive") is None
+    notify.assert_awaited_once_with(test_user.id, "google_drive")
+
+
+# ---------------------------------------------------------------------------
+# Refresh that could not run, and a notice that must not be lost
+# ---------------------------------------------------------------------------
+
+
+@EVERY_TOOL
+async def test_contended_refresh_lock_is_service_not_a_dead_connection(
+    test_user: User,
+    monkeypatch: pytest.MonkeyPatch,
+    notify: AsyncMock,
+    spec: _Spec,
+    call: ToolCall,
+) -> None:
+    """Regression: the 401 left standing by a contended lock read as "expired or revoked".
+
+    QuickBooks and Drive already treat this as SERVICE; Calendar and Gmail
+    told the model not to retry.
+    """
+    await _connect(test_user, spec.integration)
+    posts: list[httpx.Request] = []
+
+    def token_endpoint(request: httpx.Request) -> httpx.Response:
+        posts.append(request)
+        return httpx.Response(400, json={"error": "invalid_grant"})
+
+    _wire(monkeypatch, google=_google_always(401), token_endpoint=token_endpoint)
+
+    async def contended(conn: Any, lock_key: str) -> bool:
+        return False
+
+    monkeypatch.setattr(oauth_module, "_try_acquire_advisory_lock_async", contended)
+    tools = await _tools(test_user, spec)
+
+    result = await call(tools)
+
+    if call is _cal_list_calendars:
+        # Checking the saved selection against Google is best effort there.
+        assert result.is_error is False
+        assert "Could not check these against Google" in result.content
+    else:
+        assert result.error_kind is ToolErrorKind.SERVICE
+        assert "expired or revoked" not in build_error_hint(result)
+    assert posts == []
+    stored = await _stored(test_user, spec.integration)
+    assert stored is not None
+    assert stored.refresh_token == "rt-old"
+    notify.assert_not_awaited()
+
+
+@EVERY_INTEGRATION
+async def test_401_with_nothing_to_refresh_with_stays_auth(
+    test_user: User, monkeypatch: pytest.MonkeyPatch, notify: AsyncMock, spec: _Spec
+) -> None:
+    """Only a contended lock is SERVICE. A 401 on a token with no refresh token
+    has nothing to retry with, so it keeps its reconnect classification."""
+    await oauth_service.save_token(
+        test_user.id,
+        spec.integration,
+        OAuthTokenData(access_token="at-old", refresh_token="", expires_at=time.time() + 3600),
+    )
+    _wire(monkeypatch, google=_google_always(401), token_endpoint=_REFRESH_OK)
+    tools = await _tools(test_user, spec)
+
+    result = await spec.calls[0](tools)
+
+    assert result.error_kind is ToolErrorKind.AUTH
+    assert "Retry this call shortly" not in build_error_hint(result)
+
+
+async def test_user_is_notified_even_when_the_second_delete_fails(
+    test_user: User, monkeypatch: pytest.MonkeyPatch, notify: AsyncMock
+) -> None:
+    """Regression: the token is deleted under the refresh lock, so nothing refreshes it
+    again. If ``handle_permanent_refresh_failure``'s own delete then raised, the
+    notice after it never ran and the user was never told."""
+    await _connect(test_user, "google_calendar")
+    _wire(monkeypatch, google=_google_always(401), token_endpoint=_INVALID_GRANT)
+    real_delete = oauth_service.delete_token
+    deletes = 0
+
+    async def delete_then_fail(user_id: str, integration: str) -> bool:
+        nonlocal deletes
+        deletes += 1
+        if deletes == 1:
+            return await real_delete(user_id, integration)
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(oauth_service, "delete_token", delete_then_fail)
+    refresh = oauth_service.build_rejected_token_refresher(test_user.id, "google_calendar")
+
+    with pytest.raises(ReconnectRequired):
+        await refresh("at-old")
+
+    assert deletes == 2
+    assert await _stored(test_user, "google_calendar") is None
+    notify.assert_awaited_once_with(test_user.id, "google_calendar")

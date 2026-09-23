@@ -13,7 +13,11 @@ from typing import TYPE_CHECKING
 from backend.app.agent.tools.base import Tool
 from backend.app.agent.tools.names import ToolName
 from backend.app.config import settings
-from backend.app.integrations.appfolio_vendor.auth import load_credential, save_credential
+from backend.app.integrations.appfolio_vendor.auth import (
+    INTEGRATION_NAME,
+    load_credential,
+    save_customer_ids,
+)
 from backend.app.integrations.appfolio_vendor.invoices import build_invoice_tools
 from backend.app.integrations.appfolio_vendor.notes import build_note_tools
 from backend.app.integrations.appfolio_vendor.service import build_service
@@ -21,6 +25,7 @@ from backend.app.integrations.appfolio_vendor.work_order_writes import (
     build_work_order_write_tools,
 )
 from backend.app.integrations.appfolio_vendor.work_orders import build_work_order_tools
+from backend.app.services.oauth import oauth_service
 
 if TYPE_CHECKING:
     from backend.app.agent.tools.registry import ToolContext
@@ -52,34 +57,23 @@ async def _appfolio_vendor_factory(ctx: ToolContext) -> list[Tool]:
 
     user_id = ctx.user.id
 
-    async def _persist_refreshed(jwt: str, refresh_token: str) -> None:
-        await save_credential(
-            user_id=user_id,
-            jwt=jwt,
-            fingerprint=cred.fingerprint,
-            customer_ids=cred.customer_ids,
-            refresh_token=refresh_token,
-        )
-
     async def _persist_customer_ids(customer_ids: list[str]) -> None:
         # The OAuth2 exchange does not return customer IDs, so the service
         # discovers them on the first write and hands them here. Persisting
         # makes it a one-time cost instead of a discovery round-trip on
-        # every turn. ``cred`` is the object the service mutates, so the
-        # JWT and refresh token read here are current even when a token
-        # refresh happened earlier in this same turn.
-        await save_credential(
-            user_id=user_id,
-            jwt=cred.jwt,
-            fingerprint=cred.fingerprint,
-            customer_ids=customer_ids,
-            refresh_token=cred.refresh_token,
-        )
+        # every turn. Only the IDs are written: the tokens belong to the
+        # shared refresh, and this turn's copy of them may be stale.
+        await save_customer_ids(user_id, customer_ids)
 
     service = build_service(
         cred,
         api_base=settings.appfolio_vendor_api_base,
-        on_token_refresh=_persist_refreshed,
+        # A 401 refreshes through the shared, locked OAuth path: one POST
+        # across parallel calls and workers, and a dead grant retires the
+        # credential and notifies the user once.
+        refresh_rejected_jwt=oauth_service.build_rejected_token_refresher(
+            user_id, INTEGRATION_NAME
+        ),
         on_customer_ids_resolved=_persist_customer_ids,
     )
     tools: list[Tool] = []

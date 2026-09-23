@@ -13,13 +13,17 @@ from pydantic import BaseModel, Field
 from backend.app.agent import media_staging
 from backend.app.agent.approval import ApprovalPolicy, PermissionLevel
 from backend.app.agent.dto import slugify as _store_slugify
-from backend.app.agent.saved_media import find_saved_file, read_saved_file_bytes
+from backend.app.agent.saved_media import (
+    drive_reconnect_result,
+    find_saved_file,
+    read_saved_file_bytes,
+)
 from backend.app.agent.tools.base import Tool, ToolErrorKind, ToolReceipt, ToolResult, ToolTags
 from backend.app.agent.tools.names import ToolName
 from backend.app.media.download import MIME_EXTENSIONS
 from backend.app.media.pipeline import run_vision_on_media
 from backend.app.models import User
-from backend.app.services.oauth import ReconnectRequired, reconnect_instruction
+from backend.app.services.oauth import ReconnectRequired
 from backend.app.services.storage_service import SavedFile, StorageBackend
 
 if TYPE_CHECKING:
@@ -28,19 +32,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _P = ParamSpec("_P")
-
-
-def _drive_reconnect_result() -> ToolResult:
-    """AUTH result for a dead Google Drive connection."""
-    return ToolResult(
-        content="Google Drive disconnected. Please reconnect Google Drive in Settings.",
-        is_error=True,
-        error_kind=ToolErrorKind.AUTH,
-        hint=(
-            "The connection has expired or was revoked. Do not retry. "
-            f"{reconnect_instruction('google_drive')}"
-        ),
-    )
 
 
 def _reconnect_on_dead_grant(
@@ -59,8 +50,7 @@ def _reconnect_on_dead_grant(
         try:
             return await fn(*args, **kwargs)
         except ReconnectRequired as exc:
-            logger.warning("Google Drive connection needs reconnecting: %s", exc)
-            return _drive_reconnect_result()
+            return drive_reconnect_result(exc)
 
     return wrapper
 

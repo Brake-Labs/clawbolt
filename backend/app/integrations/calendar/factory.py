@@ -40,6 +40,7 @@ from backend.app.models import CalendarConfig
 from backend.app.query_helpers import fetch_all
 from backend.app.services.oauth import (
     ReconnectRequired,
+    TokenRefreshUnavailable,
     oauth_service,
     reconnect_instruction,
 )
@@ -477,7 +478,7 @@ def create_calendar_tools(
         except ReconnectRequired:
             raise
         except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 401:
+            if exc.response.status_code == 401 and not isinstance(exc, TokenRefreshUnavailable):
                 # Still refused after the refresh retry: the connection is
                 # dead, which is not a "could not check right now".
                 raise ReconnectRequired(
@@ -1149,6 +1150,16 @@ def _dead_connection_result(exc: ReconnectRequired) -> ToolResult:
 
 def _handle_http_error(exc: httpx.HTTPStatusError, action: str) -> ToolResult:
     """Convert an HTTP error into a user-friendly ToolResult."""
+    if isinstance(exc, TokenRefreshUnavailable):
+        # The 401 stands only because a peer held the refresh lock, which
+        # says nothing about the grant. Retrying shortly should succeed.
+        logger.warning("Calendar token refresh could not run during %s", action)
+        return ToolResult(
+            content=f"Calendar could not renew its access while trying to {action}.",
+            is_error=True,
+            error_kind=ToolErrorKind.SERVICE,
+            hint="Another refresh of this connection was in progress. Retry this call shortly.",
+        )
     status = exc.response.status_code
     body = ""
     with contextlib.suppress(Exception):
