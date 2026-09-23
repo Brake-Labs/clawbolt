@@ -31,12 +31,11 @@ from dataclasses import dataclass, field
 
 from sqlalchemy import select
 
-from backend.app.config import settings
 from backend.app.database import db_session_async
 from backend.app.integrations.calendar.provider import CalendarInfo
 from backend.app.integrations.calendar.service import GoogleCalendarService
 from backend.app.models import CalendarConfig
-from backend.app.services.oauth import OAuthTokenData, oauth_service
+from backend.app.services.oauth import OAuthTokenData, ReconnectRequired, oauth_service
 
 logger = logging.getLogger(__name__)
 
@@ -48,14 +47,10 @@ PRIMARY_ALIAS = "primary"
 
 
 def build_calendar_service(user_id: str, token: OAuthTokenData) -> GoogleCalendarService:
-    """Build a Calendar client for *token* that persists mid-call refreshes."""
+    """Build a Calendar client for *token* that refreshes through the shared OAuth path."""
     return GoogleCalendarService(
         access_token=token.access_token,
-        refresh_token=token.refresh_token,
-        client_id=settings.google_calendar_client_id,
-        client_secret=settings.google_calendar_client_secret,
-        token_expires_at=token.expires_at or 0.0,
-        on_token_refresh=oauth_service.build_on_refresh_callback(user_id, PROVIDER),
+        refresh_access_token=oauth_service.build_rejected_token_refresher(user_id, PROVIDER),
     )
 
 
@@ -180,4 +175,10 @@ async def resync_after_connect(user_id: str, token: OAuthTokenData) -> None:
     """Post-connect hook: resync saved calendars against the new connection."""
     if not token.access_token:
         return
-    await resync_calendar_configs(user_id, build_calendar_service(user_id, token))
+    try:
+        await resync_calendar_configs(user_id, build_calendar_service(user_id, token))
+    except ReconnectRequired:
+        # The grant died between connect and resync. The shared refresh has
+        # already retired the token and told the user, so there is nothing to
+        # resync against and nothing worth a traceback.
+        logger.warning("Calendar resync skipped, connection no longer valid: user=%s", user_id)

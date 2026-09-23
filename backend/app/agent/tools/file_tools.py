@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import re
-from typing import TYPE_CHECKING
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, ParamSpec
 
 from pydantic import BaseModel, Field
 
@@ -17,12 +19,51 @@ from backend.app.agent.tools.names import ToolName
 from backend.app.media.download import MIME_EXTENSIONS
 from backend.app.media.pipeline import run_vision_on_media
 from backend.app.models import User
+from backend.app.services.oauth import ReconnectRequired, reconnect_instruction
 from backend.app.services.storage_service import SavedFile, StorageBackend
 
 if TYPE_CHECKING:
     from backend.app.agent.tools.registry import ToolContext
 
 logger = logging.getLogger(__name__)
+
+_P = ParamSpec("_P")
+
+
+def _drive_reconnect_result() -> ToolResult:
+    """AUTH result for a dead Google Drive connection."""
+    return ToolResult(
+        content="Google Drive disconnected. Please reconnect Google Drive in Settings.",
+        is_error=True,
+        error_kind=ToolErrorKind.AUTH,
+        hint=(
+            "The connection has expired or was revoked. Do not retry. "
+            f"{reconnect_instruction('google_drive')}"
+        ),
+    )
+
+
+def _reconnect_on_dead_grant(
+    fn: Callable[_P, Awaitable[ToolResult]],
+) -> Callable[_P, Awaitable[ToolResult]]:
+    """Report a dead Drive grant as AUTH instead of a tool crash.
+
+    ``ReconnectRequired`` comes from the shared refresh (the token is already
+    retired and the user notified) or from Drive refusing a freshly refreshed
+    token. Every storage call can raise it, so it is caught once here; the
+    tools' own catch-alls re-raise it rather than call it an outage.
+    """
+
+    @functools.wraps(fn)
+    async def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> ToolResult:
+        try:
+            return await fn(*args, **kwargs)
+        except ReconnectRequired as exc:
+            logger.warning("Google Drive connection needs reconnecting: %s", exc)
+            return _drive_reconnect_result()
+
+    return wrapper
+
 
 DESCRIPTION_SLUG_MAX_LENGTH = 40
 FILENAME_SLUG_MAX_LENGTH = 30
@@ -573,6 +614,8 @@ def create_file_tools(
             if query.strip():
                 try:
                     drive_is_empty = not await storage.search_files(query="", limit=1)
+                except ReconnectRequired:
+                    raise
                 except Exception:
                     logger.warning("Empty-Drive check failed after a search miss", exc_info=True)
                     drive_is_empty = False
@@ -634,6 +677,8 @@ def create_file_tools(
                 is_error=True,
                 error_kind=ToolErrorKind.NOT_FOUND,
             )
+        except ReconnectRequired:
+            raise
         except Exception as exc:
             logger.exception("Failed to load saved media %s", saved.path)
             return ToolResult(
@@ -759,6 +804,8 @@ def create_file_tools(
                 is_error=True,
                 error_kind=ToolErrorKind.NOT_FOUND,
             )
+        except ReconnectRequired:
+            raise
         except Exception as exc:
             logger.exception("Failed to download %s for edit", file_path)
             return ToolResult(
@@ -799,6 +846,8 @@ def create_file_tools(
                 is_error=True,
                 error_kind=ToolErrorKind.NOT_FOUND,
             )
+        except ReconnectRequired:
+            raise
         except Exception as exc:
             logger.exception("Failed to update %s", file_path)
             return ToolResult(
@@ -829,6 +878,8 @@ def create_file_tools(
                 is_error=True,
                 error_kind=ToolErrorKind.NOT_FOUND,
             )
+        except ReconnectRequired:
+            raise
         except Exception as exc:
             logger.exception("Failed to download %s", file_path)
             return ToolResult(
@@ -848,7 +899,7 @@ def create_file_tools(
                 "still staged, to the user's Drive. Returns a share link the user can "
                 "tap. For a file saved on an earlier turn, use move_file."
             ),
-            function=upload_to_storage,
+            function=_reconnect_on_dead_grant(upload_to_storage),
             params_model=UploadToStorageParams,
             # Serialize storage mutations within a turn so two uploads (or an
             # upload + move) cannot race on filename indexing or
@@ -867,7 +918,7 @@ def create_file_tools(
                 "Move a saved file to another folder, optionally renaming it, e.g. once "
                 "the user says which client it belongs to."
             ),
-            function=move_file,
+            function=_reconnect_on_dead_grant(move_file),
             params_model=MoveFileParams,
             concurrency_group="user_storage",
             approval_policy=ApprovalPolicy(
@@ -886,7 +937,7 @@ def create_file_tools(
                 "Search here before asking the user to resend a file. Files the user "
                 "added to the Drive folder directly are not visible."
             ),
-            function=find_saved_files,
+            function=_reconnect_on_dead_grant(find_saved_files),
             params_model=FindSavedFilesParams,
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
@@ -904,7 +955,7 @@ def create_file_tools(
                 "Run vision analysis on a saved image, e.g. to inspect a receipt or "
                 "photo again without asking for a resend. Images only."
             ),
-            function=analyze_saved_file,
+            function=_reconnect_on_dead_grant(analyze_saved_file),
             params_model=AnalyzeSavedFileParams,
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
@@ -918,7 +969,7 @@ def create_file_tools(
                 "(notes, summaries, documents). An existing filename gets a numeric "
                 "suffix instead of being overwritten."
             ),
-            function=write_to_storage,
+            function=_reconnect_on_dead_grant(write_to_storage),
             params_model=WriteToStorageParams,
             concurrency_group="user_storage",
             approval_policy=ApprovalPolicy(
@@ -934,7 +985,7 @@ def create_file_tools(
                 "Edit a text file in the user's Drive by replacing exact text. Read it "
                 "first with read_from_storage."
             ),
-            function=edit_storage_file,
+            function=_reconnect_on_dead_grant(edit_storage_file),
             params_model=EditStorageFileParams,
             concurrency_group="user_storage",
             approval_policy=ApprovalPolicy(
@@ -949,7 +1000,7 @@ def create_file_tools(
                 "Read a text file from the user's Drive. Works only on text files "
                 "Clawbolt wrote or uploaded."
             ),
-            function=read_from_storage,
+            function=_reconnect_on_dead_grant(read_from_storage),
             params_model=ReadFromStorageParams,
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,

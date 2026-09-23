@@ -172,9 +172,9 @@ async def init_storage(user: User, *, refresh: bool = True) -> StorageBackend | 
     return GoogleDriveStorage(
         DriveOAuthCredentials(
             access_token=token.access_token,
-            refresh_token=token.refresh_token,
-            client_id=settings.google_drive_client_id,
-            client_secret=settings.google_drive_client_secret,
+            refresh_access_token=oauth_service.build_rejected_token_refresher(
+                user.id, "google_drive"
+            ),
         )
     )
 

@@ -132,6 +132,21 @@ _PERMANENT_OAUTH_ERROR_CODES = frozenset(
 )
 
 
+def reconnect_instruction(integration: str) -> str:
+    """How the agent gets a dead connection back: offer the user a fresh link.
+
+    A refused token is not always retired (a 401 that survives a refresh, or
+    a refresh that could not run, leaves it stored), and ``connect`` refuses
+    while a token is stored, so the instruction covers disconnecting first.
+    """
+    return (
+        f"Use manage_integration(action='connect', target='{integration}') to generate "
+        "a connection link for the user. If it reports the integration is still "
+        f"connected, run manage_integration(action='disconnect', target='{integration}') "
+        "first. The user can also reconnect in Settings > Integrations."
+    )
+
+
 class ReconnectRequired(Exception):
     """The provider has rejected the connection itself; only reconnecting fixes it.
 
@@ -799,84 +814,27 @@ class OAuthService:
         finally:
             await lock_conn.close()
 
-    def build_on_refresh_callback(
+    def build_rejected_token_refresher(
         self,
         user_id: str,
         integration: str,
-    ) -> Callable[[str, str, float], Awaitable[None]]:
-        """Return an async callback that persists tokens refreshed mid-call by a service.
+    ) -> Callable[[str], Awaitable[str | None]]:
+        """Return the mid-call refresh hook a provider service calls after a 401.
 
-        Provider services (Google Calendar, Gmail) refresh on 401 and
-        rotate ``refresh_token`` for some providers. Without persisting, the
-        rotated refresh token is lost and the next tool call loads the stale
-        one from the DB, causing refresh to fail.
-
-        The callback preserves fields the service does not know about
-        (realm_id, scopes, extra) by loading the current row before saving.
-
-        The load + save runs under a session-scoped advisory lock keyed on
-        ``(user_id, integration)`` so two concurrent service refreshes can't
-        both read the old row and overwrite each other (losing the rotated
-        refresh_token from whichever callback runs second).
+        The hook takes the access token the provider just rejected and
+        returns a fresh one, or None when no refresh could run. It goes
+        through ``refresh_rejected_token``, so the refresh is locked against
+        peers and persisted, and a dead grant retires the token, notifies the
+        user once, and raises ``ReconnectRequired``.
         """
 
-        async def _persist(access_token: str, refresh_token: str, expires_at: float) -> None:
-            # See ``refresh_token`` for why the lock must live on a
-            # ``Connection``, not a ``Session``: ``Session.commit()``
-            # returns the underlying connection to the pool and lets a
-            # peer enter the critical section.
-            lock_conn = await get_async_engine().connect()
-            lock_key = _refresh_lock_key(user_id, integration)
-            try:
-                if not await _try_acquire_advisory_lock_async(lock_conn, lock_key):
-                    logger.warning(
-                        "on_refresh callback could not acquire OAuth lock within %.1fs, "
-                        "skipping persist: user=%s integration=%s",
-                        _LOCK_MAX_WAIT_S,
-                        user_id,
-                        integration,
-                    )
-                    return
-                try:
-                    # Bypass the cache: this load is the peer-write detection
-                    # point for the on_refresh callback path. Same race as
-                    # in refresh_token's post-lock reload.
-                    current = await self.load_token_uncached(user_id, integration)
-                    if current is None:
-                        logger.warning(
-                            "on_refresh callback fired for missing token: user=%s integration=%s",
-                            user_id,
-                            integration,
-                        )
-                        return
-                    current.access_token = access_token
-                    if refresh_token:
-                        current.refresh_token = refresh_token
-                    current.expires_at = expires_at
-                    await self.save_token(user_id, integration, current)
-                    logger.info(
-                        "Persisted mid-call token refresh: user=%s integration=%s",
-                        user_id,
-                        integration,
-                    )
-                finally:
-                    try:
-                        await lock_conn.execute(
-                            text("SELECT pg_advisory_unlock(hashtext(:k))"),
-                            {"k": lock_key},
-                        )
-                        await lock_conn.commit()
-                    except Exception:
-                        logger.exception(
-                            "Failed to release OAuth refresh lock in callback: "
-                            "user=%s integration=%s",
-                            user_id,
-                            integration,
-                        )
-            finally:
-                await lock_conn.close()
+        async def _refresh(rejected_access_token: str) -> str | None:
+            refreshed = await self.refresh_rejected_token(
+                user_id, integration, rejected_access_token
+            )
+            return refreshed.access_token if refreshed else None
 
-        return _persist
+        return _refresh
 
     # -- Token refresh with error classification --------------------------------
 
@@ -921,7 +879,8 @@ class OAuthService:
 
         Returns the updated token data on success, or None if no token or
         refresh token exists. Raises on HTTP errors so the caller can
-        classify them via ``_is_permanent_refresh_failure``.
+        classify them via ``_is_permanent_refresh_failure``. A permanent
+        failure has already deleted the token, under the lock, by then.
 
         ``rejected_access_token`` is the access token a provider API just
         answered 401 to. When given, the refresh is skipped only if the stored
@@ -1026,7 +985,27 @@ class OAuthService:
                     },
                     auth=(config.client_id, config.client_secret),
                 )
-                resp.raise_for_status()
+                try:
+                    resp.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    if self._is_permanent_refresh_failure(exc):
+                        # Retire the dead grant before releasing the lock. A
+                        # peer waiting on it then reloads no token and stops,
+                        # instead of posting the dead refresh token again and
+                        # sending the user a second reconnect notice. The
+                        # caller's ``handle_permanent_refresh_failure`` still
+                        # notifies, once, and retries the delete if this one
+                        # failed.
+                        try:
+                            await self.delete_token(user_id, integration)
+                        except Exception:
+                            logger.exception(
+                                "Could not retire dead OAuth token under the lock: "
+                                "user=%s integration=%s",
+                                user_id,
+                                integration,
+                            )
+                    raise
                 data = resp.json()
 
                 token.access_token = data["access_token"]
@@ -1148,7 +1127,7 @@ class OAuthService:
         friendly = integration.replace("_", " ").title()
         reconnect_message = (
             f"The {friendly} connection has expired or was revoked. "
-            "The user must reconnect it in Settings > Integrations."
+            f"{reconnect_instruction(integration)}"
         )
         try:
             refreshed = await self.refresh_token(
@@ -1170,7 +1149,8 @@ class OAuthService:
     ) -> bool:
         """Retire the token when *error* means the user has to reconnect.
 
-        Deletes the stored token and tells the user, then returns True. Returns
+        Deletes the stored token (``refresh_token`` normally has already, under
+        the refresh lock) and tells the user, then returns True. Returns
         False for a transient error, leaving the token for a later retry. Shared
         by the inline path and the background sweep: a sweep that skipped this
         kept a dead token due for refresh and retried it on every tick, forever.

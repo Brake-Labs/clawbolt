@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import json
-import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -54,14 +53,7 @@ def _b64(data: str) -> str:
 
 
 def _make_service(sender_email: str = "me@example.com") -> GmailService:
-    return GmailService(
-        access_token="test-access",
-        refresh_token="test-refresh",
-        client_id="cid",
-        client_secret="csec",
-        token_expires_at=time.time() + 3600,
-        sender_email=sender_email,
-    )
+    return GmailService(access_token="test-access", sender_email=sender_email)
 
 
 def _get_tool(tools: list[Tool], name: str) -> Tool:
@@ -407,7 +399,8 @@ async def test_send_message_requires_recipient() -> None:
 
 async def test_request_refreshes_and_retries_on_401() -> None:
     """A 401 from Gmail triggers a refresh+retry so a stale access token gets rotated."""
-    service = _make_service()
+    refresh = AsyncMock(return_value="rotated-token")
+    service = GmailService(access_token="test-access", refresh_access_token=refresh)
 
     response_401 = MagicMock(status_code=401, content=b"")
     response_401.raise_for_status = MagicMock()
@@ -420,22 +413,14 @@ async def test_request_refreshes_and_retries_on_401() -> None:
     fake_client.__aenter__ = AsyncMock(return_value=fake_client)
     fake_client.__aexit__ = AsyncMock(return_value=None)
 
-    def rotate_token(_client: httpx.AsyncClient) -> None:
-        service._access_token = "rotated-token"
-
-    with (
-        patch(
-            "backend.app.integrations.gmail.service.httpx.AsyncClient",
-            return_value=fake_client,
-        ),
-        patch.object(
-            service, "_refresh_access_token", new=AsyncMock(side_effect=rotate_token)
-        ) as mock_refresh,
+    with patch(
+        "backend.app.integrations.gmail.service.httpx.AsyncClient",
+        return_value=fake_client,
     ):
         result = await service._request("GET", "/users/me/profile")
 
     assert result == {"ok": True}
-    mock_refresh.assert_awaited_once()
+    refresh.assert_awaited_once_with("test-access")
     assert fake_client.request.await_count == 2
     second_headers = fake_client.request.await_args_list[1].kwargs["headers"]
     assert second_headers["Authorization"] == "Bearer rotated-token"
@@ -464,12 +449,7 @@ async def test_message_summary_requests_metadata_headers_as_repeated_params() ->
 
 
 async def test_send_message_resolves_sender_lazily() -> None:
-    service = GmailService(
-        access_token="t",
-        refresh_token="r",
-        client_id="cid",
-        client_secret="csec",
-    )
+    service = GmailService(access_token="t")
     with patch.object(service, "_request", new_callable=AsyncMock) as mock_req:
         # First call: get_profile resolution. Second call: send.
         mock_req.side_effect = [

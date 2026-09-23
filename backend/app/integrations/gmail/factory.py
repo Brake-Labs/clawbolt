@@ -46,7 +46,11 @@ from backend.app.integrations.gmail.service import (
 )
 from backend.app.media.download import DownloadedMedia
 from backend.app.media.pipeline import process_message_media
-from backend.app.services.oauth import oauth_service
+from backend.app.services.oauth import (
+    ReconnectRequired,
+    oauth_service,
+    reconnect_instruction,
+)
 from backend.app.services.storage_service import StorageBackend
 
 if TYPE_CHECKING:
@@ -361,6 +365,30 @@ async def _resolve_attachments(
     return resolved, None
 
 
+def _reconnect_result() -> ToolResult:
+    """AUTH result for a dead Gmail connection.
+
+    Covers a 401 that survived the refresh retry and ``ReconnectRequired``
+    from a refresh that found the grant expired or revoked (the token is
+    already retired and the user notified by then).
+    """
+    return ToolResult(
+        content="Gmail disconnected. Please reconnect Gmail in Settings.",
+        is_error=True,
+        error_kind=ToolErrorKind.AUTH,
+        hint=(
+            "The connection has expired or was revoked. Do not retry. "
+            f"{reconnect_instruction('gmail')}"
+        ),
+    )
+
+
+def _dead_connection_result(exc: ReconnectRequired) -> ToolResult:
+    """Log a dead connection as expected (no traceback) and report it as AUTH."""
+    logger.warning("Gmail connection needs reconnecting: %s", exc)
+    return _reconnect_result()
+
+
 def _handle_http_error(exc: httpx.HTTPStatusError, action: str) -> ToolResult:
     status = exc.response.status_code
     body = ""
@@ -375,11 +403,7 @@ def _handle_http_error(exc: httpx.HTTPStatusError, action: str) -> ToolResult:
     )
     message, reason = parse_google_api_error(body)
     if status == 401:
-        return ToolResult(
-            content="Gmail disconnected. Please reconnect Gmail in Settings.",
-            is_error=True,
-            error_kind=ToolErrorKind.AUTH,
-        )
+        return _reconnect_result()
     if status == 403:
         # 403 has many causes: insufficientPermissions (real scope problem,
         # reconnect helps), accessNotConfigured (Gmail API disabled in the
@@ -451,6 +475,8 @@ def create_gmail_tools(
     async def _run_search(query: str, max_results: int, empty_msg: str) -> ToolResult:
         try:
             results = await service.search_messages(query, max_results)
+        except ReconnectRequired as exc:
+            return _dead_connection_result(exc)
         except httpx.TimeoutException:
             return ToolResult(
                 content="Gmail unavailable (timeout). Try again shortly.",
@@ -480,6 +506,8 @@ def create_gmail_tools(
     async def gmail_get_message(message_id: str) -> ToolResult:
         try:
             msg = await service.get_message(message_id)
+        except ReconnectRequired as exc:
+            return _dead_connection_result(exc)
         except httpx.TimeoutException:
             return ToolResult(
                 content="Gmail unavailable (timeout). Try again shortly.",
@@ -517,6 +545,8 @@ def create_gmail_tools(
         # listing is the source of truth for size and inline data.
         try:
             msg = await service.get_message(message_id)
+        except ReconnectRequired as exc:
+            return _dead_connection_result(exc)
         except httpx.TimeoutException:
             return ToolResult(
                 content="Gmail unavailable (timeout). Try again shortly.",
@@ -564,6 +594,8 @@ def create_gmail_tools(
 
         try:
             content = await service.get_attachment_bytes(message_id, attachment)
+        except ReconnectRequired as exc:
+            return _dead_connection_result(exc)
         except httpx.TimeoutException:
             return ToolResult(
                 content="Gmail unavailable (timeout). Try again shortly.",
@@ -634,7 +666,25 @@ def create_gmail_tools(
                 is_error=True,
                 error_kind=ToolErrorKind.VALIDATION,
             )
-        resolved_attachments, attach_error = await _resolve_attachments(storage, attachments or [])
+        try:
+            resolved_attachments, attach_error = await _resolve_attachments(
+                storage, attachments or []
+            )
+        except ReconnectRequired as exc:
+            # Attachments are read from Drive, so this dead grant is Drive's.
+            logger.warning("Google Drive connection needs reconnecting: %s", exc)
+            return ToolResult(
+                content=(
+                    "Cannot attach files: Google Drive disconnected. "
+                    "Please reconnect Google Drive in Settings."
+                ),
+                is_error=True,
+                error_kind=ToolErrorKind.AUTH,
+                hint=(
+                    "The Google Drive connection has expired or was revoked. Do not retry. "
+                    f"{reconnect_instruction('google_drive')}"
+                ),
+            )
         if attach_error is not None:
             return attach_error
         try:
@@ -645,6 +695,8 @@ def create_gmail_tools(
                 reply_to_message_id=reply_to_message_id,
                 attachments=resolved_attachments,
             )
+        except ReconnectRequired as exc:
+            return _dead_connection_result(exc)
         except httpx.TimeoutException:
             return ToolResult(
                 content="Gmail unavailable (timeout). Try again shortly.",
@@ -794,11 +846,7 @@ async def _gmail_factory(ctx: ToolContext) -> list[Tool]:
         return []
     service = GmailService(
         access_token=token.access_token,
-        refresh_token=token.refresh_token,
-        client_id=settings.gmail_client_id,
-        client_secret=settings.gmail_client_secret,
-        token_expires_at=token.expires_at or 0.0,
-        on_token_refresh=oauth_service.build_on_refresh_callback(ctx.user.id, "gmail"),
+        refresh_access_token=oauth_service.build_rejected_token_refresher(ctx.user.id, "gmail"),
     )
     # ``ctx.storage`` may be None when the user has not connected Drive;
     # gmail_send rejects attachment requests with a validation error in

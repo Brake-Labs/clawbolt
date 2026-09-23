@@ -14,7 +14,7 @@ from typing import Any
 
 import httpx
 
-from backend.app.services.oauth import ReconnectRequired
+from backend.app.services.oauth import ReconnectRequired, reconnect_instruction
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +139,7 @@ class QuickBooksOnlineService(QuickBooksService):
                             f"QuickBooks rejected the request with HTTP {resp.status_code} "
                             "even after a token refresh"
                             f"{f' (intuit_tid={tid})' if tid else ''}. "
-                            "The user must reconnect QuickBooks in Settings > Integrations.",
+                            f"{reconnect_instruction('quickbooks')}",
                         )
 
             try:

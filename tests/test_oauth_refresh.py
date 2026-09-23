@@ -637,18 +637,16 @@ class TestRefreshTokenLockSerialization:
 
     Concurrency primitives:
 
-    * Async test uses ``asyncio.gather`` against the production
-      ``refresh_token`` coroutine.
-    * Sync test uses ``threading.Thread`` against the production
-      ``build_on_refresh_callback`` ``_persist`` closure (the sync
-      sibling helper).
+    * The test uses ``asyncio.gather`` against the production
+      ``refresh_token`` coroutine, which every mid-call provider refresh
+      now goes through (``refresh_rejected_token``).
 
     The lock helpers are exercised end-to-end via the public service
     methods, not in isolation, so a future refactor that bypasses the
     helpers entirely still has to hit this assertion.
 
     No timestamp-based assertions across tasks (per #1202): all
-    coordination is via ``asyncio.Event`` / ``threading.Event``.
+    coordination is via ``asyncio.Event``.
     """
 
     _N_CONCURRENT = 3
@@ -794,141 +792,6 @@ class TestRefreshTokenLockSerialization:
                 f"caller {idx} returned a different refresh_token "
                 f"({r.refresh_token!r}); the lock allowed a racing rotation"
             )
-
-    @pytest.mark.skip(reason="needs rewrite for async on_refresh callback - issue #1234 followup")
-    def test_sync_callback_serializes_concurrent_persists(
-        self, _pg_async_engine: AsyncEngine, oauth_svc: OAuthService
-    ) -> None:
-        """N concurrent ``on_refresh`` callbacks for the same user serialize
-        on the advisory lock: each runs the load+save under the lock so
-        the rotated ``refresh_token`` field is preserved across overlapping
-        provider-driven mid-call refreshes.
-
-        Same mutation-test invariant as the async test, but for the
-        sync ``_try_acquire_advisory_lock_sync`` helper used by
-        ``build_on_refresh_callback``.
-        """
-        # TODO: rewrite for async on_refresh callback. The callback is
-        # now async and the sync ``_try_acquire_advisory_lock_sync``
-        # helper has been removed (issue #1234). Port to ``asyncio.gather``.
-        import threading
-
-        user_id = "lock-test-user-sync"
-        integration = "quickbooks"
-
-        # Each thread persists a unique rotated refresh_token so we
-        # can verify that *every* persist saw a non-stale base row.
-        # If two callbacks read the base row concurrently and both
-        # save, the loser's save clobbers the winner's rotated value.
-        # We assert the final saved row matches the last-running
-        # thread's intent, which can only happen if persists were
-        # serialized.
-        base_token = OAuthTokenData(
-            access_token="base-at",
-            refresh_token="base-rt",
-            expires_at=time.time() + 100,
-        )
-        persisted: dict[str, OAuthTokenData] = {"current": base_token}
-        # Each entry records the ``refresh_token`` value a thread saw
-        # when its post-lock ``load_token_uncached`` ran. With the
-        # lock working, only the first acquirer sees the original
-        # ``base-rt``; subsequent acquirers see a peer's rotation.
-        # With the bug, every thread reads the row before any save
-        # completes, so every entry equals ``base-rt``.
-        loaded_bases: list[str] = []
-        record_lock = threading.Lock()
-
-        # Hold each thread inside its critical section for a beat so
-        # racing threads have time to also enter and observe the same
-        # base. Without this, the GIL plus a fast in-memory save
-        # could let threads finish their critical section before the
-        # next one starts, masking the bug.
-        hold_inside_critical_s = 0.05
-
-        def _load_uncached(uid: str, ig: str) -> OAuthTokenData | None:
-            current = persisted["current"]
-            snapshot = OAuthTokenData(
-                access_token=current.access_token,
-                refresh_token=current.refresh_token,
-                token_type=current.token_type,
-                expires_at=current.expires_at,
-                scopes=list(current.scopes),
-                realm_id=current.realm_id,
-                extra=dict(current.extra),
-            )
-            with record_lock:
-                loaded_bases.append(snapshot.refresh_token)
-            return snapshot
-
-        def _save(uid: str, ig: str, token: OAuthTokenData) -> None:
-            # Hold inside the critical section so a buggy peer that
-            # bypasses the lock has a clean window to also observe
-            # the pre-save state and append its own ``base-rt`` to
-            # ``loaded_bases``.
-            time.sleep(hold_inside_critical_s)
-            with record_lock:
-                persisted["current"] = OAuthTokenData(
-                    access_token=token.access_token,
-                    refresh_token=token.refresh_token,
-                    token_type=token.token_type,
-                    expires_at=token.expires_at,
-                    scopes=list(token.scopes),
-                    realm_id=token.realm_id,
-                    extra=dict(token.extra),
-                )
-
-        barrier = threading.Barrier(self._N_CONCURRENT)
-
-        def _run_callback(idx: int) -> None:
-            # Coordinate so all N threads call the public callback at
-            # the same moment. Each callback opens its own lock
-            # connection and contends for the advisory lock.
-            barrier.wait(timeout=self._TIMEOUT_S)
-            new_at = f"rotated-at-{idx}"
-            new_rt = f"rotated-rt-{idx}"
-            cb = oauth_svc.build_on_refresh_callback(user_id, integration)
-            cb(new_at, new_rt, time.time() + 3600)
-
-        # Apply the patches once on the shared service before
-        # spawning threads. ``patch.object`` is not thread-safe when
-        # used as a context manager from multiple threads, so we set
-        # it up at the test scope (single thread) and let each worker
-        # thread observe the same patched attributes.
-        with (
-            patch.object(oauth_svc, "load_token_uncached", side_effect=_load_uncached),
-            patch.object(oauth_svc, "save_token", side_effect=_save),
-        ):
-            threads = [
-                threading.Thread(target=_run_callback, args=(idx,))
-                for idx in range(self._N_CONCURRENT)
-            ]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join(timeout=self._TIMEOUT_S * 2)
-                assert not t.is_alive(), "callback thread did not complete"
-
-        # Every callback ran its post-lock load (none bailed out on
-        # lock timeout).
-        assert len(loaded_bases) == self._N_CONCURRENT, (
-            f"expected {self._N_CONCURRENT} post-lock loads, got "
-            f"{len(loaded_bases)}; loaded_bases={loaded_bases}. "
-            "Some callbacks bailed out before reading."
-        )
-
-        # Acid test: exactly one thread loaded the original ``base-rt``.
-        # With the bug, every thread loads ``base-rt`` (loads happen
-        # before any save completes, so all see the pre-save state).
-        # With the fix, only the first acquirer sees ``base-rt``; the
-        # rest see a previous thread's rotation.
-        base_observations = loaded_bases.count("base-rt")
-        assert base_observations == 1, (
-            f"expected exactly one thread to observe the original base "
-            f"refresh_token, got {base_observations}; loaded_bases="
-            f"{loaded_bases}. The advisory lock failed to serialize "
-            f"on_refresh callbacks: every thread read the same stale "
-            f"row before any thread's save landed."
-        )
 
     async def test_async_helper_with_session_input_is_documented_misuse(
         self, _pg_async_engine: AsyncEngine

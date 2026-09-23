@@ -200,6 +200,19 @@ def _intuit_fault_codes(exc: httpx.HTTPStatusError) -> set[str]:
     return {str(err["code"]) for err in errors if isinstance(err, dict) and err.get("code")}
 
 
+def _log_tool_failure(exc: Exception, message: str, *args: object) -> None:
+    """Log a failed QuickBooks call; a dead connection is expected, not a crash.
+
+    ``ReconnectRequired`` is the user's connection lapsing, already handled
+    (token retired, user notified), so it gets a warning without a traceback
+    rather than an ERROR that pages as a code failure.
+    """
+    if isinstance(exc, ReconnectRequired):
+        logger.warning(message + ": reconnect required: %s", *args, exc)
+    else:
+        logger.exception(message, *args)
+
+
 def _fault_error_kind(exc: Exception) -> ToolErrorKind:
     """Classify a QBO failure for the LLM error hint.
 
@@ -808,7 +821,7 @@ def create_quickbooks_tools(
                 # The model's query was wrong; no stack trace needed.
                 logger.warning("QuickBooks rejected query: %s", exc)
             else:
-                logger.exception("QuickBooks query failed")
+                _log_tool_failure(exc, "QuickBooks query failed")
             if isinstance(exc, httpx.HTTPStatusError):
                 error_str = _format_intuit_fault(exc, entity=entity_name)
             else:
@@ -853,7 +866,7 @@ def create_quickbooks_tools(
         try:
             result = await qb_service.create_entity(entity_type, data)
         except Exception as exc:
-            logger.exception("QB create %s failed", entity_type)
+            _log_tool_failure(exc, "QB create %s failed", entity_type)
             if isinstance(exc, httpx.HTTPStatusError):
                 error_str = _format_intuit_fault(exc, entity=entity_type)
             else:
@@ -937,7 +950,7 @@ def create_quickbooks_tools(
                 error_kind=ToolErrorKind.VALIDATION,
             )
         except Exception as exc:
-            logger.exception("QB update %s failed", entity_type)
+            _log_tool_failure(exc, "QB update %s failed", entity_type)
             if isinstance(exc, httpx.HTTPStatusError):
                 error_str = _format_intuit_fault(exc, entity=entity_type)
             else:
@@ -1034,7 +1047,7 @@ def create_quickbooks_tools(
         try:
             await qb_service.send_entity_email(entity_type, entity_id, email)
         except Exception as exc:
-            logger.exception("QB send %s email failed", entity_type)
+            _log_tool_failure(exc, "QB send %s email failed", entity_type)
             if isinstance(exc, httpx.HTTPStatusError):
                 error_str = _format_intuit_fault(exc, entity=entity_type)
             else:
@@ -1141,20 +1154,11 @@ async def _get_quickbooks_service_for_user(user_id: str) -> QuickBooksService | 
     token = await oauth_service.get_valid_token(user_id, "quickbooks")
     if not (token and token.access_token and token.realm_id):
         return None
-
-    async def refresh_access_token(rejected_access_token: str) -> str | None:
-        # The shared refresh: locked against peers, persisted, and a dead
-        # grant retires the token and raises ReconnectRequired.
-        refreshed = await oauth_service.refresh_rejected_token(
-            user_id, "quickbooks", rejected_access_token
-        )
-        return refreshed.access_token if refreshed else None
-
     return QuickBooksOnlineService(
         realm_id=token.realm_id,
         access_token=token.access_token,
         environment=settings.quickbooks_environment,
-        refresh_access_token=refresh_access_token,
+        refresh_access_token=oauth_service.build_rejected_token_refresher(user_id, "quickbooks"),
     )
 
 
