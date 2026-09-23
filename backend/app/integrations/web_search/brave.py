@@ -2,8 +2,10 @@
 
 https://api.search.brave.com/app/documentation/web-search/get-started
 
-This provider does not reshape Brave's records. It pulls the result list out of
-the envelope and hands them up as-is, so any field Brave sends (including ones
+This provider does not reshape Brave's records beyond two named trims. It pulls
+the result list out of the envelope, strips markup, drops the presentation-only
+keys in ``_DROPPED_KEYS``, and caps the repeated lists in ``_LIST_CAPS``. Both
+are denylists: any field Brave sends that is not named here (including ones
 added after this was written) reaches the model.
 """
 
@@ -43,6 +45,45 @@ _FRESHNESS_CODES = frozenset({"pd", "pw", "pm", "py"})
 _MAX_ATTEMPTS = 3
 _BACKOFF_BASE_SECONDS = 0.5
 
+# Keys dropped at any depth. Each is chrome for a results UI (image and favicon
+# URLs, the site's display name and breadcrumb, schema type tags, boolean
+# display flags) and carries no fact the agent can quote. On live results they
+# were over half of every record. A denylist on purpose: an allowlist is what
+# once dropped ``product.price``, and a field Brave adds later must still pass
+# through. Title, url, description, prices, offers, ratings, snippets, FAQ
+# answers and ages are never named here.
+_DROPPED_KEYS = frozenset(
+    {
+        "thumbnail",
+        "meta_url",
+        "profile",
+        "favicon",
+        "img",
+        "logo",
+        "is_source_local",
+        "is_source_both",
+        "family_friendly",
+        "type",
+        "subtype",
+        "is_live",
+        "language",
+        "is_tripadvisor",
+    }
+)
+
+# Repeated lists capped to their first N entries, keyed by the list's key or by
+# ``parent.key``. A capped list gets a sibling ``<key>_not_shown`` count, so the
+# agent knows there was more and can search more narrowly. Offers and extra
+# snippets carry the prices and availability the agent quotes in estimates, so
+# their caps stay loose enough to give a price range; the size saving comes
+# mostly from the denylist above.
+_LIST_CAPS: dict[str, int] = {
+    "product_cluster": 3,
+    "offers": 3,
+    "extra_snippets": 5,
+    "faq.items": 2,
+}
+
 
 def _clean(value: Any) -> Any:
     """Strip highlight markup and unescape entities, recursively.
@@ -59,6 +100,29 @@ def _clean(value: Any) -> Any:
     if isinstance(value, list):
         return [_clean(v) for v in value]
     return value
+
+
+def _trim(value: Any, parent: str = "") -> Any:
+    """Drop ``_DROPPED_KEYS`` and cap ``_LIST_CAPS`` lists, recursively.
+
+    Everything else passes through unchanged, so a field this module has never
+    heard of still reaches the model.
+    """
+    if isinstance(value, list):
+        return [_trim(v, parent) for v in value]
+    if not isinstance(value, dict):
+        return value
+    out: dict[str, Any] = {}
+    for key, sub in value.items():
+        if key in _DROPPED_KEYS:
+            continue
+        cap = _LIST_CAPS.get(f"{parent}.{key}", _LIST_CAPS.get(key))
+        if cap is not None and isinstance(sub, list) and len(sub) > cap:
+            out[key] = _trim(sub[:cap], key)
+            out[f"{key}_not_shown"] = len(sub) - cap
+        else:
+            out[key] = _trim(sub, key)
+    return out
 
 
 class BraveSearchProvider:
@@ -141,4 +205,4 @@ class BraveSearchProvider:
         data = await self._request(params)
 
         results = (data.get("web") or {}).get("results") or []
-        return [_clean(r) for r in results[:count] if isinstance(r, dict)]
+        return [_trim(_clean(r)) for r in results[:count] if isinstance(r, dict)]

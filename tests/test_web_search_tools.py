@@ -18,9 +18,10 @@ import httpx
 import pytest
 
 from backend.app.agent.tools.base import Tool, ToolResult
-from backend.app.integrations.web_search.brave import BraveSearchProvider, _clean
+from backend.app.integrations.web_search.brave import BraveSearchProvider, _clean, _trim
 from backend.app.integrations.web_search.cache import SearchCache
 from backend.app.integrations.web_search.errors import SearchUnavailableError
+from backend.app.integrations.web_search.factory import _RESULT_FOOTER
 from backend.app.integrations.web_search.protocol import SearchProvider
 from backend.app.integrations.web_search.render import render_records
 
@@ -99,6 +100,129 @@ class TestClean:
         """Applied by walking the record, so it reaches fields nobody listed."""
         cleaned = _clean({"product": {"name": "<strong>USG</strong>"}, "extra": ["<em>a</em>"]})
         assert cleaned == {"product": {"name": "USG"}, "extra": ["a"]}
+
+
+def _bulky_brave_result() -> dict:
+    """A product result carrying the presentation chrome a live Brave record has."""
+    img = "https://imgs.search.brave.com/abc/rs:fit:200:200/xyz.png"
+    chrome = {"name": "Supplier", "url": "https://supplier.example.com", "img": img}
+    return {
+        "title": "1/2 in. Copper Type L Pipe",
+        "url": "https://supplier.example.com/p/copper-type-l",
+        "description": "Type L is <strong>$1.40-$2.20 per foot</strong>.",
+        "page_age": "2026-08-12T00:00:00",
+        "age": "August 12, 2026",
+        "is_source_local": False,
+        "is_source_both": False,
+        "family_friendly": True,
+        "type": "search_result",
+        "subtype": "product",
+        "is_live": False,
+        "language": "en",
+        "profile": chrome,
+        "meta_url": {"hostname": "supplier.example.com", "favicon": img, "path": "/p/copper"},
+        "thumbnail": {"src": img, "original": img, "logo": False},
+        "product_cluster": [
+            {
+                "type": "Product",
+                "name": f"Copper Pipe {j}",
+                "price": f"3{j}.98",
+                "thumbnail": {"src": img},
+                "offers": [
+                    {"url": f"https://supplier.example.com/{j}/{k}", "price": f"3{j}.{k}9"}
+                    for k in range(5)
+                ],
+                "rating": {
+                    "ratingValue": 4.6,
+                    "reviewCount": 120,
+                    "bestRating": 5,
+                    "is_tripadvisor": False,
+                    "profile": chrome,
+                },
+            }
+            for j in range(5)
+        ],
+        "extra_snippets": [f"Snippet {s}: copper moved 4%." for s in range(7)],
+        "faq": {
+            "items": [
+                {"question": f"Q{q}?", "answer": f"A{q}.", "meta_url": {"favicon": img}}
+                for q in range(4)
+            ]
+        },
+        "some_future_brave_field": "kept",
+    }
+
+
+class TestTrim:
+    """The provider-side denylist and list caps."""
+
+    def _trimmed(self) -> dict:
+        return _trim(_clean(_bulky_brave_result()))
+
+    def test_drops_presentation_only_fields_at_every_depth(self) -> None:
+        out = render_records([self._trimmed()])
+        for gone in (
+            "imgs.search.brave.com",
+            "favicon",
+            "meta_url",
+            "profile",
+            "thumbnail",
+            "is_source_",
+            "family_friendly",
+            "subtype",
+            "is_live",
+            "language",
+            "is_tripadvisor",
+            "type:",
+        ):
+            assert gone not in out, gone
+
+    def test_keeps_every_fact_the_agent_quotes(self) -> None:
+        out = render_records([self._trimmed()])
+        assert "title: 1/2 in. Copper Type L Pipe" in out
+        assert "url: https://supplier.example.com/p/copper-type-l" in out
+        assert "description: Type L is $1.40-$2.20 per foot." in out
+        assert "page_age: 2026-08-12T00:00:00" in out
+        assert "age: August 12, 2026" in out
+        assert "product_cluster[0].price: 30.98" in out
+        assert "product_cluster[0].offers[0].price: 30.09" in out
+        assert "product_cluster[0].offers[0].url: https://supplier.example.com/0/0" in out
+        assert "product_cluster[0].rating.ratingValue: 4.6" in out
+        assert "product_cluster[0].rating.bestRating: 5" in out
+        assert "product_cluster[0].offers[2].price: 30.29" in out
+        assert "extra_snippets[0]: Snippet 0: copper moved 4%." in out
+        assert "faq.items[0].answer: A0." in out
+
+    def test_an_unknown_field_still_passes_through(self) -> None:
+        """Denylist, not allowlist: a field Brave adds later reaches the model."""
+        assert self._trimmed()["some_future_brave_field"] == "kept"
+
+    def test_caps_repeated_lists_and_counts_the_rest(self) -> None:
+        trimmed = self._trimmed()
+        assert len(trimmed["product_cluster"]) == 3
+        assert trimmed["product_cluster_not_shown"] == 2
+        assert len(trimmed["product_cluster"][0]["offers"]) == 3
+        assert trimmed["product_cluster"][0]["offers_not_shown"] == 2
+        assert trimmed["extra_snippets"] == [f"Snippet {s}: copper moved 4%." for s in range(5)]
+        assert trimmed["extra_snippets_not_shown"] == 2
+        assert len(trimmed["faq"]["items"]) == 2
+        assert trimmed["faq"]["items_not_shown"] == 2
+
+    def test_short_lists_are_untouched_and_carry_no_count(self) -> None:
+        trimmed = _trim({"extra_snippets": ["a", "b"], "offers": [{"price": "1"}]})
+        assert trimmed == {"extra_snippets": ["a", "b"], "offers": [{"price": "1"}]}
+
+    def test_items_is_capped_only_under_faq(self) -> None:
+        trimmed = _trim({"other": {"items": [1, 2, 3, 4]}})
+        assert trimmed == {"other": {"items": [1, 2, 3, 4]}}
+
+    def test_is_deterministic(self) -> None:
+        assert render_records([self._trimmed()]) == render_records([self._trimmed()])
+
+    def test_shrinks_a_bulky_record_by_more_than_half(self) -> None:
+        before = len(render_records([_clean(_bulky_brave_result())]))
+        after = len(render_records([self._trimmed()]))
+        assert after < before / 2
 
 
 class TestBraveSearchProvider:
@@ -198,6 +322,24 @@ class TestBraveSearchProvider:
         assert results[0]["product"]["name"] == (
             "USG 4.5G Plus-3 Lightweight Joint Compound Blue Lid"
         )
+
+    async def test_search_trims_chrome_and_caps_lists(self) -> None:
+        """The trim runs on what search() returns, so the cache and the tool
+        both see the compact record."""
+        provider = BraveSearchProvider(api_key="k")
+        client = _mock_client(
+            [_make_httpx_response(200, _make_brave_response([_bulky_brave_result()]))]
+        )
+
+        with _patch_client(client):
+            results = await provider.search("copper pipe")
+
+        r = results[0]
+        assert "thumbnail" not in r
+        assert "meta_url" not in r
+        assert r["product_cluster_not_shown"] == 2
+        assert r["product_cluster"][0]["price"] == "30.98"
+        assert r["description"] == "Type L is $1.40-$2.20 per foot."
 
     async def test_result_without_a_product_has_no_price(self) -> None:
         provider = BraveSearchProvider(api_key="k")
@@ -447,6 +589,10 @@ class TestWebSearchTool:
         assert "too broad" in content
         assert "search once more" in content
 
+    def test_footer_stays_short(self) -> None:
+        """It rides on every result and stays in history, so it is budgeted."""
+        assert len(_RESULT_FOOTER) < 400
+
     async def test_renders_provider_fields_it_was_never_told_about(self) -> None:
         """The whole point of the pass-through: a field this code has no
         knowledge of still reaches the model."""
@@ -612,7 +758,8 @@ class TestRendering:
         assert "missing" not in out
 
     def test_keeps_image_urls_like_every_other_field(self) -> None:
-        """No denylist. A field the provider sent is a field the model sees."""
+        """The renderer has no denylist: shaping is the provider's job (see
+        TestTrim), so a record handed here is rendered whole."""
         out = render_records([{"thumbnail": {"src": "https://img.example.com/x.png"}}])
         assert "thumbnail.src: https://img.example.com/x.png" in out
 

@@ -149,7 +149,7 @@ Each line item in the `Line` array should look like:
 
 ## Updating Entities (qb_update)
 
-Pass `entity_type` and `data` with the **full entity payload including Id and SyncToken** from a prior `qb_query`.
+Pass `entity_type` and `data` with the **full entity payload including Id and SyncToken** from a `qb_query` for that record alone (`WHERE Id = '<id>'`).
 
 The SyncToken is required for optimistic concurrency. If the entity was modified since you last queried it, QuickBooks will reject the update with a conflict error. In that case, re-query the entity and try again with the new SyncToken.
 
@@ -194,7 +194,7 @@ This is the primary workflow for users who dictate job details from the field:
 4. If new client: `qb_create` Customer
 5. `qb_create` Estimate with line items (typically labor + materials)
 6. Summarize what you drafted and what you assumed in one line: "Drafted estimate for Test Customer: 8 hr labor at $50, materials $200, expires in 30 days. Change anything?"
-7. User comes back later to refine: `qb_query` the estimate (note the SyncToken in the results)
+7. User comes back later to refine: `qb_query` the estimate by Id (note the SyncToken in the results)
 8. `qb_update` Estimate with revised line items (include Id and SyncToken)
 9. When user says it's ready: `qb_send` Estimate to the client's email
 

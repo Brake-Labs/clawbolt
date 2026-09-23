@@ -391,3 +391,138 @@ class TestFormatResults:
         assert "PrimaryPhone: 555-1234" in out
         assert "BillAddr: 1 Test Ave, Pittsburgh" in out
         assert "CustomerRef: Acme Plumbing (16)" in out
+
+
+# -- Compact rendering for lists --
+
+
+def _estimate_row(i: int) -> dict:
+    """A SELECT * Estimate row, shaped like a live QBO response."""
+    addr = {"Id": "9", "Line1": f"{100 + i} Oak St", "City": "Springfield", "PostalCode": "90210"}
+    return {
+        "CustomerRef": {"value": str(58 + i), "name": f"Test Customer {i}"},
+        "TxnStatus": "Pending",
+        "domain": "QBO",
+        "sparse": False,
+        "Id": str(1040 + i),
+        "SyncToken": str(i % 3),
+        "MetaData": {"CreateTime": "2026-09-01T10:00:00-07:00"},
+        "CustomField": [{"DefinitionId": "1", "Name": "Crew", "Type": "StringType"}],
+        "DocNumber": f"EST-{1040 + i}",
+        "TxnDate": "2026-09-01",
+        "CurrencyRef": {"value": "USD", "name": "United States Dollar"},
+        "LinkedTxn": [{"TxnId": "77", "TxnType": "Invoice"}] if i == 0 else [],
+        "Line": [
+            {"Description": "Labor - bathroom remodel, demo and rough-in", "Amount": 1600.0},
+            {
+                "Description": "Materials - tile, vanity, fixtures and supply lines",
+                "Amount": 2400.0,
+            },
+            {"Description": "Permit and disposal fees", "Amount": 350.0},
+        ],
+        "TxnTaxDetail": {"TxnTaxCodeRef": {"value": "3"}, "TotalTax": 12.5, "TaxLine": []},
+        "CustomerMemo": {"value": "Valid for 30 days. " + "Price assumes a sound subfloor. " * 4},
+        "BillAddr": addr,
+        "FreeFormAddress": True,
+        "ShipFromAddr": {"Id": "900", "Line1": "1 Shop Rd"},
+        "TotalAmt": 4350.0,
+        "Balance": 4350.0,
+        "ApplyTaxAfterDiscount": False,
+        "PrintStatus": "NeedToPrint",
+        "EmailStatus": "NotSet",
+        "BillEmail": {"Address": f"customer{i}@example.com"},
+        "ExpirationDate": "2026-10-01",
+        "DeliveryInfo": {"DeliveryType": "Email"},
+        "GlobalTaxCalculation": "TaxExcluded",
+    }
+
+
+class TestCompactResults:
+    def test_three_rows_or_fewer_render_whole(self) -> None:
+        """A lookup by Id feeds qb_update, so nothing may be cut or dropped."""
+        for n in (1, 2, 3):
+            out = _format_results([_estimate_row(i) for i in range(n)])
+            assert "ShipFromAddr: 1 Shop Rd" in out
+            assert "CurrencyRef: United States Dollar (USD)" in out
+            assert "DeliveryInfo:" in out
+            assert "Permit and disposal fees $350.00" in out
+            assert "chars]" not in out
+            assert "compact" not in out
+            assert _estimate_row(0)["CustomerMemo"]["value"] in out
+
+    def test_list_rows_keep_every_identifier_total_date_and_status(self) -> None:
+        out = _format_results([_estimate_row(i) for i in range(5)])
+        lines = out.splitlines()[1:6]
+        for i, line in enumerate(lines):
+            assert f"Id: {1040 + i}" in line
+            assert f"SyncToken: {i % 3}" in line
+            assert f"DocNumber: EST-{1040 + i}" in line
+            assert f"CustomerRef: Test Customer {i} ({58 + i})" in line
+            assert "TotalAmt: 4350.0" in line
+            assert "Balance: 4350.0" in line
+            assert "TotalTax: 12.5" in line
+            assert "TxnDate: 2026-09-01" in line
+            assert "ExpirationDate: 2026-10-01" in line
+            assert "TxnStatus: Pending" in line
+            assert "EmailStatus: NotSet" in line
+            assert "PrintStatus: NeedToPrint" in line
+            assert f"BillEmail: customer{i}@example.com" in line
+            assert f"BillAddr: {100 + i} Oak St, Springfield, 90210" in line
+        assert 'LinkedTxn: [{"TxnId": "77", "TxnType": "Invoice"}]' in lines[0]
+
+    def test_list_rows_drop_filler_and_empty_fields(self) -> None:
+        out = _format_results([_estimate_row(i) for i in range(5)])
+        for gone in (
+            "ShipFromAddr",
+            "CurrencyRef",
+            "DeliveryInfo",
+            "ApplyTaxAfterDiscount",
+            "FreeFormAddress",
+            "GlobalTaxCalculation",
+            "CustomField",
+            "TxnTaxDetail",
+            "TaxLine",
+            "LinkedTxn: []",
+        ):
+            assert gone not in out, gone
+
+    def test_list_rows_cut_long_text_and_mark_it(self) -> None:
+        row = _estimate_row(0)
+        out = _format_results([row] * 4)
+        memo = row["CustomerMemo"]["value"]
+        assert memo not in out
+        cut = len(memo) - 90
+        assert f"CustomerMemo: {memo[:90]}... [+{cut} chars]" in out
+        assert "Line: [Labor - bathroom remodel, demo and rough-in $1,600.00; " in out
+        assert "Permit and disposal fees" not in out
+
+    def test_short_text_is_not_marked(self) -> None:
+        rows = [{"Id": str(i), "CustomerMemo": {"value": "Thanks!"}} for i in range(4)]
+        out = _format_results(rows)
+        assert "CustomerMemo: Thanks!\n" in out
+        assert "... [+" not in out
+
+    def test_list_carries_a_note_on_getting_the_whole_record(self) -> None:
+        out = _format_results([_estimate_row(i) for i in range(4)])
+        assert out.endswith("WHERE Id = '<Id>'.)")
+        assert "qb_update" in out
+
+    def test_compact_rendering_is_deterministic_and_shorter(self) -> None:
+        rows = [_estimate_row(i) for i in range(15)]
+        first = _format_results(rows)
+        assert first == _format_results(rows)
+        whole = "\n".join(_format_results([row]) for row in rows)
+        assert len(first) < len(whole) * 0.7
+
+    async def test_single_record_lookup_through_the_tool_is_whole(
+        self, qb_service: MockQuickBooksService
+    ) -> None:
+        tools = create_quickbooks_tools(qb_service)
+        result = await tools[0].function(query="SELECT * FROM Estimate WHERE Id = '2001'")
+        assert "SyncToken: 0" in result.content
+        assert "compact" not in result.content
+
+    def test_usage_hint_names_the_threshold(self, qb_service: MockQuickBooksService) -> None:
+        hint = create_quickbooks_tools(qb_service)[0].usage_hint or ""
+        assert "over 3 rows are compact" in hint
+        assert "WHERE Id" in hint

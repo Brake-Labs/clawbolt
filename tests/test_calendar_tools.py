@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import UTC, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -17,6 +17,7 @@ from backend.app.agent.tools.registry import ToolContext
 from backend.app.integrations.calendar.factory import (
     _calendar_factory,
     _calendar_not_visible_result,
+    _format_event_list,
     _handle_http_error,
     _parse_dt,
     _resolve_tz,
@@ -1533,3 +1534,189 @@ def test_not_visible_message_is_redacted_in_admin_views() -> None:
     redacted = redact_pii(result.content + " " + result.hint)
     assert _CONNECTED not in redacted
     assert _STALE_ID not in redacted
+
+
+# ---------------------------------------------------------------------------
+# list_events output: grouping, cap, determinism
+# ---------------------------------------------------------------------------
+
+
+def _event(
+    event_id: str,
+    start: datetime,
+    *,
+    hours: int = 2,
+    title: str = "Job",
+    location: str = "",
+    description: str = "",
+    all_day: bool = False,
+) -> CalendarEventData:
+    return CalendarEventData(
+        id=event_id,
+        title=title,
+        start=start,
+        end=start + timedelta(hours=hours) if not all_day else start + timedelta(days=1),
+        location=location,
+        description=description,
+        all_day=all_day,
+    )
+
+
+def _week_of_events() -> list[tuple[str, CalendarEventData]]:
+    """Two calendars, two events on each of two days, interleaved in time."""
+    return [
+        ("Personal", _event("p1", datetime(2026, 3, 25, 9, tzinfo=UTC), title="Kitchen A")),
+        ("Jobs", _event("j1", datetime(2026, 3, 25, 10, tzinfo=UTC), title="Roof B")),
+        ("Personal", _event("p2", datetime(2026, 3, 25, 13, tzinfo=UTC), title="Kitchen C")),
+        ("Jobs", _event("j2", datetime(2026, 3, 26, 8, tzinfo=UTC), title="Roof D")),
+    ]
+
+
+def test_event_list_groups_by_calendar_then_day() -> None:
+    out = _format_event_list(_week_of_events(), ["Personal", "Jobs"], show_label=True)
+    lines = out.splitlines()
+    assert lines == [
+        "Found 4 event(s):",
+        "[Personal]",
+        "2026-03-25 Wed",
+        "- 09:00-11:00 Kitchen A | id: p1",
+        "- 13:00-15:00 Kitchen C | id: p2",
+        "[Jobs]",
+        "2026-03-25 Wed",
+        "- 10:00-12:00 Roof B | id: j1",
+        "2026-03-26 Thu",
+        "- 08:00-10:00 Roof D | id: j2",
+    ]
+
+
+def test_event_list_single_calendar_has_no_label() -> None:
+    events = [pair for pair in _week_of_events() if pair[0] == "Personal"]
+    out = _format_event_list(events, ["Personal"], show_label=False)
+    assert "[Personal]" not in out
+    assert out.count("2026-03-25 Wed") == 1
+
+
+def test_event_line_keeps_location_notes_and_id() -> None:
+    long_notes = "n" * 150
+    event = _event(
+        "evt-x", datetime(2026, 3, 25, 9, tzinfo=UTC), location="1 Oak St", description=long_notes
+    )
+    out = _format_event_list([("Personal", event)], ["Personal"], show_label=False)
+    assert f"- 09:00-11:00 Job @ 1 Oak St | {'n' * 100}... | id: evt-x" in out
+
+
+def test_event_line_all_day_and_overnight() -> None:
+    all_day = _event("ad", datetime(2026, 3, 25, tzinfo=UTC), title="Holiday", all_day=True)
+    overnight = _event("on", datetime(2026, 3, 25, 22, tzinfo=UTC), hours=4, title="Pour")
+    out = _format_event_list(
+        [("Personal", overnight), ("Personal", all_day)], ["Personal"], show_label=False
+    )
+    assert "- all day Holiday | id: ad" in out
+    assert "- 22:00-2026-03-26 02:00 Pour | id: on" in out
+    # All-day sorts first on its day (it starts at midnight).
+    assert out.index("id: ad") < out.index("id: on")
+
+
+def test_all_day_event_stays_on_its_own_day_west_of_utc() -> None:
+    """An all-day event starts at UTC midnight, which in Denver is 18:00 the
+    evening before. It must not split the previous day's heading."""
+    mdt = timezone(timedelta(hours=-6))
+    events = [
+        ("Jobs", _event("a", datetime(2026, 9, 23, 17, tzinfo=mdt), title="Site visit")),
+        ("Jobs", _event("b", datetime(2026, 9, 24, tzinfo=UTC), title="Off", all_day=True)),
+        ("Jobs", _event("c", datetime(2026, 9, 23, 19, tzinfo=mdt), title="Estimate")),
+        ("Jobs", _event("d", datetime(2026, 9, 24, 8, tzinfo=mdt), title="Roof")),
+    ]
+    out = _format_event_list(events, ["Jobs"], show_label=False)
+    assert out.splitlines() == [
+        "Found 4 event(s):",
+        "2026-09-23 Wed",
+        "- 17:00-19:00 Site visit | id: a",
+        "- 19:00-21:00 Estimate | id: c",
+        "2026-09-24 Thu",
+        "- all day Off | id: b",
+        "- 08:00-10:00 Roof | id: d",
+    ]
+    capped = _format_event_list(events, ["Jobs"], show_label=False, limit=2)
+    assert "2026-09-24" not in capped.split("\n(")[0]
+    assert "(2 more event(s) from 2026-09-24 on not shown" in capped
+
+
+def _many_events(n_personal: int, n_jobs: int) -> list[tuple[str, CalendarEventData]]:
+    base = datetime(2026, 4, 1, 8, tzinfo=UTC)
+    events = [
+        ("Personal", _event(f"p{i:03d}", base + timedelta(days=i), title=f"P{i}"))
+        for i in range(n_personal)
+    ]
+    events += [
+        ("Jobs", _event(f"j{i:03d}", base + timedelta(days=i, hours=1), title=f"J{i}"))
+        for i in range(n_jobs)
+    ]
+    return events
+
+
+def test_event_list_caps_and_counts_the_rest_per_calendar() -> None:
+    out = _format_event_list(_many_events(50, 30), ["Personal", "Jobs"], show_label=True)
+    assert out.startswith("Found 80 event(s), showing the first 60 by start time:")
+    # The earliest 60 are shown: 30 of each calendar through day 29.
+    assert out.count("| id: ") == 60
+    assert "id: p029" in out
+    assert "id: j029" in out
+    assert "id: p030" not in out
+    assert out.rstrip().endswith(
+        "(20 more event(s) from 2026-05-01 on not shown: Personal 20. "
+        "Narrow the date range or pass calendar_id to see them.)"
+    )
+
+
+def test_event_list_under_the_cap_has_no_footer() -> None:
+    out = _format_event_list(_many_events(30, 30), ["Personal", "Jobs"], show_label=True)
+    assert out.startswith("Found 60 event(s):")
+    assert "not shown" not in out
+    assert out.count("| id: ") == 60
+
+
+def test_event_list_is_deterministic_regardless_of_input_order() -> None:
+    """Ties on start time break on calendar order, then title, then id."""
+    same_time = datetime(2026, 3, 25, 9, tzinfo=UTC)
+    events = [
+        ("Jobs", _event("j-b", same_time, title="B")),
+        ("Personal", _event("p-z", same_time, title="Z")),
+        ("Jobs", _event("j-a", same_time, title="A")),
+        ("Personal", _event("p-a", same_time, title="A")),
+    ]
+    order = ["Personal", "Jobs"]
+    first = _format_event_list(events, order, show_label=True, limit=3)
+    second = _format_event_list(list(reversed(events)), order, show_label=True, limit=3)
+    assert first == second
+    # Cap keeps Personal's two and the first Jobs event by title.
+    assert "id: p-a" in first
+    assert "id: p-z" in first
+    assert "id: j-a" in first
+    assert "id: j-b" not in first
+    assert "Jobs 1" in first
+
+
+async def test_list_events_tool_caps_a_long_range() -> None:
+    service = MockGoogleCalendarService()
+    base = datetime(2026, 5, 1, 9, tzinfo=UTC)
+    for i in range(75):
+        event = _event(f"bulk-{i:03d}", base + timedelta(days=i // 2, hours=i % 2))
+        service.events.append(event)
+        service._event_calendar_map[event.id] = "primary" if i % 3 else "jobs@example.com"
+    tools = create_calendar_tools(service, enabled_calendars=_DEFAULT_ENABLED)
+    result = await _get_tool(tools, ToolName.CALENDAR_LIST_EVENTS).function(
+        start_date="2026-05-01T00:00:00", end_date="2026-08-01T00:00:00"
+    )
+    assert result.is_error is False
+    assert "Found 75 event(s), showing the first 60" in result.content
+    assert result.content.count("| id: bulk-") == 60
+    assert "15 more event(s)" in result.content
+    assert "Personal 10, Jobs 5" in result.content
+    assert "Narrow the date range" in result.content
+
+
+def test_list_events_description_names_the_cap(cal_tools: list[Tool]) -> None:
+    tool = _get_tool(cal_tools, ToolName.CALENDAR_LIST_EVENTS)
+    assert "at most 60 events" in tool.description
+    assert "narrow the range" in (tool.usage_hint or "")
