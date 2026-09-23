@@ -35,16 +35,21 @@ class PipelineResult:
     combined_context: str
 
 
-async def run_vision_on_media(content: bytes, mime_type: str, text_body: str = "") -> str:
+async def run_vision_on_media(
+    content: bytes,
+    mime_type: str,
+    text_body: str = "",
+    user_id: str | None = None,
+) -> str:
     """Run vision analysis on media bytes with optional caption context.
 
     Invoked by the ``analyze_photo`` tool when the agent decides vision is
     worth running on a staged photo. Returns the analysis text; falls back
     to :data:`VISION_FALLBACK` on error so callers always get a non-empty
-    string.
+    string. *user_id* attributes the call's token usage to that user.
     """
     try:
-        return await analyze_image(content, mime_type, context=text_body)
+        return await analyze_image(content, mime_type, context=text_body, user_id=user_id)
     except Exception:
         logger.exception("Vision analysis failed (mime_type=%s)", mime_type)
         return VISION_FALLBACK

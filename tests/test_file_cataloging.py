@@ -701,6 +701,7 @@ async def test_analyze_saved_file_reads_from_durable_storage(
         b"saved-image-bytes",
         "image/jpeg",
         "Pull the total",
+        user_id=test_user.id,
     )
 
 
@@ -732,6 +733,7 @@ async def test_analyze_saved_file_uses_turn_text_when_context_omitted(
         b"saved-image-bytes",
         "image/jpeg",
         "What was the total on this receipt?",
+        user_id=test_user.id,
     )
 
 

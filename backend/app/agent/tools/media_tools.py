@@ -108,7 +108,7 @@ def create_media_tools(
         await media_staging.touch(handle, user_id=user_id)
 
         effective_context = context or turn_text
-        description = await run_vision_on_media(content, mime, effective_context)
+        description = await run_vision_on_media(content, mime, effective_context, user_id=user_id)
         analyze_cache[handle] = description
         logger.info("analyze_photo ran vision for %s (chars=%d)", handle, len(description))
         return ToolResult(content=description)

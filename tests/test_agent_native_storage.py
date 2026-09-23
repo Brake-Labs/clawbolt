@@ -313,6 +313,7 @@ async def test_analyze_photo_happy_path(mock_vision: AsyncMock, test_user: User)
     assert await_args is not None
     _, _, passed_context = await_args.args
     assert passed_context == "tell me what this is"
+    assert await_args.kwargs == {"user_id": test_user.id}
 
 
 @patch("backend.app.agent.tools.media_tools.run_vision_on_media", new_callable=AsyncMock)

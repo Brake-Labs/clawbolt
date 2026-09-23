@@ -44,6 +44,11 @@ PURPOSE_AGENT_FOLLOWUP = "agent_followup"  # post-trim retry of the main agent c
 PURPOSE_AGENT_WRAP_UP = "agent_wrap_up"
 PURPOSE_COMPACTION = "compaction"
 PURPOSE_HEARTBEAT_DECISION = "heartbeat_decision"
+# Image description run by ``analyze_photo`` / ``analyze_saved_file``. A
+# separate call from the agent loop, with its own model role and token budget.
+PURPOSE_VISION = "vision"
+# Structured-output call that reads a free-text reply to a pending approval.
+PURPOSE_APPROVAL_CLASSIFICATION = "approval_classification"
 
 
 @dataclass(frozen=True)

@@ -682,7 +682,9 @@ def create_file_tools(
             )
 
         effective_context = context or turn_text or "Describe this saved image."
-        description = await run_vision_on_media(content, mime_type, effective_context)
+        description = await run_vision_on_media(
+            content, mime_type, effective_context, user_id=user.id
+        )
         saved_analysis_cache[cache_key] = description
         logger.info(
             "analyze_saved_file ran vision for %s (chars=%d)",
