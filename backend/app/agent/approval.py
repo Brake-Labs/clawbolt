@@ -159,12 +159,18 @@ class ApprovalPolicy:
             tool-level approval covering every resource, not just the one in
             front of the user. Leave ``None`` to keep approvals strictly
             per-resource.
+        preview_builder: Optional async callable that describes the call
+            against live state (e.g. the record an update will change), used
+            instead of ``description_builder`` when the user is actually
+            asked. Return ``None`` to fall back to ``description_builder``;
+            an exception falls back the same way.
     """
 
     default_level: PermissionLevel = PermissionLevel.ASK
     resource_extractor: Callable[[dict[str, Any]], str | None] | None = None
     description_builder: Callable[[dict[str, Any]], str] | None = None
     resource_noun: str | None = None
+    preview_builder: Callable[[dict[str, Any]], Awaitable[str | None]] | None = None
 
 
 # ---------------------------------------------------------------------------

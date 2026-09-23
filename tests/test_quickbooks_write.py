@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from typing import Any
 from unittest.mock import AsyncMock
@@ -27,9 +28,18 @@ class FakeQBService(QuickBooksService):
         self.updated: list[tuple[str, dict[str, Any]]] = []
         self.sent: list[tuple[str, str, str]] = []
         self._next_id = 100
+        # Stored records qb_update reads before merging. Unseeded ids read
+        # back as a bare record at SyncToken 0.
+        self.records: dict[tuple[str, str], dict[str, Any]] = {}
 
     async def query(self, query_str: str) -> list[dict[str, Any]]:
         return []
+
+    async def read_entity(self, entity_type: str, entity_id: str) -> dict[str, Any]:
+        stored = self.records.get((entity_type, str(entity_id)))
+        if stored is None:
+            return {"Id": str(entity_id), "SyncToken": "0"}
+        return copy.deepcopy(stored)
 
     async def create_entity(self, entity_type: str, data: dict[str, Any]) -> dict[str, Any]:
         self._next_id += 1
@@ -197,6 +207,25 @@ async def test_qb_create_invoice() -> None:
     assert body["DueDate"] == "2026-04-15"
 
 
+async def test_qb_create_drops_line_ids_copied_from_another_record() -> None:
+    """Converting an estimate copies its lines, Ids included; those Ids name
+    the estimate's lines, not lines of the new invoice."""
+    svc = FakeQBService()
+    fn = _get_tool(create_quickbooks_tools(svc), "qb_create")
+    line = {
+        "Id": "1",
+        "Amount": 400.0,
+        "DetailType": "SalesItemLineDetail",
+        "SalesItemLineDetail": {"ItemRef": {"value": "1"}, "Qty": 8, "UnitPrice": 50},
+    }
+
+    result = await fn(entity_type="Invoice", data={"CustomerRef": {"value": "3"}, "Line": [line]})
+
+    assert result.is_error is False
+    _, body = svc.created[0]
+    assert body["Line"] == [{k: v for k, v in line.items() if k != "Id"}]
+
+
 async def test_qb_create_invoice_with_linked_estimate() -> None:
     """Creating an invoice with LinkedTxn (estimate-to-invoice workflow)."""
     svc = FakeQBService()
@@ -354,6 +383,7 @@ async def test_qb_update_estimate() -> None:
 async def test_qb_update_customer() -> None:
     """Update a customer's contact info."""
     svc = FakeQBService()
+    svc.records[("Customer", "100")] = {"Id": "100", "SyncToken": "1", "DisplayName": "Old"}
     tools = create_quickbooks_tools(svc)
     fn = _get_tool(tools, "qb_update")
 
@@ -734,6 +764,9 @@ class FakeQBOServiceWithURL(QuickBooksOnlineService):
     async def query(self, query_str: str) -> list[dict[str, Any]]:
         return []
 
+    async def read_entity(self, entity_type: str, entity_id: str) -> dict[str, Any]:
+        return {"Id": str(entity_id), "SyncToken": "0"}
+
     async def create_entity(self, entity_type: str, data: dict[str, Any]) -> dict[str, Any]:
         self._next_id += 1
         result: dict[str, Any] = {"Id": str(self._next_id), **data}
@@ -1005,8 +1038,8 @@ def test_qb_create_approval_description_falls_back_on_malformed_payload() -> Non
 
 def test_qb_update_approval_description_includes_entity_id() -> None:
     """The qb_update prompt must call out which Id is being changed so
-    an admin reviewing audit logs can trace it. Line item breakdown
-    follows the same rules as qb_create."""
+    an admin reviewing audit logs can trace it. A line without an Id is
+    added, not a replacement, so the static text names no total."""
     svc = FakeQBService()
     tools = create_quickbooks_tools(svc)
     builder = _get_description_builder(tools, "qb_update")
@@ -1028,8 +1061,9 @@ def test_qb_update_approval_description_includes_entity_id() -> None:
             },
         }
     )
-    assert "Update Estimate #2001 in QuickBooks for $600.00" in description
-    assert "qty 12 x $50.00 = $600.00" in description
+    assert description.startswith("Update Estimate #2001 in QuickBooks\n")
+    assert "  Add line: Labor (revised) | qty 12 x $50.00 = $600.00" in description
+    assert "for $" not in description
 
 
 def test_qb_update_approval_description_customer_short_form_includes_id() -> None:
@@ -1045,7 +1079,11 @@ def test_qb_update_approval_description_customer_short_form_includes_id() -> Non
             "data": {"Id": "100", "SyncToken": "1", "DisplayName": "Acme"},
         }
     )
-    assert description == "Update Customer #100 in QuickBooks"
+    assert description == (
+        "Update Customer #100 in QuickBooks\n"
+        "  Set DisplayName: Acme\n"
+        "  Everything else stays as it is."
+    )
 
 
 def test_qb_update_approval_description_item_short_form_includes_id() -> None:
@@ -1066,7 +1104,8 @@ def test_qb_update_approval_description_item_short_form_includes_id() -> None:
             },
         }
     )
-    assert description == "Update Item #1 in QuickBooks"
+    assert description.startswith("Update Item #1 in QuickBooks\n")
+    assert "  Set Name: Materials" in description
 
 
 def test_qb_create_approval_description_uses_thousands_separator() -> None:

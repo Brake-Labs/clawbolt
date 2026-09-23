@@ -149,33 +149,33 @@ Each line item in the `Line` array should look like:
 
 ## Updating Entities (qb_update)
 
-Pass `entity_type` and `data` with the **full entity payload including Id and SyncToken** from a `qb_query` for that record alone (`WHERE Id = '<id>'`).
-
-The SyncToken is required for optimistic concurrency. If the entity was modified since you last queried it, QuickBooks will reject the update with a conflict error. In that case, re-query the entity and try again with the new SyncToken.
+1. `qb_query` the record alone (`WHERE Id = '<id>'`). Its lines are listed with their `Id`.
+2. `qb_update` with `Id`, that `SyncToken`, and only what changes. The tool re-reads the record and merges your change in: fields and lines you omit are kept.
+   - Change a line: its `Id` plus only the keys that change. `SalesItemLineDetail` merges key by key, so `ItemRef` and `TaxCodeRef` stay. Keep `Amount` = `Qty * UnitPrice`.
+   - Add a line: no `Id`.
+   - Remove a line: its `Id` in `delete_line_ids`. Nothing else removes one.
+3. If the tool says the record changed since it was read, re-query it and check the change still applies before retrying with the new SyncToken.
 
 ### Update example
+Memo changed, line 2 to 12 hours, a permit line added, line 3 removed:
 ```json
 {
   "entity_type": "Estimate",
   "data": {
     "Id": "2001",
-    "SyncToken": "0",
-    "CustomerRef": {"value": "100"},
+    "SyncToken": "4",
+    "CustomerMemo": {"value": "Revised after site visit"},
     "Line": [
+      {"Id": "2", "Amount": 600.00, "SalesItemLineDetail": {"Qty": 12}},
       {
-        "Amount": 600.00,
+        "Amount": 75.00,
         "DetailType": "SalesItemLineDetail",
-        "Description": "Labor - kitchen remodel (revised)",
-        "SalesItemLineDetail": {"Qty": 12, "UnitPrice": 50.00}
-      },
-      {
-        "Amount": 350.00,
-        "DetailType": "SalesItemLineDetail",
-        "Description": "Materials",
-        "SalesItemLineDetail": {"Qty": 1, "UnitPrice": 350.00}
+        "Description": "Permit fee",
+        "SalesItemLineDetail": {"Qty": 1, "UnitPrice": 75.00}
       }
     ]
-  }
+  },
+  "delete_line_ids": ["3"]
 }
 ```
 
@@ -195,7 +195,7 @@ This is the primary workflow for users who dictate job details from the field:
 5. `qb_create` Estimate with line items (typically labor + materials)
 6. Summarize what you drafted and what you assumed in one line: "Drafted estimate for Test Customer: 8 hr labor at $50, materials $200, expires in 30 days. Change anything?"
 7. User comes back later to refine: `qb_query` the estimate by Id (note the SyncToken in the results)
-8. `qb_update` Estimate with revised line items (include Id and SyncToken)
+8. `qb_update` Estimate with only the changed fields and lines (see Updating Entities)
 9. When user says it's ready: `qb_send` Estimate to the client's email
 
 ### New customer job

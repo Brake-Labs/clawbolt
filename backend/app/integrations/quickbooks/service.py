@@ -33,8 +33,17 @@ class QuickBooksService(ABC):
         """Create a QBO entity (Customer, Estimate, Invoice, etc.)."""
 
     @abstractmethod
+    async def read_entity(self, entity_type: str, entity_id: str) -> dict[str, Any]:
+        """Read one QBO entity by Id, with every field QuickBooks stores."""
+
+    @abstractmethod
     async def update_entity(self, entity_type: str, data: dict[str, Any]) -> dict[str, Any]:
-        """Update an existing QBO entity. *data* must include Id and SyncToken."""
+        """POST *data* as an update. *data* must include Id and SyncToken.
+
+        Sent as given: the caller decides between a sparse update
+        (``"sparse": true``, omitted fields untouched) and a full one
+        (omitted writable fields set to NULL).
+        """
 
     @abstractmethod
     async def send_entity_email(
@@ -165,6 +174,14 @@ class QuickBooksOnlineService(QuickBooksService):
             "POST", path, json=data, params={"requestid": uuid.uuid4().hex}
         )
         # QBO wraps the created entity under the entity type key
+        return result.get(entity_type, result)
+
+    async def read_entity(self, entity_type: str, entity_id: str) -> dict[str, Any]:
+        entity_id = str(entity_id).strip()
+        if not entity_id.isdigit():
+            msg = f"Invalid entity_id '{entity_id}'. QuickBooks IDs must be numeric."
+            raise ValueError(msg)
+        result = await self._request("GET", f"/{entity_type.lower()}/{entity_id}")
         return result.get(entity_type, result)
 
     async def update_entity(self, entity_type: str, data: dict[str, Any]) -> dict[str, Any]:
