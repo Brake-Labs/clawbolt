@@ -78,9 +78,9 @@ async def test_query_invoices_includes_line_items(qb_tool: Tool) -> None:
     result = await qb_tool.function(query="SELECT * FROM Invoice")
 
     assert result.is_error is False
-    assert "Pipe repair labor $350.00" in result.content
-    assert "Copper fittings $150.00" in result.content
-    assert "Kitchen remodel labor $800.00" in result.content
+    assert 'Amount: 350.0 | Description: "Pipe repair labor" | Qty: 7' in result.content
+    assert 'Amount: 150.0 | Description: "Copper fittings" | Qty: 10' in result.content
+    assert 'Amount: 800.0 | Description: "Kitchen remodel labor"' in result.content
 
 
 # -- Filtering --
@@ -445,7 +445,7 @@ class TestCompactResults:
             assert "ShipFromAddr: 1 Shop Rd" in out
             assert "CurrencyRef: United States Dollar (USD)" in out
             assert "DeliveryInfo:" in out
-            assert "Permit and disposal fees $350.00" in out
+            assert 'Amount: 350.0 | Description: "Permit and disposal fees"' in out
             assert "chars]" not in out
             assert "compact" not in out
             assert _estimate_row(0)["CustomerMemo"]["value"] in out

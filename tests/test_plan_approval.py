@@ -1,6 +1,8 @@
 """Tests for per-tool sequential approval in the agent tool execution pipeline."""
 
 import asyncio
+from collections.abc import Awaitable, Callable
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 from pydantic import BaseModel
@@ -725,3 +727,59 @@ class TestBatchApproval:
             "Approval prompt was persisted to session history; this trains the "
             "LLM to mimic the format. See issue #1049."
         )
+
+
+class TestPreviewBuilder:
+    """``ApprovalPolicy.preview_builder`` replaces the static description,
+    but only on a prompt the user will read."""
+
+    @staticmethod
+    def _tool(
+        level: PermissionLevel,
+        preview: Callable[[dict[str, Any]], Awaitable[str | None]],
+    ) -> Tool:
+        return Tool(
+            name="previewed",
+            description="Mutating tool",
+            function=_echo_tool,
+            params_model=_EchoParams,
+            approval_policy=ApprovalPolicy(
+                default_level=level,
+                description_builder=lambda args: f"static {args['text']}",
+                preview_builder=preview,
+            ),
+        )
+
+    async def test_ask_uses_the_preview(self, test_user: User) -> None:
+        async def preview(args: dict[str, Any]) -> str | None:
+            return f"live {args['text']}"
+
+        agent = ClawboltAgent(user=test_user)
+        _, _, description = await agent._get_tool_permission(
+            self._tool(PermissionLevel.ASK, preview), {"text": "x"}
+        )
+        assert description == "live x"
+
+    async def test_failing_or_empty_preview_falls_back(self, test_user: User) -> None:
+        async def broken(args: dict[str, Any]) -> str | None:
+            raise RuntimeError("lookup failed")
+
+        async def empty(args: dict[str, Any]) -> str | None:
+            return None
+
+        agent = ClawboltAgent(user=test_user)
+        for preview in (broken, empty):
+            _, _, description = await agent._get_tool_permission(
+                self._tool(PermissionLevel.ASK, preview), {"text": "x"}
+            )
+            assert description == "static x"
+
+    async def test_auto_approved_call_skips_the_preview(self, test_user: User) -> None:
+        preview = AsyncMock(return_value="live")
+        agent = ClawboltAgent(user=test_user)
+        level, _, description = await agent._get_tool_permission(
+            self._tool(PermissionLevel.ALWAYS, preview), {"text": "x"}
+        )
+        assert level == PermissionLevel.ALWAYS
+        assert description == "static x"
+        preview.assert_not_awaited()

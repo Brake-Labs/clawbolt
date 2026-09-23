@@ -365,6 +365,19 @@ class ClawboltAgent:
         description = tool_obj.name
         if policy.description_builder is not None:
             description = policy.description_builder(validated_args)
+        if level == PermissionLevel.ASK and policy.preview_builder is not None:
+            # Only a prompt the user will read is worth a live lookup.
+            try:
+                previewed = await policy.preview_builder(validated_args)
+            except Exception:
+                logger.warning(
+                    "preview_builder for %s failed; using the static description",
+                    tool_obj.name,
+                    exc_info=True,
+                )
+                previewed = None
+            if previewed:
+                description = previewed
 
         return level, resource, description
 

@@ -14,6 +14,13 @@ from backend.app.agent.approval import ApprovalPolicy, PermissionLevel
 from backend.app.agent.tools.base import Tool, ToolErrorKind, ToolReceipt, ToolResult, ToolTags
 from backend.app.agent.tools.names import ToolName
 from backend.app.config import settings
+from backend.app.integrations.quickbooks.merge import (
+    MergedUpdate,
+    UpdateRejected,
+    build_update,
+    describe_line,
+    describe_merged_update,
+)
 from backend.app.integrations.quickbooks.service import (
     QuickBooksOnlineService,
     QuickBooksService,
@@ -69,6 +76,9 @@ _ENTITY_LABELS: dict[str, str] = {
 
 # Entity types that qb_create is allowed to create.
 _CREATABLE_ENTITIES = {"Customer", "Estimate", "Invoice", "Item"}
+
+# Keys that identify an existing record; never valid on a create.
+_RECORD_IDENTITY_KEYS = frozenset({"Id", "SyncToken", "sparse", "MetaData", "domain"})
 
 # Entity types that qb_update is allowed to update.
 _UPDATABLE_ENTITIES = {"Customer", "Estimate", "Invoice", "Item"}
@@ -257,13 +267,25 @@ class QBUpdateParams(BaseModel):
     )
     data: dict[str, Any] = Field(
         description=(
-            "Full QBO API payload as a JSON object, "
-            "including Id and SyncToken from a prior qb_query. "
-            "See SKILL.md for payload formats."
+            "Only what changes, plus Id and SyncToken from a qb_query of this record. "
+            "Fields you omit are kept. Line entries: with a line's Id, only the keys "
+            "you send change on that line; without Id, the line is added. Lines you "
+            "omit are kept. See SKILL.md."
         )
+    )
+    delete_line_ids: list[str] = Field(
+        default_factory=list,
+        description="Ids of existing lines to remove. The only way a line is removed.",
     )
 
     _coerce_data = field_validator("data", mode="before")(_coerce_data_to_dict)
+
+    @field_validator("delete_line_ids", mode="before")
+    @classmethod
+    def _stringify_line_ids(cls, value: Any) -> Any:
+        if isinstance(value, list):
+            return [str(v) for v in value]
+        return value
 
 
 class QBSendParams(BaseModel):
@@ -378,10 +400,55 @@ def _is_empty(key: str, val: Any) -> bool:
     )
 
 
+# Line keys rendered first, in this order, by ``_render_line``.
+_LINE_HEAD_KEYS = ("Id", "LineNum", "DetailType", "Amount", "Description")
+
+
+def _render_line(line: dict[str, Any]) -> str:
+    """Render one transaction line with everything qb_update needs.
+
+    Id, LineNum, DetailType, Amount and Description first, then every field
+    of the line's detail object (ItemRef, Qty, UnitPrice, TaxCodeRef,
+    ServiceDate, DiscountPercent, ...), then any other line field. Nothing
+    is dropped, so each line can be told apart and changed by its Id.
+    """
+    parts: list[str] = []
+    for key in _LINE_HEAD_KEYS:
+        if key not in line or line[key] is None:
+            continue
+        val = line[key]
+        if key == "Description":
+            parts.append(f"Description: {json.dumps(val)}")
+        else:
+            parts.append(f"{key}: {val}")
+    detail_key = line.get("DetailType")
+    for key, val in line.items():
+        if key in _LINE_HEAD_KEYS:
+            continue
+        if key == detail_key and isinstance(val, dict):
+            for dkey, dval in val.items():
+                text = _render_value(dkey, dval)
+                if text is not None and not _is_empty(dkey, dval):
+                    parts.append(f"{dkey}: {text}")
+            continue
+        text = _render_value(key, val)
+        if text is not None and not _is_empty(key, val):
+            parts.append(f"{key}: {text}")
+    return " | ".join(parts)
+
+
 def _format_row(row: dict[str, Any], *, compact: bool) -> str:
     parts: list[str] = []
+    line_block: list[str] = []
     for key, val in row.items():
         if key in ("domain", "sparse", "MetaData"):
+            continue
+        if not compact and key == "Line" and isinstance(val, list):
+            # Whole records feed qb_update, so every line keeps its Id and
+            # detail. Rendered after the row so its fields stay on one line.
+            items = [item for item in val if isinstance(item, dict)]
+            line_block.append(f"  Line ({len(items)}):")
+            line_block.extend(f"    {_render_line(item)}" for item in items)
             continue
         if compact:
             if key in _COMPACT_DROPPED_FIELDS or _is_empty(key, val):
@@ -398,7 +465,7 @@ def _format_row(row: dict[str, Any], *, compact: bool) -> str:
             cut = len(text) - _COMPACT_TEXT_CHARS
             text = f"{text[:_COMPACT_TEXT_CHARS]}... [+{cut} chars]"
         parts.append(f"{key}: {text}")
-    return "- " + " | ".join(parts)
+    return "\n".join(["- " + " | ".join(parts), *line_block])
 
 
 def _format_results(rows: list[dict[str, Any]]) -> str:
@@ -517,10 +584,17 @@ def _format_qb_write_approval_description(verb: str, args: dict[str, Any]) -> st
     for line in lines_raw:
         if not isinstance(line, dict):
             return short_header
+        # QBO computes the subtotal line itself; counting a copied one would
+        # show double the real total. A discount line's Amount is the size of
+        # the discount, so it reduces the total rather than adding to it.
+        if line.get("DetailType") == "SubTotalLineDetail" or "SubTotalLineDetail" in line:
+            continue
         try:
             amount = float(line.get("Amount", 0) or 0)
         except (TypeError, ValueError):
             return short_header
+        if line.get("DetailType") == "DiscountLineDetail" or "DiscountLineDetail" in line:
+            amount = -abs(amount)
         description = str(line.get("Description") or "(no description)")
         detail = line.get("SalesItemLineDetail")
         qty: float | None = None
@@ -552,6 +626,53 @@ def _format_qb_write_approval_description(verb: str, args: dict[str, Any]) -> st
         else:
             rendered.append(f"  {idx}. {short_desc} | ${amount:,.2f}")
     return "\n".join(rendered)
+
+
+def _describe_line_keys(line: dict[str, Any]) -> str:
+    """The keys a line change sets, detail keys included. Only these change;
+    the rest of the stored line is kept."""
+    sent: list[str] = []
+    for key, val in line.items():
+        if key in ("Id", "DetailType"):
+            continue
+        if key.endswith("LineDetail") and isinstance(val, dict):
+            sent.extend(f"{k} {_render_value(k, v)}" for k, v in val.items())
+        else:
+            sent.append(f"{key} {_render_value(key, val)}")
+    return ", ".join(sent) or "no change"
+
+
+def _describe_qb_update_request(args: dict[str, Any]) -> str:
+    """Approval text for qb_update from the request alone.
+
+    Used when the live preview (``preview_qb_update``) cannot read the
+    record. Lists what the request sets, changes, adds and removes; with no
+    stored values to compare against, it names no totals.
+    """
+    entity_type = str(args.get("entity_type") or "entity")
+    data: dict[str, Any] = args.get("data") or {}
+    header = _qb_approval_header("Update", entity_type, data.get("Id"), total=None)
+    rows: list[str] = []
+    for key, val in data.items():
+        if key in ("Id", "SyncToken", "sparse", "domain", "MetaData", "Line"):
+            continue
+        text = _render_value(key, val)
+        rows.append(f"  Set {key}: {text if text is not None else '(empty)'}")
+    lines = data.get("Line")
+    if isinstance(lines, list):
+        for line in lines:
+            if not isinstance(line, dict):
+                continue
+            if line.get("Id") not in (None, ""):
+                rows.append(f"  Change line {line['Id']}: {_describe_line_keys(line)}")
+            else:
+                rows.append(f"  Add line: {describe_line(line)}")
+    for lid in args.get("delete_line_ids") or []:
+        rows.append(f"  Remove line {lid}")
+    if not rows:
+        return header
+    rows.append("  Everything else stays as it is.")
+    return "\n".join([header, *rows])
 
 
 # Entity types that have a public QBO web UI page we can deep-link to.
@@ -688,6 +809,24 @@ def create_quickbooks_tools(
                 error_kind=ToolErrorKind.VALIDATION,
             )
 
+        # A payload copied from a queried record carries that record's
+        # identity. QBO treats a create body with Id and SyncToken as an
+        # update, so a whole estimate pasted into an Invoice create would
+        # overwrite whichever invoice shares its Id. Strip the identity.
+        data = {k: v for k, v in data.items() if k not in _RECORD_IDENTITY_KEYS}
+
+        lines = data.get("Line")
+        if isinstance(lines, list):
+            # Lines copied from a queried record (estimate to invoice) carry
+            # that record's line Ids, which name lines of another transaction.
+            data = {
+                **data,
+                "Line": [
+                    {k: v for k, v in ln.items() if k != "Id"} if isinstance(ln, dict) else ln
+                    for ln in lines
+                ],
+            }
+
         try:
             result = await qb_service.create_entity(entity_type, data)
         except Exception as exc:
@@ -734,8 +873,29 @@ def create_quickbooks_tools(
             ),
         )
 
-    async def qb_update(entity_type: str, data: dict[str, Any]) -> ToolResult:
-        """Update an existing entity in QuickBooks Online."""
+    async def _merge_with_stored(
+        entity_type: str, data: dict[str, Any], delete_line_ids: list[str]
+    ) -> MergedUpdate:
+        """Read the record as QuickBooks holds it now and merge the change in."""
+        entity_id = str(data.get("Id") or "").strip()
+        if not entity_id:
+            raise UpdateRejected(
+                "data.Id is missing. Query the record first and pass its Id and SyncToken."
+            )
+        current = await qb_service.read_entity(entity_type, entity_id)
+        return build_update(entity_type, current, data, delete_line_ids)
+
+    async def qb_update(
+        entity_type: str,
+        data: dict[str, Any],
+        delete_line_ids: list[str] | None = None,
+    ) -> ToolResult:
+        """Update an existing entity in QuickBooks Online.
+
+        Never sends the agent's payload as-is. The record is re-read and the
+        change merged into it (see ``merge.build_update``), so a field or a
+        line the agent left out is kept rather than nulled or deleted.
+        """
         if entity_type not in _UPDATABLE_ENTITIES:
             return ToolResult(
                 content=f"Updating '{entity_type}' is not allowed. "
@@ -745,7 +905,14 @@ def create_quickbooks_tools(
             )
 
         try:
-            result = await qb_service.update_entity(entity_type, data)
+            merged = await _merge_with_stored(entity_type, data, delete_line_ids or [])
+            result = await qb_service.update_entity(entity_type, merged.payload)
+        except UpdateRejected as exc:
+            return ToolResult(
+                content=f"Did not update {entity_type}: {exc}",
+                is_error=True,
+                error_kind=ToolErrorKind.VALIDATION,
+            )
         except Exception as exc:
             logger.exception("QB update %s failed", entity_type)
             if isinstance(exc, httpx.HTTPStatusError):
@@ -763,8 +930,12 @@ def create_quickbooks_tools(
         total = result.get("TotalAmt")
         display_name = result.get("DisplayName", "")
         item_name = result.get("Name", "")
+        sync_token = result.get("SyncToken")
 
         parts = ["ok", f"Id: {entity_id}"]
+        if sync_token is not None:
+            # A second update of this record needs the new token.
+            parts.append(f"SyncToken: {sync_token}")
         if doc_num:
             parts.append(f"DocNumber: {doc_num}")
         if total is not None:
@@ -782,6 +953,26 @@ def create_quickbooks_tools(
                 url=_build_qbo_url(qb_service, entity_type, str(entity_id)),
             ),
         )
+
+    async def preview_qb_update(args: dict[str, Any]) -> str | None:
+        """Approval text for qb_update against the stored record.
+
+        Shows each changed field and line as it is and as it will be, and
+        the line total before and after. ``None`` (a failed read, a request
+        the tool will refuse) falls back to ``_describe_qb_update_request``.
+        """
+        entity_type = str(args.get("entity_type") or "")
+        data = args.get("data")
+        if entity_type not in _UPDATABLE_ENTITIES or not isinstance(data, dict):
+            return None
+        try:
+            merged = await _merge_with_stored(
+                entity_type, data, list(args.get("delete_line_ids") or [])
+            )
+        except Exception:
+            logger.info("qb_update preview unavailable", exc_info=True)
+            return None
+        return describe_merged_update(entity_type, merged)
 
     async def qb_send(entity_type: str, entity_id: str, email: str) -> ToolResult:
         """Send an invoice or estimate via QuickBooks email."""
@@ -894,24 +1085,24 @@ def create_quickbooks_tools(
         Tool(
             name=ToolName.QB_UPDATE,
             description=(
-                "Update an existing entity in QuickBooks Online. Pass the entity type "
-                "(Customer, Estimate, Invoice, or Item) and the full QBO API payload "
-                "including Id and SyncToken from a prior qb_query. "
-                "See the QuickBooks skill for payload formats."
+                "Update an existing Customer, Estimate, Invoice, or Item in QuickBooks "
+                "Online. Send only what changes, with Id and SyncToken from a qb_query "
+                "of that record; the tool merges it into the stored record, so omitted "
+                "fields and lines are kept. See the QuickBooks skill."
             ),
             function=qb_update,
             params_model=QBUpdateParams,
             concurrency_group=_QB_WRITE_CONCURRENCY_GROUP,
             usage_hint=(
-                "Update a Customer, Estimate, Invoice, or Item in QB. "
-                "Payload must include Id and SyncToken from a prior query."
+                "Update a Customer, Estimate, Invoice, or Item in QB. Send only the "
+                "change plus Id and SyncToken. Lines: by Id to change, no Id to add, "
+                "delete_line_ids to remove."
             ),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 resource_extractor=_extract_entity_type,
-                description_builder=lambda args: _format_qb_write_approval_description(
-                    "Update", args
-                ),
+                description_builder=_describe_qb_update_request,
+                preview_builder=preview_qb_update,
             ),
         ),
         Tool(

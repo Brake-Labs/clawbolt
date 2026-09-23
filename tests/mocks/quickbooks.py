@@ -140,6 +140,12 @@ class MockQuickBooksService(QuickBooksService):
     async def create_entity(self, entity_type: str, data: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError("MockQuickBooksService.create_entity not implemented")
 
+    async def read_entity(self, entity_type: str, entity_id: str) -> dict[str, Any]:
+        for row in _ENTITY_DATA.get(entity_type, []):
+            if row.get("Id") == str(entity_id):
+                return dict(row)
+        raise LookupError(f"{entity_type} {entity_id} not found")
+
     async def update_entity(self, entity_type: str, data: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError("MockQuickBooksService.update_entity not implemented")
 
