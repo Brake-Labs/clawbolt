@@ -1719,4 +1719,4 @@ async def test_list_events_tool_caps_a_long_range() -> None:
 def test_list_events_description_names_the_cap(cal_tools: list[Tool]) -> None:
     tool = _get_tool(cal_tools, ToolName.CALENDAR_LIST_EVENTS)
     assert "at most 60 events" in tool.description
-    assert "narrow the range" in (tool.usage_hint or "")
+    assert "narrow the range" in tool.description

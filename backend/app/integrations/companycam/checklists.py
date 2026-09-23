@@ -108,28 +108,25 @@ def build_checklist_tools(service: CompanyCamService) -> list[Tool]:
         Tool(
             name=ToolName.COMPANYCAM_LIST_CHECKLISTS,
             tags={ToolTags.READ_ONLY},
-            description="List checklists for a CompanyCam project",
+            description="List a CompanyCam project's checklists and their status.",
             function=companycam_list_checklists,
             params_model=CompanyCamListChecklistsParams,
-            usage_hint="Check what checklists exist on a project and their status.",
         ),
         Tool(
             name=ToolName.COMPANYCAM_GET_CHECKLIST,
             tags={ToolTags.READ_ONLY},
-            description="Get checklist details with tasks and completion status",
+            description="Get a CompanyCam checklist with all tasks and completion status.",
             function=companycam_get_checklist,
             params_model=CompanyCamGetChecklistParams,
-            usage_hint="View full checklist details including all tasks and progress.",
         ),
         Tool(
             name=ToolName.COMPANYCAM_CREATE_CHECKLIST,
-            description="Create a checklist on a CompanyCam project from a template",
+            description=(
+                "Create a checklist on a CompanyCam project from a template. Find the "
+                "template with companycam_list_checklists or ask the user which one."
+            ),
             function=companycam_create_checklist,
             params_model=CompanyCamCreateChecklistParams,
-            usage_hint=(
-                "Create a new checklist from a template. "
-                "Use list_checklists or ask the user which template to use."
-            ),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 description_builder=lambda args: "Create a checklist on a CompanyCam project",

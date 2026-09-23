@@ -1,7 +1,7 @@
 """Tests for tool_to_function_schema with Pydantic model-based parameters."""
 
 import json
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -236,3 +236,63 @@ def test_line_item_params_ge_constraints() -> None:
         raise AssertionError(msg)
     except ValidationError:
         pass
+
+
+# --- compact_input_schema ---
+
+
+class _OptionalParams(BaseModel):
+    """Developer docstring that the model should never see."""
+
+    folder: str | None = Field(default=None, description="Destination folder.")
+    minutes: int | None = Field(default=None, ge=0, le=60, description="Reminder offset.")
+    age: Literal["pd", "pw"] | None = Field(default=None, description="Result age.")
+    either: int | str | None = Field(default=None, description="Two real types.")
+    note: str = Field(default="", description="Optional note.")
+    mime: str = Field(default="image/jpeg", description="MIME type.")
+    flag: bool = Field(default=False, description="A flag.")
+    description: str = Field(description="A parameter literally named description.")
+
+
+def _compact_schema() -> dict[str, Any]:
+    tool = Tool(name="t", description="d", function=_dummy_func, params_model=_OptionalParams)
+    return tool_to_function_schema(tool)["input_schema"]
+
+
+def test_compact_schema_drops_the_model_docstring() -> None:
+    schema = _compact_schema()
+    assert "description" not in schema
+    assert "description" in schema["properties"], "a parameter named description must survive"
+    assert schema["required"] == ["description"]
+
+
+def test_compact_schema_collapses_optional_to_its_type() -> None:
+    props = _compact_schema()["properties"]
+    assert props["folder"] == {"type": "string", "description": "Destination folder."}
+    assert props["minutes"] == {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 60,
+        "description": "Reminder offset.",
+    }
+    assert props["age"] == {"type": "string", "enum": ["pd", "pw"], "description": "Result age."}
+
+
+def test_compact_schema_keeps_a_real_union() -> None:
+    either = _compact_schema()["properties"]["either"]
+    assert {"type": "integer"} in either["anyOf"]
+    assert {"type": "string"} in either["anyOf"]
+
+
+def test_compact_schema_keeps_only_informative_defaults() -> None:
+    props = _compact_schema()["properties"]
+    assert "default" not in props["note"]
+    assert props["mime"]["default"] == "image/jpeg"
+    assert props["flag"]["default"] is False
+
+
+def test_compact_schema_still_validates_null_and_omission() -> None:
+    """The params model is unchanged, so an explicit null and an omitted field still pass."""
+    parsed = _OptionalParams.model_validate({"description": "x", "folder": None})
+    assert parsed.folder is None
+    assert _OptionalParams.model_validate({"description": "x"}).note == ""

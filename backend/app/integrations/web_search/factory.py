@@ -86,18 +86,16 @@ class WebSearchParams(BaseModel):
     max_results: int | None = Field(
         default=None,
         description=(
-            "How many results to return, 1 to 20. Omit for the default. Ask "
-            "for fewer when checking a single fact, more when comparing "
-            "prices or options across suppliers."
+            "Results to return, 1 to 20. Omit for the default. Fewer to check one "
+            "fact, more to compare prices or options across suppliers."
         ),
     )
     freshness: Literal["pd", "pw", "pm", "py"] | None = Field(
         default=None,
         description=(
-            "Restrict results by age: pd past day, pw past week, pm past "
-            "month, py past year. Use pm for prices and anything that moves. "
-            "Omit it for building codes, specs, and standards, where the "
-            "correct answer is often years old and filtering hides it."
+            "Maximum result age: pd day, pw week, pm month, py year. Use pm for "
+            "prices and anything that moves. Omit for building codes, specs, and "
+            "standards, where the right answer is often years old."
         ),
     )
 
@@ -208,21 +206,19 @@ def _create_web_search_tools(provider: SearchProvider, cache: SearchCache) -> li
             name=ToolName.WEB_SEARCH,
             tags={ToolTags.READ_ONLY},
             description=(
-                "Search the web. Returns the top results with their source "
-                "URLs and whatever details the search engine has for each one. "
-                "Write your own search query from what the user asked. Long "
-                "lists in a result (products, offers, snippets, FAQs) are cut "
-                "to the first few, with a *_not_shown count; search more "
-                "narrowly for the rest."
+                "Search the web with a query you write from what the user asked. "
+                "Returns the top results with their source URLs and details. Long "
+                "lists in a result (products, offers, snippets, FAQs) are cut to the "
+                "first few, with a *_not_shown count; search more narrowly for the "
+                "rest."
             ),
             function=web_search,
             params_model=WebSearchParams,
             usage_hint=(
-                "Results can be out of date, so a figure you repeat from one "
-                "needs its source URL and should be framed as a ballpark to "
-                "confirm, never a firm quote. This applies to search results "
-                "only: totals from connected integrations and rates from the "
-                "user's own files are exact and should be stated plainly."
+                "web_search results can be out of date: a figure you repeat from one "
+                "needs its source URL and framing as a ballpark to confirm, never a "
+                "firm quote. Search results only: totals from connected integrations "
+                "and rates from the user's own files are exact; state them plainly."
             ),
             # Read-only and stateless: nothing to serialize against.
             approval_policy=ApprovalPolicy(

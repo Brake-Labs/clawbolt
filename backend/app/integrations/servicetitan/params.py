@@ -21,16 +21,15 @@ class StSearchCustomersParams(BaseModel):
 
     query: str = Field(
         description=(
-            "Free-form lookup string. Treated as a name substring;"
-            " if the input is mostly digits, treated as a phone-number"
-            " substring instead."
+            "Name fragment (e.g. 'Acme', 'Jane Doe') or, if mostly digits, a partial"
+            " phone number (e.g. '5550101')."
         ),
     )
     limit: int = Field(
         default=5,
         ge=1,
         le=25,
-        description="Maximum number of matches to return. Defaults to 5.",
+        description="Maximum matches to return.",
     )
 
 
@@ -38,10 +37,7 @@ class StGetCustomerParams(BaseModel):
     """Inputs for ``st_get_customer``."""
 
     customer_id: int = Field(
-        description=(
-            "The numeric ServiceTitan customer ID to look up. Usually"
-            " obtained from a prior st_search_customers call."
-        ),
+        description="Customer ID from st_search_customers.",
     )
 
 
@@ -56,24 +52,20 @@ class StListAppointmentsParams(BaseModel):
     from_date: str | None = Field(
         default=None,
         description=(
-            "Inclusive lower bound on appointment start time. ISO 8601"
-            " string (e.g. 2026-05-11 or 2026-05-11T08:00:00Z). Omit"
-            " to default to the start of today (UTC)."
+            "Inclusive start-time lower bound, ISO 8601 (e.g. 2026-05-11 or"
+            " 2026-05-11T08:00:00Z). Omit for the start of today (UTC)."
         ),
     )
     to_date: str | None = Field(
         default=None,
         description=(
-            "Exclusive upper bound on appointment start time. ISO 8601"
-            " string. Omit to default to the start of tomorrow (UTC)."
+            "Exclusive start-time upper bound, ISO 8601. Omit for the start of tomorrow (UTC)."
         ),
     )
     status: str | None = Field(
         default=None,
         description=(
-            "Filter to appointments with this status. ServiceTitan"
-            " values: Scheduled, Dispatched, Working, Done, Hold. Omit"
-            " to return all statuses."
+            "Status to filter to: Scheduled, Dispatched, Working, Done, or Hold. Omit for all."
         ),
     )
 
@@ -89,23 +81,17 @@ class StAddJobNoteParams(BaseModel):
     """
 
     job_id: int = Field(
-        description=(
-            "The numeric ServiceTitan job ID to attach the note to."
-            " Obtain from a prior appointment lookup or list call."
-        ),
+        description=("Job ID from an appointment lookup. Confirm it with the user before calling."),
     )
     text: str = Field(
         min_length=1,
-        description=(
-            "The note body to post on the job. Plain text. Empty or"
-            " whitespace-only values are rejected."
-        ),
+        description="Plain-text note body; must not be blank.",
     )
     pin_to_top: bool = Field(
         default=False,
         description=(
-            "When true, ServiceTitan pins the note above other notes"
-            " in the job's note feed. Defaults to false."
+            "Pin the note above the job's other notes. Only when the user explicitly"
+            " asks for a pinned note."
         ),
     )
 

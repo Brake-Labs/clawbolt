@@ -471,16 +471,13 @@ def build_photo_tools(service: CompanyCamService, ctx: ToolContext) -> list[Tool
         Tool(
             name=ToolName.COMPANYCAM_UPLOAD_PHOTO,
             description=(
-                "Upload a photo from the conversation to a CompanyCam project. "
-                "Search for the project first, then upload with tags and description."
+                "Upload a photo from the conversation to a CompanyCam project. When "
+                "the user sends a photo and you know the client or job, find the "
+                "project with companycam_search_projects, then upload with a "
+                "description and relevant tags."
             ),
             function=companycam_upload_photo,
             params_model=CompanyCamUploadPhotoParams,
-            usage_hint=(
-                "When the user sends a photo and you know the client/job context, "
-                "search for the CompanyCam project, then upload the photo with "
-                "relevant tags (e.g. 'kitchen', 'demo', 'before')."
-            ),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 description_builder=lambda args: "Upload a photo to CompanyCam",
@@ -489,13 +486,9 @@ def build_photo_tools(service: CompanyCamService, ctx: ToolContext) -> list[Tool
         ),
         Tool(
             name=ToolName.COMPANYCAM_ADD_COMMENT,
-            description="Add a comment to a CompanyCam project or photo",
+            description="Add a comment to a CompanyCam project or photo.",
             function=companycam_add_comment,
             params_model=CompanyCamAddCommentParams,
-            usage_hint=(
-                "Add a note or comment to a project (target_type='project') "
-                "or a specific photo (target_type='photo')."
-            ),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 description_builder=lambda args: (
@@ -506,20 +499,15 @@ def build_photo_tools(service: CompanyCamService, ctx: ToolContext) -> list[Tool
         Tool(
             name=ToolName.COMPANYCAM_LIST_COMMENTS,
             tags={ToolTags.READ_ONLY},
-            description="List comments on a CompanyCam project or photo",
+            description="List comments on a CompanyCam project or photo.",
             function=companycam_list_comments,
             params_model=CompanyCamListCommentsParams,
-            usage_hint=(
-                "View discussion on a project (target_type='project') "
-                "or a specific photo (target_type='photo')."
-            ),
         ),
         Tool(
             name=ToolName.COMPANYCAM_TAG_PHOTO,
-            description="Add tags to a CompanyCam photo for organization",
+            description="Add descriptive tags to a CompanyCam photo.",
             function=companycam_tag_photo,
             params_model=CompanyCamTagPhotoParams,
-            usage_hint="Tag photos with descriptive labels like 'before', 'kitchen', 'damage'.",
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 description_builder=lambda args: "Add tags to a CompanyCam photo",
@@ -527,10 +515,12 @@ def build_photo_tools(service: CompanyCamService, ctx: ToolContext) -> list[Tool
         ),
         Tool(
             name=ToolName.COMPANYCAM_DELETE_PHOTO,
-            description=("WARNING: Permanently delete a CompanyCam photo. This cannot be undone."),
+            description=(
+                "WARNING: Permanently delete a CompanyCam photo. This cannot be undone. "
+                "Only when the user explicitly asks."
+            ),
             function=companycam_delete_photo,
             params_model=CompanyCamDeletePhotoParams,
-            usage_hint="Only delete a photo if the user explicitly asks.",
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 description_builder=lambda args: (
@@ -541,9 +531,11 @@ def build_photo_tools(service: CompanyCamService, ctx: ToolContext) -> list[Tool
         Tool(
             name=ToolName.COMPANYCAM_SEARCH_PHOTOS,
             tags={ToolTags.READ_ONLY},
-            description="Search photos across all CompanyCam projects",
+            description=(
+                "Search CompanyCam photos across projects by project or date range, or "
+                "browse recent ones."
+            ),
             function=companycam_search_photos,
             params_model=CompanyCamSearchPhotosParams,
-            usage_hint="Find photos by project, date range, or browse recent photos.",
         ),
     ]

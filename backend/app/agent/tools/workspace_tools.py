@@ -73,22 +73,20 @@ _PERMISSIONS_FILE = "PERMISSIONS.json"
 class ReadFileParams(BaseModel):
     """Parameters for the read_file tool."""
 
-    path: str = Field(
-        description="Relative path within your workspace (e.g. 'USER.md', 'memory/MEMORY.md')"
-    )
+    path: str = Field(description="Workspace-relative path, e.g. 'USER.md', 'memory/MEMORY.md'.")
 
 
 class WriteFileParams(BaseModel):
     """Parameters for the write_file tool."""
 
-    path: str = Field(description="Relative path within your workspace (e.g. 'USER.md', 'SOUL.md')")
-    content: str = Field(description="Full file content to write")
+    path: str = Field(description="Workspace-relative path, e.g. 'USER.md'.")
+    content: str = Field(description="Full file content.")
 
 
 class EditFileParams(BaseModel):
     """Parameters for the edit_file tool."""
 
-    path: str = Field(description="Relative path within your workspace (e.g. 'USER.md')")
+    path: str = Field(description="Workspace-relative path, e.g. 'USER.md'.")
     old_text: str = Field(description="Exact text to find and replace")
     new_text: str = Field(description="Replacement text")
 
@@ -96,7 +94,7 @@ class EditFileParams(BaseModel):
 class DeleteFileParams(BaseModel):
     """Parameters for the delete_file tool."""
 
-    path: str = Field(description="Relative path within your workspace (e.g. 'BOOTSTRAP.md')")
+    path: str = Field(description="Workspace-relative path, e.g. 'BOOTSTRAP.md'.")
 
 
 def _extract_path(args: dict[str, object]) -> str | None:
@@ -579,33 +577,23 @@ def create_workspace_tools(user_id: str) -> list[Tool]:
             name=ToolName.READ_FILE,
             tags={ToolTags.READ_ONLY},
             description=(
-                "Read a markdown or JSON file from your workspace. "
-                "Use to check USER.md, SOUL.md, memory files, or PERMISSIONS.json."
+                "Read a markdown or JSON file from your workspace, e.g. USER.md, "
+                "SOUL.md, memory/MEMORY.md, or PERMISSIONS.json (current tool "
+                "permission levels)."
             ),
             function=read_file,
             params_model=ReadFileParams,
-            usage_hint=(
-                "Read USER.md to see what you know about the user. "
-                "Read SOUL.md to check your personality. "
-                "Read memory/MEMORY.md to review long-term facts. "
-                "Read PERMISSIONS.json to see current tool permission levels."
-            ),
         ),
         Tool(
             name=ToolName.WRITE_FILE,
             description=(
-                "Write or overwrite a markdown or JSON file in your workspace. "
-                "Use to update USER.md with user info, SOUL.md with your personality, "
-                "or PERMISSIONS.json to reset permissions."
+                "Write or overwrite a markdown or JSON file in your workspace, e.g. "
+                "USER.md, SOUL.md, or PERMISSIONS.json to reset all permissions to "
+                "defaults."
             ),
             function=write_file,
             params_model=WriteFileParams,
             tags={ToolTags.MODIFIES_PROFILE},
-            usage_hint=(
-                "Write to USER.md when you learn about the user (rates, hours, preferences, etc.). "
-                "Write to SOUL.md when the user defines your personality. "
-                "Write to PERMISSIONS.json to reset all permissions to defaults."
-            ),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ALWAYS,
                 resource_extractor=_extract_path,
@@ -616,9 +604,8 @@ def create_workspace_tools(user_id: str) -> list[Tool]:
         Tool(
             name=ToolName.EDIT_FILE,
             description=(
-                "Replace exact text in a markdown or JSON file. "
-                "Use for targeted updates to USER.md, SOUL.md, PERMISSIONS.json, etc. "
-                "Read the file first to see current contents."
+                "Replace exact text in a markdown or JSON workspace file for a "
+                "targeted update. Read the file first."
             ),
             function=edit_file,
             params_model=EditFileParams,

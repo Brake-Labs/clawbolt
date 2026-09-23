@@ -189,21 +189,22 @@ def build_note_tools(service: AppFolioVendorService, ctx: ToolContext) -> list[T
         Tool(
             name=ToolName.APPFOLIO_LIST_NOTES,
             tags={ToolTags.READ_ONLY},
-            description="List notes on an AppFolio work order.",
+            description=(
+                "List notes on an AppFolio work order, e.g. to see prior updates and"
+                " photos before adding one."
+            ),
             function=appfolio_list_notes,
             params_model=AppFolioListNotesParams,
-            usage_hint="Use to see prior status updates and photos before adding a new one.",
         ),
         Tool(
             name=ToolName.APPFOLIO_ADD_NOTE,
-            description=("Add a note (text + optional photos) to an AppFolio work order."),
+            description=(
+                "Add a note, with optional photos, to an AppFolio work order. Notes are"
+                " visible to the property manager."
+            ),
             function=appfolio_add_note,
             params_model=AppFolioAddNoteParams,
             concurrency_group=work_order_concurrency_key,
-            usage_hint=(
-                "Pass photos by their original_url from the conversation or by"
-                " media handle from analyze_photo. Notes are visible to the PM."
-            ),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 description_builder=lambda args: (
@@ -220,13 +221,13 @@ def build_note_tools(service: AppFolioVendorService, ctx: ToolContext) -> list[T
         Tool(
             name=ToolName.APPFOLIO_UPDATE_NOTE,
             description=(
-                "Edit an existing AppFolio work-order note. Pass the note_id returned"
-                " by appfolio_add_note or appfolio_list_notes; never predict one."
+                "Edit an AppFolio work-order note, only to fix its text or attach more"
+                " photos. Pass a note_id returned by appfolio_add_note or"
+                " appfolio_list_notes; never predict one."
             ),
             function=appfolio_update_note,
             params_model=AppFolioUpdateNoteParams,
             concurrency_group=work_order_concurrency_key,
-            usage_hint="Only use when the user wants to fix the text or attach more photos.",
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 description_builder=lambda args: (

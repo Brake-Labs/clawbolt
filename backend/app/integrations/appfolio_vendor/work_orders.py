@@ -288,37 +288,28 @@ def build_work_order_tools(service: AppFolioVendorService) -> list[Tool]:
             name=ToolName.APPFOLIO_LIST_WORK_ORDERS,
             tags={ToolTags.READ_ONLY},
             description=(
-                "List the user's AppFolio work orders, filtered by status."
-                " Default returns in-progress and estimates needed."
+                "List the user's AppFolio work orders by status (default: in progress"
+                " and estimates requested), e.g. for a summary of open work. For a"
+                " lookup by address or number, use appfolio_search_work_orders."
             ),
             function=appfolio_list_work_orders,
             params_model=AppFolioListWorkOrdersParams,
-            usage_hint=(
-                "Use to give the user a status summary of their open work."
-                " For specific lookups (by address or work order number), use"
-                " appfolio_search_work_orders instead."
-            ),
         ),
         Tool(
             name=ToolName.APPFOLIO_SEARCH_WORK_ORDERS,
             tags={ToolTags.READ_ONLY},
-            description="Search AppFolio work orders by number, address, or free text.",
+            description=(
+                "Search AppFolio work orders with any free text the user gave: number,"
+                " address, unit, or tenant name."
+            ),
             function=appfolio_search_work_orders,
             params_model=AppFolioSearchWorkOrdersParams,
-            usage_hint=(
-                "Pass any free text the user gave you: a property address,"
-                " a tenant name, or a work order number."
-            ),
         ),
         Tool(
             name=ToolName.APPFOLIO_GET_WORK_ORDER,
             tags={ToolTags.READ_ONLY},
-            description="Get full details for a single AppFolio work order.",
+            description="Get full details for one AppFolio work order.",
             function=appfolio_get_work_order,
             params_model=AppFolioGetWorkOrderParams,
-            usage_hint=(
-                "Use after a list or search to drill into one work order."
-                " Both customer_id and work_order_id come from the list output."
-            ),
         ),
     ]

@@ -242,23 +242,18 @@ def build_project_tools(service: CompanyCamService) -> list[Tool]:
         Tool(
             name=ToolName.COMPANYCAM_SEARCH_PROJECTS,
             tags={ToolTags.READ_ONLY},
-            description="Search CompanyCam projects by name or address",
+            description=(
+                "Search CompanyCam projects by client name or address. Search before "
+                "uploading photos or creating a project."
+            ),
             function=companycam_search_projects,
             params_model=CompanyCamSearchParams,
-            usage_hint=(
-                "Search for a CompanyCam project before uploading photos. "
-                "Use the client address or name as the search query."
-            ),
         ),
         Tool(
             name=ToolName.COMPANYCAM_CREATE_PROJECT,
-            description="Create a new CompanyCam project",
+            description="Create a CompanyCam project when no matching project exists.",
             function=companycam_create_project,
             params_model=CompanyCamCreateProjectParams,
-            usage_hint=(
-                "Create a new project when no matching project exists. "
-                "Use the client name and address as the project name."
-            ),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 description_builder=lambda args: (
@@ -268,13 +263,11 @@ def build_project_tools(service: CompanyCamService) -> list[Tool]:
         ),
         Tool(
             name=ToolName.COMPANYCAM_UPDATE_PROJECT,
-            description="Update a CompanyCam project's name or address",
+            description=(
+                "Rename a CompanyCam project or change its address, e.g. to add the client name."
+            ),
             function=companycam_update_project,
             params_model=CompanyCamUpdateProjectParams,
-            usage_hint=(
-                "Use to rename a project or update its address. "
-                "For example, adding a client name to a project."
-            ),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 description_builder=lambda args: "Update CompanyCam project details",
@@ -283,20 +276,17 @@ def build_project_tools(service: CompanyCamService) -> list[Tool]:
         Tool(
             name=ToolName.COMPANYCAM_GET_PROJECT,
             tags={ToolTags.READ_ONLY},
-            description="Get full details for a CompanyCam project",
+            description=(
+                "Get a CompanyCam project's details: address, notepad, contacts, and status."
+            ),
             function=companycam_get_project,
             params_model=CompanyCamGetProjectParams,
-            usage_hint=(
-                "Use to check project details including address, notepad, "
-                "contacts, and status. Search for the project first to get the ID."
-            ),
         ),
         Tool(
             name=ToolName.COMPANYCAM_ARCHIVE_PROJECT,
-            description="Archive a completed CompanyCam project",
+            description="Archive a CompanyCam project when its job is completed.",
             function=companycam_archive_project,
             params_model=CompanyCamArchiveProjectParams,
-            usage_hint="Archive a project when a job is completed.",
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 description_builder=lambda args: "Archive a CompanyCam project",
@@ -305,14 +295,11 @@ def build_project_tools(service: CompanyCamService) -> list[Tool]:
         Tool(
             name=ToolName.COMPANYCAM_DELETE_PROJECT,
             description=(
-                "WARNING: Permanently delete a CompanyCam project. "
-                "This cannot be undone. Consider archiving instead."
+                "WARNING: Permanently delete a CompanyCam project. This cannot be "
+                "undone. Only when the user explicitly asks; suggest archiving first."
             ),
             function=companycam_delete_project,
             params_model=CompanyCamDeleteProjectParams,
-            usage_hint=(
-                "Only delete a project if the user explicitly asks. Suggest archiving first."
-            ),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 description_builder=lambda args: (
@@ -322,10 +309,9 @@ def build_project_tools(service: CompanyCamService) -> list[Tool]:
         ),
         Tool(
             name=ToolName.COMPANYCAM_UPDATE_NOTEPAD,
-            description="Update the notepad (notes) on a CompanyCam project",
+            description="Add or replace the notepad (notes) on a CompanyCam project.",
             function=companycam_update_notepad,
             params_model=CompanyCamUpdateNotepadParams,
-            usage_hint="Add or update notes on a project.",
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 description_builder=lambda args: "Update notes on a CompanyCam project",
@@ -334,9 +320,10 @@ def build_project_tools(service: CompanyCamService) -> list[Tool]:
         Tool(
             name=ToolName.COMPANYCAM_LIST_DOCUMENTS,
             tags={ToolTags.READ_ONLY},
-            description="List documents attached to a CompanyCam project",
+            description=(
+                "List documents (contracts, specs, files) attached to a CompanyCam project."
+            ),
             function=companycam_list_documents,
             params_model=CompanyCamListDocumentsParams,
-            usage_hint="Check what contracts, specs, or files are attached to a project.",
         ),
     ]

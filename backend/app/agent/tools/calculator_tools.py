@@ -45,7 +45,7 @@ class CalculateParams(BaseModel):
 
     expression: str = Field(
         max_length=1000,
-        description="A mathematical expression to evaluate, e.g. '(12 * 15) + (8 * 10)'",
+        description="The expression to evaluate.",
     )
 
 
@@ -123,21 +123,15 @@ def _create_calculator_tools() -> list[Tool]:
             name=ToolName.CALCULATE,
             tags={ToolTags.READ_ONLY},
             description=(
-                "Evaluate a mathematical expression and return the exact result. "
-                "Use this tool for ALL arithmetic instead of computing in your head. "
-                "Examples: '12.5 * 47 * 1.15' for material cost with markup, "
-                "'(24 * 36) / 144' for square footage to square yards, "
-                "'round(2450 * 1.25, 2)' for 25% markup, "
-                "'ceil(sqrt(400))' for square root rounded up."
+                "Evaluate a math expression and return the exact result. Use it for ALL "
+                "arithmetic (costs, quantities, areas) instead of computing in your head. "
+                "Functions: sqrt, abs, round, ceil, floor, min, max. Constants: pi, e. "
+                "Examples: '12.5 * 47 * 1.15' (material cost with markup), "
+                "'(24 * 36) / 144' (square feet to square yards), "
+                "'round(2450 * 1.25, 2)' (25% markup), 'ceil(sqrt(400))'."
             ),
             function=calculate,
             params_model=CalculateParams,
-            usage_hint=(
-                "Use this tool whenever the user asks you to do math, calculate costs, "
-                "estimate quantities, compute areas, or any arithmetic. Always prefer "
-                "this tool over doing math in your head. Supported functions: "
-                "sqrt, abs, round, ceil, floor, min, max. Constants: pi, e."
-            ),
         ),
     ]
 

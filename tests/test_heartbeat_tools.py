@@ -119,15 +119,15 @@ async def test_update_heartbeat_description_steers_away_from_timed_reminders(
     assert "calendar_create_event" in desc
 
 
-async def test_get_heartbeat_usage_hint_does_not_promise_reminders(
+async def test_get_heartbeat_does_not_promise_reminders(
     test_user: User,
 ) -> None:
-    """get_heartbeat usage_hint must not conflate heartbeat notes with reminders (#1067)."""
+    """get_heartbeat must not conflate heartbeat notes with reminders (#1067)."""
     tools = create_heartbeat_tools(test_user.id)
     get_tool = tools[0]
-    hint = (get_tool.usage_hint or "").lower()
-    assert "heartbeat notes" in hint
-    assert "or reminders" not in hint
+    text = f"{get_tool.description} {get_tool.usage_hint}".lower()
+    assert "heartbeat" in text
+    assert "reminder" not in text
 
 
 async def test_heartbeat_scoped_to_user(test_user: User) -> None:

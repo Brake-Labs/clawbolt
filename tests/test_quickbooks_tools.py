@@ -522,7 +522,7 @@ class TestCompactResults:
         assert "SyncToken: 0" in result.content
         assert "compact" not in result.content
 
-    def test_usage_hint_names_the_threshold(self, qb_service: MockQuickBooksService) -> None:
-        hint = create_quickbooks_tools(qb_service)[0].usage_hint or ""
-        assert "over 3 rows are compact" in hint
-        assert "WHERE Id" in hint
+    def test_description_names_the_threshold(self, qb_service: MockQuickBooksService) -> None:
+        desc = create_quickbooks_tools(qb_service)[0].description
+        assert "over 3 rows are compact" in desc
+        assert "WHERE Id" in desc

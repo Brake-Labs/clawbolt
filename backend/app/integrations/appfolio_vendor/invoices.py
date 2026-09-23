@@ -394,19 +394,15 @@ def build_invoice_tools(service: AppFolioVendorService, ctx: ToolContext) -> lis
         Tool(
             name=ToolName.APPFOLIO_CREATE_INVOICE,
             description=(
-                "Build a line-itemized invoice on an AppFolio work order."
-                " Cannot carry photos; attach those with appfolio_add_note."
+                "Create a line-itemized invoice on an AppFolio work order. This bills"
+                " the customer: confirm each line's description, quantity, and amount"
+                " with the user first. AppFolio rejects an invoice that carries line"
+                " items and files together, so put a receipt or photo on the record"
+                " with appfolio_add_note on the same work order."
             ),
             function=appfolio_create_invoice,
             params_model=AppFolioCreateInvoiceParams,
             concurrency_group=work_order_concurrency_key,
-            usage_hint=(
-                "Confirm each line item's description, quantity, and amount"
-                " with the user before submitting; this is a billing action."
-                " To put a receipt or photo on the record, call"
-                " appfolio_add_note on the same work order; AppFolio rejects"
-                " an invoice that carries line items and files together."
-            ),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 description_builder=_format_invoice_approval_description,
@@ -415,15 +411,13 @@ def build_invoice_tools(service: AppFolioVendorService, ctx: ToolContext) -> lis
         Tool(
             name=ToolName.APPFOLIO_UPLOAD_INVOICE_PDF,
             description=(
-                "Upload one or more pre-built PDFs as an invoice on an AppFolio work order."
+                "Upload an invoice document the user already prepared (one or more"
+                " PDFs or photos) to an AppFolio work order. For line-item entry, use"
+                " appfolio_create_invoice."
             ),
             function=appfolio_upload_invoice_pdf,
             params_model=AppFolioUploadInvoicePdfParams,
             concurrency_group=work_order_concurrency_key,
-            usage_hint=(
-                "Use when the user has already prepared an invoice document."
-                " For line-item entry, use appfolio_create_invoice instead."
-            ),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 description_builder=lambda args: (
