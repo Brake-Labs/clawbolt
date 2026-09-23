@@ -15,6 +15,7 @@ from backend.app.agent.tools.base import ToolErrorKind
 from backend.app.integrations.quickbooks.factory import (
     QBCreateParams,
     QBUpdateParams,
+    _format_qb_write_approval_description,
     create_quickbooks_tools,
 )
 from backend.app.integrations.quickbooks.service import QuickBooksOnlineService, QuickBooksService
@@ -249,6 +250,31 @@ async def test_qb_create_drops_the_identity_of_a_copied_record() -> None:
     for key in ("Id", "SyncToken", "sparse", "MetaData"):
         assert key not in body
     assert body["CustomerRef"] == {"value": "3"}
+
+
+def test_create_approval_total_skips_subtotal_and_subtracts_discount() -> None:
+    """An estimate copied into an Invoice create carries QBO's own subtotal
+    line and may carry a discount line; neither is a charge."""
+    text = _format_qb_write_approval_description(
+        "Create",
+        {
+            "entity_type": "Invoice",
+            "data": {
+                "Line": [
+                    {"Amount": 400.0, "Description": "Labor", "DetailType": "SalesItemLineDetail"},
+                    {
+                        "Amount": 100.0,
+                        "Description": "Materials",
+                        "DetailType": "SalesItemLineDetail",
+                    },
+                    {"Amount": 50.0, "DetailType": "DiscountLineDetail", "DiscountLineDetail": {}},
+                    {"Amount": 500.0, "DetailType": "SubTotalLineDetail", "SubTotalLineDetail": {}},
+                ]
+            },
+        },
+    )
+    assert "$450.00" in text
+    assert "$1,050.00" not in text and "$1050.00" not in text
 
 
 async def test_qb_create_invoice_with_linked_estimate() -> None:

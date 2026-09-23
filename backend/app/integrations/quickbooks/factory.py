@@ -584,10 +584,17 @@ def _format_qb_write_approval_description(verb: str, args: dict[str, Any]) -> st
     for line in lines_raw:
         if not isinstance(line, dict):
             return short_header
+        # QBO computes the subtotal line itself; counting a copied one would
+        # show double the real total. A discount line's Amount is the size of
+        # the discount, so it reduces the total rather than adding to it.
+        if line.get("DetailType") == "SubTotalLineDetail" or "SubTotalLineDetail" in line:
+            continue
         try:
             amount = float(line.get("Amount", 0) or 0)
         except (TypeError, ValueError):
             return short_header
+        if line.get("DetailType") == "DiscountLineDetail" or "DiscountLineDetail" in line:
+            amount = -abs(amount)
         description = str(line.get("Description") or "(no description)")
         detail = line.get("SalesItemLineDetail")
         qty: float | None = None
