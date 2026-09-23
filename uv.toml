@@ -19,3 +19,9 @@ exclude-newer = "7 days"
 any-llm-sdk = "0 days"
 # Pulled in by any-llm-sdk >= 1.24 for compaction normalization (any-llm#1235).
 openresponses-types = "0 days"
+# TEMPORARY, and the one third-party exception: genai-prices 0.1.8 (published
+# 2026-09-23) is the first release that prices claude-opus-5-5 on its own
+# entry; 0.1.7 prefix-matches it to claude-opus-5 and over-bills it by 25%.
+# The package is price data, not code on the request path. Delete this line on
+# or after 2026-09-30, when 0.1.8 clears the window; the lock keeps it.
+genai-prices = "0 days"
