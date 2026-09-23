@@ -29,7 +29,11 @@ from pydantic import BaseModel, Field
 
 from backend.app.agent import media_staging
 from backend.app.agent.approval import ApprovalPolicy, PermissionLevel
-from backend.app.agent.saved_media import find_saved_file, read_saved_file_bytes
+from backend.app.agent.saved_media import (
+    drive_reconnect_result,
+    find_saved_file,
+    read_saved_file_bytes,
+)
 from backend.app.agent.tools.base import Tool, ToolErrorKind, ToolReceipt, ToolResult, ToolTags
 from backend.app.agent.tools.names import ToolName
 from backend.app.config import settings
@@ -399,7 +403,7 @@ def _handle_http_error(exc: httpx.HTTPStatusError, action: str) -> ToolResult:
             content=f"Gmail could not renew its access while trying to {action}.",
             is_error=True,
             error_kind=ToolErrorKind.SERVICE,
-            hint="The connection is fine. Retry this call shortly.",
+            hint="Another refresh of this connection was in progress. Retry this call shortly.",
         )
     status = exc.response.status_code
     body = ""
@@ -683,19 +687,7 @@ def create_gmail_tools(
             )
         except ReconnectRequired as exc:
             # Attachments are read from Drive, so this dead grant is Drive's.
-            logger.warning("Google Drive connection needs reconnecting: %s", exc)
-            return ToolResult(
-                content=(
-                    "Cannot attach files: Google Drive disconnected. "
-                    "Please reconnect Google Drive in Settings."
-                ),
-                is_error=True,
-                error_kind=ToolErrorKind.AUTH,
-                hint=(
-                    "The Google Drive connection has expired or was revoked. Do not retry. "
-                    f"{reconnect_instruction('google_drive')}"
-                ),
-            )
+            return drive_reconnect_result(exc)
         if attach_error is not None:
             return attach_error
         try:

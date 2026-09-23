@@ -13,7 +13,11 @@ from typing import Any
 from google.auth.transport import Request as GoogleAuthRequest
 from google.oauth2.credentials import Credentials as GoogleOAuthCredentials
 
-from backend.app.services.oauth import ReconnectRequired, reconnect_instruction
+from backend.app.services.oauth import (
+    ReconnectRequired,
+    RefreshLockContended,
+    reconnect_instruction,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -241,7 +245,13 @@ class GoogleDriveStorage(StorageBackend):
         except _AccessTokenRejected:
             pass
         refresh = self._credentials.refresh_access_token
-        new_token = await refresh(sent_token) if refresh is not None else None
+        try:
+            new_token = await refresh(sent_token) if refresh is not None else None
+        except RefreshLockContended as exc:
+            raise DriveTokenRefreshUnavailable(
+                f"Google Drive rejected the access token during {op} while the refresh "
+                "lock was busy"
+            ) from exc
         if not new_token:
             raise DriveTokenRefreshUnavailable(
                 f"Google Drive rejected the access token during {op} and no refresh could run"

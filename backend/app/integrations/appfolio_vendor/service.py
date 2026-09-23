@@ -39,7 +39,13 @@ from backend.app.integrations.appfolio_vendor.auth import (
     save_credential,
     upsert_fingerprint,
 )
-from backend.app.services.oauth import PermanentRefreshError, ReconnectRequired, oauth_service
+from backend.app.services.oauth import (
+    PermanentRefreshError,
+    ReconnectRequired,
+    RefreshLockContended,
+    is_dead_grant_response,
+    oauth_service,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +123,18 @@ class AuthExpiredError(AppFolioError):
     def __init__(self, login_url: str = "") -> None:
         super().__init__("AppFolio session expired; a new magic link is required")
         self.login_url = login_url
+
+
+class RefreshRefusedError(AuthExpiredError):
+    """The token endpoint refused the refresh without confirming a dead grant.
+
+    Any 4xx other than 408 or 429 that is not a 400 or 401 carrying an
+    RFC 6749 permanent ``error`` code: an HTML error page, a moved route, a
+    body that is not OAuth. The endpoint is reverse-engineered and has moved
+    before (#1269), so such an answer may be our fault or transient. It is
+    still reported as an expired session, but the credential is kept and
+    the user is not notified, since retiring it costs a manual reconnect.
+    """
 
 
 class AuthScopeError(AppFolioError):
@@ -570,8 +588,11 @@ class AppFolioVendorService:
 
         Raises :class:`AuthExpiredError` when the refresh grant is dead: the
         shared refresh has deleted the credential and told the user by then.
-        Raises :class:`AppFolioUnavailableError` when the refresh could not
-        run (token endpoint 5xx or 429, network failure, refresh lock held by
+        Raises :class:`RefreshRefusedError` (also an ``AuthExpiredError``)
+        when the token endpoint refused the refresh in a way that does not
+        confirm a dead grant; the credential stays stored. Raises
+        :class:`AppFolioUnavailableError` when the refresh could not run
+        (token endpoint 5xx, 408 or 429, network failure, refresh lock held by
         a peer), which says nothing about the credential and keeps it stored.
         """
         if self._credential.jwt != sent_jwt:
@@ -591,6 +612,18 @@ class AppFolioVendorService:
                 "AppFolio %s %s: credential retired, reconnect required: %s", method, path, exc
             )
             raise AuthExpiredError() from exc
+        except RefreshRefusedError:
+            # Refused in a way we cannot confirm as a dead grant: report it as
+            # expired, as before, but the credential stays stored.
+            raise
+        except RefreshLockContended as exc:
+            logger.warning(
+                "AppFolio %s %s: token refresh could not run (lock contended)", method, path
+            )
+            raise AppFolioUnavailableError(
+                "AppFolio could not renew the session right now because another renewal"
+                " was in progress. Try again shortly."
+            ) from exc
         except Exception as exc:
             logger.warning(
                 "AppFolio %s %s: token refresh failed transiently: %s",
@@ -603,13 +636,9 @@ class AppFolioVendorService:
                 f" ({_format_http_exception(exc)}). Try again shortly."
             ) from exc
         if not new_jwt:
-            logger.warning(
-                "AppFolio %s %s: token refresh could not run (lock contended)", method, path
-            )
-            raise AppFolioUnavailableError(
-                "AppFolio could not renew the session right now because another renewal"
-                " was in progress. Try again shortly."
-            )
+            # Nothing to refresh with (no refresh token stored): the 401 goes
+            # to the evidence-based classification, as it did before.
+            return False
         self._credential.jwt = new_jwt
         self._refresh_succeeded = True
         return True
@@ -1222,12 +1251,15 @@ async def refresh_access_token(
 ) -> AccessExchangeResult:
     """Refresh an expired bearer JWT via the OAuth2 refresh-token grant.
 
-    Raises :class:`AuthExpiredError` only when the token endpoint refuses
-    the grant itself: a 4xx other than 408 or 429. The request is the same
-    on every attempt, so such a refusal repeats and only a new magic link
-    recovers. A 5xx, a 408 or 429, a network failure, or a 2xx without a
-    token raises :class:`AppFolioUnavailableError`, which says nothing about
-    the credential.
+    Raises :class:`AuthExpiredError` only when the token endpoint confirms
+    the grant is dead: a 400 or 401 whose JSON ``error`` is an RFC 6749
+    permanent code (``is_dead_grant_response``), the same rule the shared
+    refresh applies. Any other 4xx except 408 and 429 raises
+    :class:`RefreshRefusedError`: still an expired session to the model, but
+    not proof enough to retire the credential. A 5xx, a 408 or 429, a
+    network failure, or a 2xx without a token raises
+    :class:`AppFolioUnavailableError`, which says nothing about the
+    credential.
     """
     body = {
         "client_id": _OAUTH_CLIENT_ID,
@@ -1255,7 +1287,9 @@ async def refresh_access_token(
                 f"AppFolio OAuth refresh failed: HTTP {resp.status_code}",
                 status_code=resp.status_code,
             )
-        raise AuthExpiredError()
+        if is_dead_grant_response(resp):
+            raise AuthExpiredError()
+        raise RefreshRefusedError()
     payload: dict[str, Any] = resp.json() if resp.content else {}
     jwt = payload.get("access_token") or ""
     if not jwt:
@@ -1277,8 +1311,9 @@ async def _appfolio_refresh_grant(refresh_token: str) -> dict[str, Any]:
     The credential lives in ``oauth_tokens`` like any OAuth token, but the
     token endpoint takes JSON with a public client id rather than the
     form-encoded, client-secret request ``OAuthConfig`` describes, so this
-    supplies only the POST. A refused grant becomes ``PermanentRefreshError``,
-    which retires the credential and notifies the user once.
+    supplies only the POST. A confirmed dead grant becomes
+    ``PermanentRefreshError``, which retires the credential and notifies the
+    user once; any other refusal propagates as a non-permanent failure.
 
     ``expires_in`` is left out on purpose. The stored credential has always
     had no expiry, so the background refresh sweep skips it and AppFolio
@@ -1290,6 +1325,10 @@ async def _appfolio_refresh_grant(refresh_token: str) -> dict[str, Any]:
         result = await refresh_access_token(
             refresh_token=refresh_token, timeout_seconds=_REFRESH_TIMEOUT_SECONDS
         )
+    except RefreshRefusedError:
+        # Not a confirmed dead grant: propagates as a non-permanent failure,
+        # so the shared refresh keeps the credential and sends no notice.
+        raise
     except AuthExpiredError as exc:
         raise PermanentRefreshError("AppFolio refused the refresh grant") from exc
     return {"access_token": result.jwt, "refresh_token": result.refresh_token}

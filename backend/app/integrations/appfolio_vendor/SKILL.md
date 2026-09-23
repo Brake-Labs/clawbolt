@@ -56,5 +56,5 @@ never over chat where it would stay in the message history:
 Direct the user to the web app; do not accept the magic link in the
 conversation. The OAuth2 exchange returns a refresh token alongside the
 bearer JWT, so live sessions extend automatically on 401. When AppFolio
-refuses the refresh, the connection is removed, the user is told, and they
-reconnect the same way.
+revokes the refresh token, the connection is removed, the user is told, and
+they reconnect the same way.

@@ -1158,7 +1158,7 @@ def _handle_http_error(exc: httpx.HTTPStatusError, action: str) -> ToolResult:
             content=f"Calendar could not renew its access while trying to {action}.",
             is_error=True,
             error_kind=ToolErrorKind.SERVICE,
-            hint="The connection is fine. Retry this call shortly.",
+            hint="Another refresh of this connection was in progress. Retry this call shortly.",
         )
     status = exc.response.status_code
     body = ""

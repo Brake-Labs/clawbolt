@@ -8,15 +8,16 @@ AppFolio API and its OAuth token endpoint are ``httpx`` fakes.
 
 Token endpoint classification (``refresh_access_token``):
 
-========================================  ==========  ================
-Token endpoint answer                     Tool error  Credential
-========================================  ==========  ================
-4xx other than 408/429 (invalid_grant)    AUTH        deleted, notified
-5xx, 408, 429                             SERVICE     kept
-network failure                           SERVICE     kept
-2xx without an access_token               SERVICE     kept
-refresh lock held by a peer               SERVICE     kept
-========================================  ==========  ================
+==============================================  ==========  =================
+Token endpoint answer                           Tool error  Credential
+==============================================  ==========  =================
+400/401 with an RFC 6749 permanent ``error``    AUTH        deleted, notified
+any other 4xx except 408/429 (HTML, 404, ...)   AUTH        kept, no notice
+5xx, 408, 429                                   SERVICE     kept
+network failure                                 SERVICE     kept
+2xx without an access_token                     SERVICE     kept
+refresh lock held by a peer                     SERVICE     kept
+==============================================  ==========  =================
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ from backend.app.integrations.appfolio_vendor.auth import (
     AppFolioCredential,
     load_credential,
     save_credential,
+    save_customer_ids,
 )
 from backend.app.integrations.appfolio_vendor.factory import (
     _appfolio_vendor_auth_check,
@@ -166,9 +168,8 @@ def _assert_kept(stored: AppFolioCredential | None) -> None:
     [
         (400, {"error": "invalid_grant", "error_description": "refresh token revoked"}),
         (401, {"error": "invalid_client"}),
-        (400, {}),
     ],
-    ids=["400_invalid_grant", "401_invalid_client", "400_no_body"],
+    ids=["400_invalid_grant", "401_invalid_client"],
 )
 async def test_dead_refresh_grant_is_auth_retires_and_notifies_once(
     test_user: User,
@@ -217,6 +218,46 @@ async def test_next_turn_after_retirement_offers_no_tools(
     assert await _appfolio_vendor_auth_check(ctx) is not None
     assert await _appfolio_vendor_factory(ctx) == []
     notify.assert_awaited_once()
+
+
+def _token_raw(status: int, content: bytes, content_type: str) -> Handler:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, content=content, headers={"content-type": content_type})
+
+    return handler
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        _token_raw(403, b"<html><body>Request blocked</body></html>", "text/html"),
+        _token(404, {"message": "Not Found"}),
+        _token(400, {"message": "unexpected parameter", "code": 12}),
+        _token(415, {"error": "unsupported_media_type"}),
+        _token(403, {"error": "invalid_grant"}),
+        _token(400),
+    ],
+    ids=["403_html", "404", "400_not_oauth", "415", "403_oauth_code", "400_empty"],
+)
+async def test_unconfirmed_refusal_is_auth_but_keeps_the_credential(
+    test_user: User, monkeypatch: pytest.MonkeyPatch, notify: AsyncMock, token: Handler
+) -> None:
+    """Regression: any token endpoint 4xx retired the credential and notified the user.
+
+    The endpoint is reverse-engineered and has moved before, so a WAF page, a
+    404 or a body that is not OAuth may be our fault or transient. The model
+    still hears AUTH, as before, but reconnecting stays the user's choice.
+    """
+    await _connect(test_user)
+    _wire(monkeypatch, api=_api_accepts_only("jwt-new"), token=token)
+    tools = await _tools(test_user)
+
+    result = await _list(tools)
+
+    assert result.is_error is True
+    assert result.error_kind is ToolErrorKind.AUTH
+    _assert_kept(await _stored(test_user))
+    notify.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +325,29 @@ async def test_contended_refresh_lock_is_service_not_session_expired(
 # ---------------------------------------------------------------------------
 # Successful refresh
 # ---------------------------------------------------------------------------
+
+
+async def test_customer_ids_saved_during_the_refresh_post_survive_it(
+    test_user: User, monkeypatch: pytest.MonkeyPatch, notify: AsyncMock
+) -> None:
+    """Regression: the refresh saved ``extra`` from the copy it loaded before the POST,
+    so customer IDs recorded while the POST was in flight were overwritten."""
+    await _connect(test_user)
+
+    async def token(request: httpx.Request) -> httpx.Response:
+        await save_customer_ids(test_user.id, ["c1", "c2"])
+        return httpx.Response(200, json={"access_token": "jwt-new", "refresh_token": "rt-new"})
+
+    _wire(monkeypatch, api=_api_accepts_only("jwt-new"), token=token)
+    tools = await _tools(test_user)
+
+    assert (await _list(tools)).is_error is False
+
+    stored = await _stored(test_user)
+    assert stored is not None
+    assert (stored.jwt, stored.refresh_token) == ("jwt-new", "rt-new")
+    assert stored.customer_ids == ["c1", "c2"]
+    assert stored.fingerprint == "fp-1"
 
 
 async def test_refresh_persists_rotated_tokens_and_keeps_appfolio_metadata(

@@ -198,16 +198,42 @@ class PermanentRefreshError(Exception):
     """
 
 
-class TokenRefreshUnavailable(httpx.HTTPStatusError):
-    """The provider refused the access token (401) and no refresh could run.
+class RefreshLockContended(Exception):
+    """A peer held the refresh lock past the bounded wait, so no refresh ran.
 
-    Raised by a provider service when the mid-call refresh hook returns None,
-    most often because a peer held the refresh lock past the bounded wait.
-    That says nothing about the grant, so callers classify it as a transient
-    ``ToolErrorKind.SERVICE`` rather than as a dead connection. It is an
-    ``HTTPStatusError`` carrying the 401, so handlers that branch on a 401
-    must check for this type first.
+    Transient and says nothing about the grant. Raised by
+    ``refresh_rejected_token`` (and so by the mid-call refresh hook) so a
+    provider service can report it as retryable instead of letting the
+    original 401 read as a dead connection.
     """
+
+
+class TokenRefreshUnavailable(httpx.HTTPStatusError):
+    """The provider refused the access token (401) while the refresh lock was busy.
+
+    Raised by a provider service when its mid-call refresh hook raises
+    ``RefreshLockContended``. That says nothing about the grant, so callers
+    classify it as a transient ``ToolErrorKind.SERVICE`` rather than as a
+    dead connection. It is an ``HTTPStatusError`` carrying the 401, so
+    handlers that branch on a 401 must check for this type first.
+    """
+
+
+def is_dead_grant_response(resp: httpx.Response) -> bool:
+    """True when a token endpoint answer says the grant itself is dead.
+
+    Only a 400 or 401 whose JSON ``error`` is an RFC 6749 permanent code
+    counts. Anything else (an HTML error page, a moved endpoint, a body that
+    is not OAuth) is unrecognized, and retiring a credential on it would cost
+    the user a manual reconnect for what may be a transient or local fault.
+    """
+    if resp.status_code not in (400, 401):
+        return False
+    try:
+        body = resp.json()
+    except Exception:
+        return False
+    return isinstance(body, dict) and body.get("error") in _PERMANENT_OAUTH_ERROR_CODES
 
 
 # A refresh grant an integration registers when its token endpoint does not
@@ -890,10 +916,11 @@ class OAuthService:
         """Return the mid-call refresh hook a provider service calls after a 401.
 
         The hook takes the access token the provider just rejected and
-        returns a fresh one, or None when no refresh could run. It goes
-        through ``refresh_rejected_token``, so the refresh is locked against
-        peers and persisted, and a dead grant retires the token, notifies the
-        user once, and raises ``ReconnectRequired``.
+        returns a fresh one, or None when there is nothing to refresh with. It
+        goes through ``refresh_rejected_token``, so the refresh is locked
+        against peers and persisted, a dead grant retires the token, notifies
+        the user once, and raises ``ReconnectRequired``, and a contended lock
+        raises ``RefreshLockContended``.
         """
 
         async def _refresh(rejected_access_token: str) -> str | None:
@@ -944,8 +971,13 @@ class OAuthService:
         integration: str,
         *,
         rejected_access_token: str = "",
+        raise_on_contention: bool = False,
     ) -> OAuthTokenData | None:
         """Refresh an expired OAuth token via the provider's token endpoint.
+
+        ``raise_on_contention`` raises ``RefreshLockContended`` instead of
+        returning None when a peer holds the lock past the bounded wait, so a
+        caller can tell that transient case from "nothing to refresh".
 
         Returns the updated token data on success, or None if no token or
         refresh token exists. Raises on HTTP errors so the caller can
@@ -993,6 +1025,10 @@ class OAuthService:
                     user_id,
                     integration,
                 )
+                if raise_on_contention:
+                    raise RefreshLockContended(
+                        f"OAuth refresh lock for {integration} held by a peer past the wait"
+                    )
                 return None
             try:
                 # Bypass the cache: the post-lock reload exists to detect
@@ -1081,6 +1117,14 @@ class OAuthService:
                 else:
                     token.expires_at = 0.0
 
+                # ``extra`` is integration metadata, not token state, and the
+                # lock does not cover its writers (AppFolio records customer
+                # IDs mid-turn). Re-read it after the POST so a write that
+                # landed during the request is not overwritten by the copy
+                # loaded before it.
+                current = await self.load_token_uncached(user_id, integration)
+                if current is not None:
+                    token.extra = current.extra
                 await self.save_token(user_id, integration, token)
                 logger.info(
                     "Refreshed OAuth token: user=%s integration=%s",
@@ -1192,9 +1236,11 @@ class OAuthService:
         ``ReconnectRequired``. A transient failure (provider 5xx, network
         error) propagates unchanged and leaves the token for a later retry.
         Also raises ``ReconnectRequired`` when the token row is gone, as it is
-        for every later call in a turn whose first call retired it. Returns
-        None when no refresh could run for another reason (the lock was
-        contended), leaving the caller's original 401 to stand.
+        for every later call in a turn whose first call retired it. Raises
+        ``RefreshLockContended`` when a peer held the lock past the wait,
+        which is transient. Returns None when there is nothing to refresh
+        with (no refresh token, no OAuth config), leaving the caller's
+        original 401 to stand.
         """
         friendly = _display_name(integration)
         reconnect_message = (
@@ -1203,7 +1249,10 @@ class OAuthService:
         )
         try:
             refreshed = await self.refresh_token(
-                user_id, integration, rejected_access_token=rejected_access_token
+                user_id,
+                integration,
+                rejected_access_token=rejected_access_token,
+                raise_on_contention=True,
             )
         except Exception as exc:
             if await self.handle_permanent_refresh_failure(user_id, integration, exc):

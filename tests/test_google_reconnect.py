@@ -683,6 +683,26 @@ async def test_contended_refresh_lock_is_service_not_a_dead_connection(
     notify.assert_not_awaited()
 
 
+@EVERY_INTEGRATION
+async def test_401_with_nothing_to_refresh_with_stays_auth(
+    test_user: User, monkeypatch: pytest.MonkeyPatch, notify: AsyncMock, spec: _Spec
+) -> None:
+    """Only a contended lock is SERVICE. A 401 on a token with no refresh token
+    has nothing to retry with, so it keeps its reconnect classification."""
+    await oauth_service.save_token(
+        test_user.id,
+        spec.integration,
+        OAuthTokenData(access_token="at-old", refresh_token="", expires_at=time.time() + 3600),
+    )
+    _wire(monkeypatch, google=_google_always(401), token_endpoint=_REFRESH_OK)
+    tools = await _tools(test_user, spec)
+
+    result = await spec.calls[0](tools)
+
+    assert result.error_kind is ToolErrorKind.AUTH
+    assert "Retry this call shortly" not in build_error_hint(result)
+
+
 async def test_user_is_notified_even_when_the_second_delete_fails(
     test_user: User, monkeypatch: pytest.MonkeyPatch, notify: AsyncMock
 ) -> None:
