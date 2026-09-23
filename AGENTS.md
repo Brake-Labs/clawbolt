@@ -300,20 +300,22 @@ Invariants, each of which the feature is worthless without:
 - **Whether a tool mutates comes from `ToolTags.READ_ONLY`, not the approval
   policy.** Untagged means mutating. See step 7 of "Adding a New Agent Tool".
 - **`MATCHED` needs the whole validated argument set.** For every write the
-  live turn made, `report.compare_writes` reports one of five outcomes.
+  live turn made, `report.compare_writes` reports one of six outcomes.
   `MATCHED` is agreement on every argument after the params model fills its
   defaults. `SAME_RECORD_DIFFERENT_ARGS` is the right record with different
   content; `SAME_TOOL_DIFFERENT_ARGS` is the tool called against something
   production did not write to, or a write with no record ID at all whose
-  arguments differ; `MISSED` is not calling the tool; `NOT_REACHED` is a
-  replay that ran out of lookup rounds before the candidate decided.
+  arguments differ; `MISSED` is not calling the tool. Two more are not
+  readings of a decision at all: `NOT_REACHED` is a replay that ran out of
+  lookup rounds before the candidate decided, and `NOT_REPLAYED` is a turn
+  the provider errored on, so the candidate never saw it.
   Agreement on record IDs alone used to be enough, and it meant
   `qb_update(entity_type="Invoice", data={Id:123, TotalAmt:500})` and
   `qb_update(entity_type="Estimate", data={Id:123, TotalAmt:5000})` counted as
   one write in the headline rate. The headline counts `MATCHED` only, over
-  `writes_measured` (`writes_total` less `NOT_REACHED`), which understates the
-  candidate rather than flattering it. Reading the turn is still what
-  separates a paraphrase from a note on the wrong job.
+  `writes_measured` (`writes_total` less both unmeasured buckets), which
+  understates the candidate rather than flattering it. Reading the turn is
+  still what separates a paraphrase from a note on the wrong job.
 - **Matching is greedy.** Each production write is compared against every
   candidate call to that tool independently and the best reading wins, so two
   production writes to one tool can both be judged against the same candidate
@@ -332,7 +334,12 @@ Invariants, each of which the feature is worthless without:
   the top of the turn ordering instead. `REPLAY_INCOMPLETE` is the sibling
   case for the measurement running out (`execution.MAX_REPLAY_READ_ROUNDS`),
   and its writes are `NOT_REACHED` rather than `MISSED`, so a cap the replay
-  hit is never reported as a write the candidate skipped.
+  hit is never reported as a write the candidate skipped. `NOT_REPLAYED` does
+  the same job for a turn the provider errored on. That one is easy to get a
+  lot of: `MAX_CONSECUTIVE_CALL_FAILURES` counts *consecutive* failures and
+  the turns run under `asyncio.gather`, so a flaky provider scatters errored
+  turns through a run without tripping the breaker, and every write on every
+  one of them used to land in the rate's denominator as a miss.
 - **Cost is `None` when nothing can price it, never zero.** A model served
   through a gateway is billed by whoever is behind it, which the (provider,
   model) pair no longer names, so `LLMTarget.priced` suppresses the figure and

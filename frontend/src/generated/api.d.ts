@@ -4080,6 +4080,8 @@ export interface components {
             writes_missed: number;
             /** Writes Not Reached */
             writes_not_reached: number;
+            /** Writes Not Replayed */
+            writes_not_replayed: number;
             /** Writes Measured */
             writes_measured: number;
             /** Write Match Rate */

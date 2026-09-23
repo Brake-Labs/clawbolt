@@ -514,6 +514,7 @@ def _summary_payload(summary: report.RunSummary) -> dict:
         "writes_args_differ": summary.writes_args_differ,
         "writes_missed": summary.writes_missed,
         "writes_not_reached": summary.writes_not_reached,
+        "writes_not_replayed": summary.writes_not_replayed,
         "writes_measured": summary.writes_measured,
         "write_match_rate": round(summary.write_match_rate, 4),
         "candidate": {

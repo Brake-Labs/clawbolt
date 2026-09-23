@@ -140,6 +140,7 @@ _WRITE_RANK = {
     WriteOutcome.SAME_TOOL_DIFFERENT_ARGS: 2,
     WriteOutcome.MISSED: 3,
     WriteOutcome.NOT_REACHED: 4,
+    WriteOutcome.NOT_REPLAYED: 5,
 }
 
 
@@ -156,7 +157,9 @@ def compare_writes(
     before writing would otherwise be scored on the lookup, and every
     lookup-then-write turn would report a miss. A candidate still looking
     things up when the round cap hit never got as far as the question, so
-    every one of its writes is ``NOT_REACHED`` rather than ``MISSED``.
+    every one of its writes is ``NOT_REACHED`` rather than ``MISSED``, and a
+    turn the provider never answered reports ``NOT_REPLAYED`` for the same
+    reason: neither is a decision the candidate made.
 
     Three readings above a miss, from the whole validated argument set down:
     the same arguments is ``MATCHED``, the same record IDs with different
@@ -198,7 +201,20 @@ def _compare_one_write(
     expected: dict[str, Any],
     expected_ids: dict[str, list[str]],
 ) -> WriteComparison:
-    """The best reading of *candidate*'s calls against one production write."""
+    """The best reading of *candidate*'s calls against one production write.
+
+    Two answers come before any reading of the calls, because on those turns
+    there are no calls to read and the absence is the measurement's, not the
+    candidate's: the provider errored (``NOT_REPLAYED``) or the replay ran
+    out of lookup rounds (``NOT_REACHED``).
+    """
+    if candidate.error:
+        return WriteComparison(
+            tool_name=tool.name,
+            outcome=WriteOutcome.NOT_REPLAYED,
+            key_arguments=expected,
+            record_ids=expected_ids,
+        )
     if candidate.hit_read_round_cap:
         return WriteComparison(
             tool_name=tool.name,
@@ -377,6 +393,10 @@ class RunSummary:
     """Writes on turns whose replay ran out of lookup rounds. Unmeasured, so
     they are excluded from ``write_match_rate`` rather than counted against
     the candidate."""
+    writes_not_replayed: int = 0
+    """Writes on turns the provider errored on. Unmeasured for the same
+    reason and excluded the same way: the candidate was never shown the turn,
+    so it did not skip the write."""
 
     candidate: ModelTotals = field(default_factory=ModelTotals)
     production: ProductionUsage = field(default_factory=ProductionUsage)
@@ -385,8 +405,12 @@ class RunSummary:
 
     @property
     def writes_measured(self) -> int:
-        """Production writes the candidate was actually asked about."""
-        return self.writes_total - self.writes_not_reached
+        """Production writes the candidate was actually asked about.
+
+        The total less the two unmeasured buckets. A turn that errored and a
+        turn that ran out of lookup rounds both leave the question unasked.
+        """
+        return self.writes_total - self.writes_not_reached - self.writes_not_replayed
 
     @property
     def write_match_rate(self) -> float:
@@ -526,6 +550,8 @@ def aggregate(
                 summary.writes_args_differ += 1
             elif write.outcome is WriteOutcome.NOT_REACHED:
                 summary.writes_not_reached += 1
+            elif write.outcome is WriteOutcome.NOT_REPLAYED:
+                summary.writes_not_replayed += 1
             else:
                 summary.writes_missed += 1
 
@@ -545,9 +571,15 @@ def _notes(summary: RunSummary, endpoint: str) -> list[str]:
         notes.append(COST_COMPARABILITY)
 
     if summary.turns_failed:
+        stranded = (
+            f" The {summary.writes_not_replayed} write(s) the live turns made on them are "
+            f"left out of the match rate rather than counted as missed."
+            if summary.writes_not_replayed
+            else ""
+        )
         notes.append(
             f"{summary.turns_failed} turn(s) could not be replayed, so the candidate has "
-            f"no decision for them. They are listed with the provider's error."
+            f"no decision for them. They are listed with the provider's error.{stranded}"
         )
 
     if summary.silent_turns:

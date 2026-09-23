@@ -46,6 +46,7 @@ export function summary(overrides: Partial<ComparisonSummary> = {}): ComparisonS
     writes_args_differ: 0,
     writes_missed: 0,
     writes_not_reached: 0,
+    writes_not_replayed: 0,
     writes_measured: 10,
     write_match_rate: 1,
     candidate: {

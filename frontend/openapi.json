@@ -7596,6 +7596,10 @@
             "type": "integer",
             "title": "Writes Not Reached"
           },
+          "writes_not_replayed": {
+            "type": "integer",
+            "title": "Writes Not Replayed"
+          },
           "writes_measured": {
             "type": "integer",
             "title": "Writes Measured"
@@ -7635,6 +7639,7 @@
           "writes_args_differ",
           "writes_missed",
           "writes_not_reached",
+          "writes_not_replayed",
           "writes_measured",
           "write_match_rate",
           "candidate",

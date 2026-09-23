@@ -166,6 +166,11 @@ function SummaryGrid({ summary }: { summary: ComparisonSummary }) {
   const totals = summary.candidate;
   const silent = summary.outcome_counts.no_candidate_output ?? 0;
   const incomplete = summary.outcome_counts.replay_incomplete ?? 0;
+  // Writes the candidate was never asked about: the replay ran out of lookup
+  // rounds, or the provider never answered the turn. Two buckets on the wire
+  // because an operator acts on them differently, one number on the tile
+  // because what the rate's denominator drops is the same either way.
+  const unmeasured = summary.writes_not_reached + summary.writes_not_replayed;
   return (
     <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
       <Stat
@@ -195,14 +200,14 @@ function SummaryGrid({ summary }: { summary: ComparisonSummary }) {
         }
         hint={
           summary.writes_measured
-            ? // ``writes_not_reached`` is named here, not only in the note below.
-              // The denominator is the measured writes, so a run that ran out of
-              // lookup rounds on its hard turns reports a rate over what was
-              // left, and a reader who cannot see how many dropped out reads
-              // that rate as the whole sample.
-              `${pct(summary.write_match_rate)} matched on every argument, ${summary.writes_same_record} same record with different arguments, ${summary.writes_args_differ} same tool only, ${summary.writes_missed} not made${summary.writes_not_reached ? `, ${summary.writes_not_reached} not measured` : ''}`
+            ? // The unmeasured writes are named here, not only in the notes
+              // below. The denominator is the measured writes, so a run that
+              // ran out of lookup rounds or lost turns to the provider
+              // reports a rate over what was left, and a reader who cannot
+              // see how many dropped out reads that rate as the whole sample.
+              `${pct(summary.write_match_rate)} matched on every argument, ${summary.writes_same_record} same record with different arguments, ${summary.writes_args_differ} same tool only, ${summary.writes_missed} not made${unmeasured ? `, ${unmeasured} not measured` : ''}`
             : summary.writes_total
-              ? `${summary.writes_total} write(s), none measured: every replay ran out of lookup rounds`
+              ? `${summary.writes_total} write(s), none measured: no replay reached the question`
               : 'The live turns in this sample wrote nothing'
         }
       />

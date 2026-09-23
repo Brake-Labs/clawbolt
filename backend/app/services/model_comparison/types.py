@@ -150,11 +150,12 @@ class WriteOutcome(StrEnum):
     """Whether the candidate reached one write the live turn made.
 
     Four readings of the candidate's decision, ordered here from best to
-    worst, and a fifth for a turn where there was no decision to read.
-    The headline rate counts ``MATCHED`` alone; ``NOT_REACHED`` is not
-    counted at all, because it is a measurement that did not finish rather
-    than a decision the candidate made, which is also why it sits outside
-    that ordering rather than below ``MISSED`` in it.
+    worst, and two more for a turn where there was no decision to read.
+    The headline rate counts ``MATCHED`` alone; ``NOT_REACHED`` and
+    ``NOT_REPLAYED`` are not counted at all, because each is a measurement
+    that did not finish rather than a decision the candidate made, which is
+    also why they sit outside that ordering rather than below ``MISSED`` in
+    it. ``report.RunSummary.writes_measured`` is the total less both.
     """
 
     MATCHED = "matched"
@@ -196,6 +197,22 @@ class WriteOutcome(StrEnum):
     write poses. Reporting that as a miss accused a model of skipping a write
     it had not got to yet. Excluded from the match rate's denominator: an
     unfinished measurement is not a failure to write.
+    """
+
+    NOT_REPLAYED = "not_replayed"
+    """The provider errored, so the candidate never saw the turn.
+
+    Its own bucket rather than ``NOT_REACHED`` because the two are not the
+    same measurement failure and the operator acts on them differently: a
+    round cap is this deployment's own ceiling on a hard turn, an error is
+    the provider. Both are unmeasured, so both stay out of the rate.
+
+    It is easy to get a lot of these. ``MAX_CONSECUTIVE_CALL_FAILURES``
+    counts *consecutive* failures and the turns run under ``asyncio.gather``,
+    so a flaky provider scatters errored turns through a run without ever
+    tripping the breaker. Counting their writes as ``MISSED`` put every write
+    on every one of them into the match rate's denominator and rendered "Did
+    not make the write" beside the provider's own error message.
     """
 
 

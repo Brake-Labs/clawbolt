@@ -983,6 +983,7 @@ def test_a_summary_without_a_cost_serves_null_not_zero(
             "writes_args_differ": 0,
             "writes_missed": 0,
             "writes_not_reached": 0,
+            "writes_not_replayed": 0,
             "writes_measured": 0,
             "write_match_rate": 0.0,
             "candidate": {

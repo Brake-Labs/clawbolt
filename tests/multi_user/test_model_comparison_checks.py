@@ -981,10 +981,40 @@ def test_a_turn_with_no_production_write_has_no_outcome_to_check() -> None:
 
 
 def test_an_errored_candidate_is_not_replayed_rather_than_a_miss() -> None:
+    """The turn's writes are unmeasured, not skipped, all the way to the rate.
+
+    Only the ``TurnOutcome`` used to say so. ``compare_writes`` ran anyway,
+    saw no tool calls, and reported every production write as ``MISSED``, so
+    the card said "Did not make the write" beside the provider's own error
+    and the rate's denominator grew by one per write. There is no breaker to
+    stop it either: ``MAX_CONSECUTIVE_CALL_FAILURES`` counts consecutive
+    failures and the turns run concurrently, so a flaky provider scatters
+    these through a run.
+    """
     errored = ModelCallResult(provider="p", model="m", error="APIStatusError: 503")
-    sample = _sample(_recorded_note("118601"))
+    sample = _sample(_recorded_note("118601"), _recorded_note("118602"))
     writes = report.compare_writes(sample, errored, WRITE_TOOLS)
     assert report.turn_outcome(errored, writes) is TurnOutcome.NOT_REPLAYED
+    assert [w.outcome for w in writes] == [WriteOutcome.NOT_REPLAYED] * 2
+
+    summary = report.aggregate(
+        [
+            TurnReport(
+                sample=sample,
+                candidate=errored,
+                outcome=TurnOutcome.NOT_REPLAYED,
+                writes=writes,
+            ),
+            _turn(2, writes=[WriteOutcome.MATCHED]),
+        ]
+    )
+    assert summary.writes_total == 3
+    assert summary.writes_not_replayed == 2
+    assert summary.writes_missed == 0
+    # The one write anyone actually asked the candidate about.
+    assert summary.writes_measured == 1
+    assert summary.write_match_rate == 1.0
+    assert any("left out of the match rate" in note for note in summary.notes)
 
 
 # ---------------------------------------------------------------------------

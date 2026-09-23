@@ -125,8 +125,9 @@ class ComparisonSummary(BaseModel):
     # ``writes_matched`` is agreement on the whole validated argument set;
     # ``writes_same_record`` is the right record with different arguments;
     # ``writes_args_differ`` is the tool called against something else;
-    # ``writes_not_reached`` is a turn whose replay ran out of lookup rounds,
-    # so the candidate was never asked. The last is excluded from
+    # ``writes_not_reached`` is a turn whose replay ran out of lookup rounds
+    # and ``writes_not_replayed`` a turn the provider errored on, so on
+    # neither was the candidate ever asked. Both are excluded from
     # ``writes_measured``, which is the rate's denominator, because an
     # unfinished measurement is not a failure to write.
     writes_total: int
@@ -135,6 +136,7 @@ class ComparisonSummary(BaseModel):
     writes_args_differ: int
     writes_missed: int
     writes_not_reached: int
+    writes_not_replayed: int
     writes_measured: int
     # ``writes_matched / writes_measured``. Full-argument agreement only:
     # reaching the right record with different arguments is its own bucket

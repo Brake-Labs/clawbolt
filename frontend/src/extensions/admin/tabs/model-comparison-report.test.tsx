@@ -172,6 +172,7 @@ describe('ModelComparisonReportPage', () => {
       writes_args_differ: 1,
       writes_missed: 1,
       writes_not_reached: 0,
+      writes_not_replayed: 0,
       writes_measured: 10,
       write_match_rate: 0.6,
     });
@@ -199,6 +200,7 @@ describe('ModelComparisonReportPage', () => {
       writes_args_differ: 0,
       writes_missed: 0,
       writes_not_reached: 4,
+      writes_not_replayed: 0,
       writes_measured: 6,
       write_match_rate: 1,
     });
@@ -247,6 +249,29 @@ describe('ModelComparisonReportPage', () => {
     expect(
       within(tile as HTMLElement).getByText(/Production billed \$0.9000 over 80 calls/),
     ).toBeInTheDocument();
+  });
+
+  it('counts a turn the provider never answered out of the write rate', async () => {
+    // Its writes are unmeasured, not missed, and the tile has to say how
+    // many dropped out or the rate reads as the whole sample.
+    const api = await import('../admin-api');
+    const s = summary({
+      writes_total: 10,
+      writes_matched: 6,
+      writes_same_record: 0,
+      writes_args_differ: 0,
+      writes_missed: 0,
+      writes_not_reached: 1,
+      writes_not_replayed: 3,
+      writes_measured: 6,
+      write_match_rate: 1,
+    });
+    vi.mocked(api.getComparisonReport).mockResolvedValue(report({ run: run({ summary: s }) }));
+    renderReport();
+
+    const tile = (await screen.findByText('Writes reached')).closest('div');
+    expect(within(tile as HTMLElement).getByText('6/6')).toBeInTheDocument();
+    expect(within(tile as HTMLElement).getByText(/4 not measured/)).toBeInTheDocument();
   });
 
   it('says the cost is not available rather than showing zero', async () => {

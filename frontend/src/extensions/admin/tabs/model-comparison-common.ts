@@ -62,6 +62,7 @@ export const WRITE_OUTCOME_COPY: Record<string, string> = {
   same_tool_different_args: 'Same tool, different arguments',
   missed: 'Did not make the write',
   not_reached: 'Not measured: the replay ran out of lookup rounds',
+  not_replayed: 'Not measured: the provider did not answer this turn',
 };
 
 /** What each deterministic check looks for. Keyed by ``types.Finding``. */
