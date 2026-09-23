@@ -34,6 +34,7 @@ from backend.app.agent.onboarding import (
     build_onboarding_system_prompt,
     is_onboarding_needed,
 )
+from backend.app.agent.prompt_epoch import EpochHistoryRenderer, PromptEpoch
 from backend.app.agent.session_db import get_session_store
 from backend.app.agent.skills.loader import load_all_skills
 from backend.app.agent.stores import ToolConfigStore
@@ -112,6 +113,7 @@ class PipelineContext:
     storage: StorageBackend | None = None
     combined_context: str = ""
     conversation_history: list[AgentMessage] = field(default_factory=list)
+    prompt_epoch: PromptEpoch | None = None
     system_prompt_override: str | None = None
     is_onboarding: bool = False
     event_subscribers: list[Callable[[AgentEvent], Awaitable[None]]] = field(default_factory=list)
@@ -284,6 +286,7 @@ async def run_agent(
     request_id: str = "",
     llm_override: UserLLMOverride | None = None,
     drain_inbound: Callable[[], Awaitable[list[UserMessage]]] | None = None,
+    prompt_epoch: PromptEpoch | None = None,
 ) -> AgentResponse:
     """Initialize agent with tools and process the message.
 
@@ -378,6 +381,7 @@ async def run_agent(
             message_context=combined_context,
             conversation_history=conversation_history,
             system_prompt_override=system_prompt_override,
+            prompt_epoch=prompt_epoch,
         )
     except ContentFilterError:
         logger.warning(
@@ -496,9 +500,17 @@ async def load_history_step(ctx: PipelineContext) -> PipelineContext:
             or (m.seq > current_seq and m.direction == MessageDirection.OUTBOUND)
         ]
         history_session = ctx.session.model_copy(update={"messages": [*earlier, ctx.message]})
-    ctx.conversation_history = await load_conversation_history(
-        history_session, tz_name=ctx.user.timezone
+    # Both prompt-cache settings need the epoch; only compaction changes
+    # what the history renders. With both off this is the plain loader.
+    renderer = (
+        EpochHistoryRenderer(ctx.user.id, compact=settings.cold_start_compaction_enabled)
+        if settings.prompt_stable_prefix_enabled or settings.cold_start_compaction_enabled
+        else None
     )
+    ctx.conversation_history = await load_conversation_history(
+        history_session, tz_name=ctx.user.timezone, render=renderer
+    )
+    ctx.prompt_epoch = renderer.epoch if renderer is not None else None
     ctx.is_onboarding = is_onboarding_needed(ctx.user)
     # Pass user (inbound) message count so the onboarding subscriber's
     # heuristic fallback can require a minimum number of user turns before
@@ -618,6 +630,7 @@ async def run_agent_step(ctx: PipelineContext) -> PipelineContext:
         request_id=ctx.request_id,
         llm_override=override,
         drain_inbound=_make_inbound_drain(ctx),
+        prompt_epoch=ctx.prompt_epoch,
     )
     return ctx
 

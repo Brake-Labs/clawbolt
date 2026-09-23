@@ -4,7 +4,7 @@ import asyncio
 import datetime
 import json
 import logging
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -12,7 +12,7 @@ from sqlalchemy import select
 
 from backend.app.agent.approval import _parse_approval_response
 from backend.app.agent.compaction import compact_session
-from backend.app.agent.dto import SessionState
+from backend.app.agent.dto import SessionState, StoredMessage
 from backend.app.agent.memory_db import get_memory_store
 from backend.app.agent.messages import (
     AgentMessage,
@@ -531,10 +531,19 @@ def _stored_messages_to_agent_messages(
     return history
 
 
+# Renders the loaded rows (the window, the current row, the timezone) into
+# the history the LLM sees. See ``prompt_epoch.EpochHistoryRenderer``.
+HistoryRenderer = Callable[
+    [list[StoredMessage], StoredMessage | None, str], Awaitable[list[AgentMessage]]
+]
+
+
 async def load_conversation_history(
     session: SessionState,
     limit: int = DEFAULT_HISTORY_LIMIT,
     tz_name: str = "",
+    *,
+    render: HistoryRenderer | None = None,
 ) -> list[AgentMessage]:
     """Load recent messages as typed message objects for LLM context.
 
@@ -555,6 +564,9 @@ async def load_conversation_history(
     guard against exceeding the LLM context window. Rows that fall outside
     the window are routed through compaction (see below) so they are never
     silently lost.
+
+    *render* replaces the plain row-to-message rendering and is handed the
+    current row too. Row selection above it is unchanged.
     """
     all_messages = session.messages
 
@@ -600,7 +612,10 @@ async def load_conversation_history(
         )
         preceding = below + preceding
 
-    history = _stored_messages_to_agent_messages(messages, tz_name=tz_name, preceding=preceding)
+    if render is not None:
+        history = await render(messages, all_messages[-1] if all_messages else None, tz_name)
+    else:
+        history = _stored_messages_to_agent_messages(messages, tz_name=tz_name, preceding=preceding)
     logger.debug(
         "Loaded %d history messages for session %s",
         len(history),

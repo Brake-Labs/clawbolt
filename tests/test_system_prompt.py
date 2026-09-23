@@ -23,6 +23,7 @@ from backend.app.agent.system_prompt import (
     build_user_section,
     to_local_time,
 )
+from backend.app.config import settings
 from backend.app.models import User
 from backend.app.services.llm_service import LLMTarget, prepare_system_with_caching
 
@@ -141,16 +142,19 @@ class TestBuildParts:
         assert blocks[0]["text"] == "Just a plain prompt"
 
     async def test_agent_prompt_parts_split_dynamic_out(self) -> None:
-        """build_agent_system_prompt_parts returns memory in the dynamic half only."""
+        """With the stable prefix off, memory rides the dynamic half only."""
         user = MagicMock()
         user.id = "user-123"
         user.soul_text = "soul"
         user.user_text = "user info"
         user.timezone = ""
-        with patch(
-            "backend.app.agent.system_prompt.build_memory_context",
-            new_callable=AsyncMock,
-            return_value="some memory",
+        with (
+            patch.object(settings, "prompt_stable_prefix_enabled", False),
+            patch(
+                "backend.app.agent.system_prompt.build_memory_context",
+                new_callable=AsyncMock,
+                return_value="some memory",
+            ),
         ):
             stable, dynamic = await build_agent_system_prompt_parts(
                 user, tools=[], message_context="hello"
@@ -158,6 +162,27 @@ class TestBuildParts:
         assert "some memory" in dynamic
         assert "some memory" not in stable
         assert "AI assistant for solo tradespeople" in stable
+
+    async def test_stable_prefix_puts_memory_in_the_stable_half(self) -> None:
+        """With the stable prefix on, memory is part of the cached system block."""
+        user = MagicMock()
+        user.id = "user-123"
+        user.soul_text = "soul"
+        user.user_text = "user info"
+        user.timezone = ""
+        with (
+            patch.object(settings, "prompt_stable_prefix_enabled", True),
+            patch(
+                "backend.app.agent.system_prompt.build_memory_context",
+                new_callable=AsyncMock,
+                return_value="some memory",
+            ),
+        ):
+            stable, dynamic = await build_agent_system_prompt_parts(
+                user, tools=[], message_context="hello"
+            )
+        assert "## Your Memory\nsome memory" in stable
+        assert "some memory" not in dynamic
 
 
 class TestSectionBuilders:
@@ -276,9 +301,8 @@ class TestBuildAgentSystemPrompt:
         assert "Proactive Messaging" in result
 
     async def test_tool_guidelines_live_in_dynamic_half(self) -> None:
-        """Tool guidelines must sit in the dynamic half so that specialist
-        activation mid-conversation does not bust the stable system-prompt
-        cache. They must never leak into the stable half."""
+        """With the stable prefix off, tool guidelines sit in the dynamic half
+        and never leak into the stable half."""
         user = MagicMock()
         user.soul_text = "I'm Bolt."
         user.user_text = ""
@@ -288,10 +312,13 @@ class TestBuildAgentSystemPrompt:
         tool = MagicMock()
         tool.usage_hint = "Use save_fact for memories"
 
-        with patch(
-            "backend.app.agent.system_prompt.build_memory_context",
-            new_callable=AsyncMock,
-            return_value="",
+        with (
+            patch.object(settings, "prompt_stable_prefix_enabled", False),
+            patch(
+                "backend.app.agent.system_prompt.build_memory_context",
+                new_callable=AsyncMock,
+                return_value="",
+            ),
         ):
             stable, dynamic = await build_agent_system_prompt_parts(
                 user=user,
@@ -305,6 +332,35 @@ class TestBuildAgentSystemPrompt:
         # specialist would invalidate the cached prefix.
         assert "Tool Guidelines" not in stable
         assert "save_fact" not in stable
+
+    async def test_tool_guidelines_are_stable_under_the_stable_prefix(self) -> None:
+        """Guidelines come from the tool list, which precedes the system block
+        in the cache, so under the stable prefix they sit in the stable half."""
+        user = MagicMock()
+        user.soul_text = "I'm Bolt."
+        user.user_text = ""
+        user.id = 1
+        user.timezone = ""
+
+        tool = MagicMock()
+        tool.usage_hint = "Use save_fact for memories"
+
+        with (
+            patch.object(settings, "prompt_stable_prefix_enabled", True),
+            patch(
+                "backend.app.agent.system_prompt.build_memory_context",
+                new_callable=AsyncMock,
+                return_value="",
+            ),
+        ):
+            stable, dynamic = await build_agent_system_prompt_parts(
+                user=user,
+                tools=[tool],
+                message_context="hello",
+            )
+
+        assert "## Tool Guidelines\n- Use save_fact for memories" in stable
+        assert "save_fact" not in dynamic
 
     async def test_preamble_is_generic(self) -> None:
         """Agent prompt preamble should be generic (no assistant_name)."""

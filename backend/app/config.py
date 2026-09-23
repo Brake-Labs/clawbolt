@@ -161,6 +161,24 @@ class Settings(BaseSettings):
     # there is no admin form for it. See docs/self-host/configuration.md.
     llm_pricing_aliases: str = ""
 
+    # Prompt-cache epochs (backend/app/agent/prompt_epoch.py). An epoch is the
+    # run of turns between two cold starts, a cold start being the first turn
+    # after the cache has idled out.
+    # Idle gap after which the cache counts as expired. None follows
+    # ``llm_cache_extended_ttl``: 3600 seconds when it is on, 300 when off.
+    prompt_cache_idle_seconds: int | None = Field(default=None, ge=1)
+    # Carry memory and tool guidelines in the cached system block, with the
+    # workspace documents snapshotted once per epoch and mid-epoch edits sent
+    # as a delta on the current turn.
+    prompt_stable_prefix_enabled: bool = True
+    # Rebuild the history to a budget at each cold start, eliding old tool
+    # results, and keep it append-only in between. The existing trim still
+    # applies above ``context_trim_trigger_tokens`` as a ceiling.
+    cold_start_compaction_enabled: bool = False
+    cold_start_history_budget_tokens: int = Field(default=30_000, ge=1_000)
+    # Turns before the cold start whose tool results stay verbatim.
+    cold_start_verbatim_turns: int = Field(default=4, ge=0)
+
     # Model comparison (admin console, multi_user only). A run replays a
     # user's recent turns through a candidate model, one LLM call per turn
     # plus up to ``execution.MAX_REPLAY_READ_ROUNDS`` (6) more where the turn
@@ -702,6 +720,15 @@ def log_config_warnings(s: Settings | None = None) -> list[str]:
             f" 2x the effective turn-trim trigger ({effective_trigger_turns});"
             " the row cap will bind before the turn backstop and old messages"
             " will roll through window-overflow compaction instead"
+        )
+    if (
+        s.cold_start_compaction_enabled
+        and s.cold_start_history_budget_tokens >= s.context_trim_target_tokens
+    ):
+        warnings.append(
+            f"cold_start_history_budget_tokens ({s.cold_start_history_budget_tokens})"
+            f" >= context_trim_target_tokens ({s.context_trim_target_tokens});"
+            " cold starts will rebuild a history larger than the one a trim leaves behind"
         )
 
     # Anthropic requires a longer-lived breakpoint to precede a shorter one.

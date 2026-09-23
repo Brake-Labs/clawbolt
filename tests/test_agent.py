@@ -164,10 +164,13 @@ async def test_agent_system_prompt_includes_soul(mock_amessages: object, test_us
     assert "AI assistant for solo tradespeople" in system_prompt
 
 
+@pytest.mark.parametrize("stable_prefix", [True, False])
 @patch("backend.app.agent.core.amessages")
-async def test_system_prompt_includes_tool_hints(mock_amessages: object, test_user: User) -> None:
-    """Tool usage hints are dynamic, so they ride on the current user turn,
-    not the cacheable system param (#1420)."""
+async def test_system_prompt_includes_tool_hints(
+    mock_amessages: object, test_user: User, stable_prefix: bool
+) -> None:
+    """Tool usage hints sit in the cached system block under the stable
+    prefix, and ride the current user turn without it (#1420)."""
     mock_amessages.return_value = make_text_response("Ok!")  # type: ignore[union-attr]
 
     async def dummy(**kwargs: object) -> ToolResult:
@@ -192,15 +195,19 @@ async def test_system_prompt_includes_tool_hints(mock_amessages: object, test_us
 
     agent = ClawboltAgent(user=test_user)
     agent.register_tools(tools)
-    await agent.process_message("Hello")
+    with patch(
+        "backend.app.agent.system_prompt.settings.prompt_stable_prefix_enabled", stable_prefix
+    ):
+        await agent.process_message("Hello")
 
     call_args = mock_amessages.call_args  # type: ignore[union-attr]
     current_turn = call_args.kwargs["messages"][-1]["content"]
-    assert "Tool Guidelines" in current_turn
-    assert "When you learn new info, save it." in current_turn
-    assert "Search memory for relevant information." in current_turn
-    # Dynamic hints must stay out of the cacheable system param.
-    assert "Tool Guidelines" not in extract_system_text(call_args.kwargs["system"])
+    system_text = extract_system_text(call_args.kwargs["system"])
+    holder, other = (system_text, current_turn) if stable_prefix else (current_turn, system_text)
+    assert "Tool Guidelines" in holder
+    assert "When you learn new info, save it." in holder
+    assert "Search memory for relevant information." in holder
+    assert "Tool Guidelines" not in other
 
 
 @patch("backend.app.agent.core.amessages")
@@ -250,10 +257,10 @@ async def test_system_prompt_skips_tools_without_hints(
     await agent.process_message("Hello")
 
     call_args = mock_amessages.call_args  # type: ignore[union-attr]
-    # Tool guidelines are dynamic and now ride on the current user turn.
-    current_turn = call_args.kwargs["messages"][-1]["content"]
-    assert "This tool does something useful." in current_turn
-    assert "tool_without_hint" not in current_turn
+    # Under the (default) stable prefix, guidelines sit in the system block.
+    system_text = extract_system_text(call_args.kwargs["system"])
+    assert "This tool does something useful." in system_text
+    assert "tool_without_hint" not in system_text
 
 
 @patch("backend.app.agent.core.amessages")

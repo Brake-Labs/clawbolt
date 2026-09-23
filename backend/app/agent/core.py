@@ -75,6 +75,7 @@ from backend.app.agent.observer import (
     emit_llm_request,
     emit_llm_response,
 )
+from backend.app.agent.prompt_epoch import PromptEpoch, remember_workspace_snapshot
 from backend.app.agent.skills.loader import (
     extract_delivered_skills,
     get_skill_instructions,
@@ -83,6 +84,7 @@ from backend.app.agent.skills.loader import (
 from backend.app.agent.system_prompt import (
     build_agent_system_prompt_parts,
     build_time_user_context,
+    capture_workspace,
 )
 from backend.app.agent.tool_errors import (
     _DEFAULT_ERROR_HINT,
@@ -439,17 +441,28 @@ class ClawboltAgent:
             )
         self._prev_tool_names = current
 
-    async def _build_system_prompt(self, message_context: str) -> tuple[str, str]:
+    async def _build_system_prompt(
+        self, message_context: str, epoch: PromptEpoch | None = None
+    ) -> tuple[str, str]:
         """Build the system prompt as ``(stable, dynamic)`` halves.
 
-        *stable* goes in the cacheable ``system`` param; *dynamic* (memory,
-        integrations) is appended to the current user turn so it does not
-        invalidate the history cache (#1420).
+        *stable* goes in the cacheable ``system`` param; *dynamic* is appended
+        to the current user turn so it does not invalidate the history cache
+        (#1420). Under ``prompt_stable_prefix_enabled``, a turn that knows its
+        cache *epoch* renders the workspace snapshot taken when the epoch
+        opened (see ``prompt_epoch``); one that does not, such as a heartbeat
+        or a replay, renders the workspace as it stands.
         """
+        live = await capture_workspace(self.user)
+        snapshot = None
+        if settings.prompt_stable_prefix_enabled and epoch is not None:
+            snapshot = remember_workspace_snapshot(self.user.id, epoch, live)
         return await build_agent_system_prompt_parts(
             self.user,
             self.tools,
             message_context,
+            live=live,
+            snapshot=snapshot,
         )
 
     async def _emit_response(
@@ -1349,6 +1362,7 @@ class ClawboltAgent:
         *,
         deterministic_trim: bool = False,
         now: datetime | None = None,
+        epoch: PromptEpoch | None = None,
     ) -> AssembledPrompt:
         """Build the exact message list a turn sends to the LLM, pre-flight.
 
@@ -1371,20 +1385,24 @@ class ClawboltAgent:
         depending on whether this worker happened to serve that user recently.
         Live turns leave it False and keep the accurate count.
 
+        ``epoch`` is the prompt-cache epoch the turn belongs to, from the
+        history renderer (``prompt_epoch``). It selects the workspace snapshot
+        in the system block. None renders the workspace as it stands.
+
         Side effect: seeds ``self._delivered_skill_categories`` from the tool
         results that survived trimming, so first-use SKILL.md injection does
         not repeat guidance already in context.
         """
         # The system prompt splits into a stable half (cacheable, sent in
-        # the ``system`` param) and a dynamic half (memory, integrations,
-        # cross-session context). The dynamic half is appended to the
-        # current user turn rather than the system param so a memory write
-        # does not invalidate the message-history cache (#1420). An
-        # override (e.g. onboarding) is treated as fully stable.
+        # the ``system`` param) and a dynamic half (integrations, workspace
+        # updates, or memory when the stable prefix is off). The dynamic half
+        # is appended to the current user turn rather than the system param
+        # so a memory write does not invalidate the message-history cache
+        # (#1420). An override (e.g. onboarding) is treated as fully stable.
         if system_prompt_override is not None:
             stable_system, dynamic_context = system_prompt_override, ""
         else:
-            stable_system, dynamic_context = await self._build_system_prompt(message_context)
+            stable_system, dynamic_context = await self._build_system_prompt(message_context, epoch)
         # The full assembled prompt for observers / debugging. The dynamic
         # half physically ships on the user turn now, but this field still
         # reflects everything the model was given as instruction context.
@@ -1418,9 +1436,12 @@ class ClawboltAgent:
         # per message), so fall back to the process-local per-user cache
         # of the last API-reported count. Only without either does the
         # trimmer use its chars/4 heuristic.
+        # A cold start that rebuilt the history leaves the last reported
+        # count describing the prompt before the rebuild, so estimate instead.
+        rebuilt = epoch is not None and epoch.cold_start and settings.cold_start_compaction_enabled
         input_tokens = (
             None
-            if deterministic_trim
+            if deterministic_trim or rebuilt
             else (self._last_input_tokens or _recall_input_tokens(self.user.id))
         )
         trim_result = trim_messages(
@@ -1479,12 +1500,16 @@ class ClawboltAgent:
         max_tokens: int | None = None,
         *,
         wrap_up_on_max_rounds: bool = True,
+        prompt_epoch: PromptEpoch | None = None,
     ) -> AgentResponse:
         """Process a message through the agent loop.
 
         *wrap_up_on_max_rounds* is False for turns the user did not start
         (heartbeats), where running out of rounds must stay silent rather
         than send an unprompted "ran out of steps" message.
+
+        *prompt_epoch* is the cache epoch the history renderer found; see
+        :meth:`assemble_prompt`.
         """
         agent_start_time = time.monotonic()
         logger.debug(
@@ -1497,6 +1522,7 @@ class ClawboltAgent:
             message_context,
             conversation_history,
             system_prompt_override,
+            epoch=prompt_epoch,
         )
         system_prompt = assembled.system_prompt
         messages = assembled.messages
