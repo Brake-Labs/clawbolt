@@ -133,10 +133,17 @@ _PERMANENT_OAUTH_ERROR_CODES = frozenset(
 
 
 def reconnect_instruction(integration: str) -> str:
-    """How the agent gets a dead connection back: offer the user a fresh link."""
+    """How the agent gets a dead connection back: offer the user a fresh link.
+
+    A refused token is not always retired (a 401 that survives a refresh, or
+    a refresh that could not run, leaves it stored), and ``connect`` refuses
+    while a token is stored, so the instruction covers disconnecting first.
+    """
     return (
         f"Use manage_integration(action='connect', target='{integration}') to generate "
-        "a connection link for the user, or they can reconnect in Settings > Integrations."
+        "a connection link for the user. If it reports the integration is still "
+        f"connected, run manage_integration(action='disconnect', target='{integration}') "
+        "first. The user can also reconnect in Settings > Integrations."
     )
 
 

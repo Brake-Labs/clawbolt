@@ -554,6 +554,10 @@ async def test_drive_401_persisting_after_refresh_is_auth(
     stored = await _stored(test_user, "google_drive")
     assert stored is not None
     assert stored.refresh_token == "rt-new"
+    # The token is still stored, so ``connect`` alone would refuse.
+    assert "manage_integration(action='disconnect', target='google_drive')" in (
+        build_error_hint(result)
+    )
     notify.assert_not_awaited()
 
 
