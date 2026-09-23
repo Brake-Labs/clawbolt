@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -1615,6 +1615,31 @@ def test_event_line_all_day_and_overnight() -> None:
     assert "- 22:00-2026-03-26 02:00 Pour | id: on" in out
     # All-day sorts first on its day (it starts at midnight).
     assert out.index("id: ad") < out.index("id: on")
+
+
+def test_all_day_event_stays_on_its_own_day_west_of_utc() -> None:
+    """An all-day event starts at UTC midnight, which in Denver is 18:00 the
+    evening before. It must not split the previous day's heading."""
+    mdt = timezone(timedelta(hours=-6))
+    events = [
+        ("Jobs", _event("a", datetime(2026, 9, 23, 17, tzinfo=mdt), title="Site visit")),
+        ("Jobs", _event("b", datetime(2026, 9, 24, tzinfo=UTC), title="Off", all_day=True)),
+        ("Jobs", _event("c", datetime(2026, 9, 23, 19, tzinfo=mdt), title="Estimate")),
+        ("Jobs", _event("d", datetime(2026, 9, 24, 8, tzinfo=mdt), title="Roof")),
+    ]
+    out = _format_event_list(events, ["Jobs"], show_label=False)
+    assert out.splitlines() == [
+        "Found 4 event(s):",
+        "2026-09-23 Wed",
+        "- 17:00-19:00 Site visit | id: a",
+        "- 19:00-21:00 Estimate | id: c",
+        "2026-09-24 Thu",
+        "- all day Off | id: b",
+        "- 08:00-10:00 Roof | id: d",
+    ]
+    capped = _format_event_list(events, ["Jobs"], show_label=False, limit=2)
+    assert "2026-09-24" not in capped.split("\n(")[0]
+    assert "(2 more event(s) from 2026-09-24 on not shown" in capped
 
 
 def _many_events(n_personal: int, n_jobs: int) -> list[tuple[str, CalendarEventData]]:

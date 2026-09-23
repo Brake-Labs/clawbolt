@@ -206,14 +206,25 @@ def _format_event_list(
 
     Each calendar label and each date prints once, and every event keeps its
     id on its own line. Past ``limit`` the latest events are left out and a
-    footer counts them per calendar. Ordering is total (start, calendar,
-    title, id), so the same events always render the same text.
+    footer counts them per calendar. Ordering is total (day, all-day first,
+    start, calendar, title, id), so the same events always render the same
+    text.
     """
     rank = {name: i for i, name in enumerate(calendar_order)}
 
     def key(pair: tuple[str, CalendarEventData]) -> tuple:
         cal_name, event = pair
-        return (event.start, rank.get(cal_name, len(rank)), cal_name, event.title, event.id)
+        # Day first, as the heading prints it: an all-day event starts at UTC
+        # midnight, which west of UTC is the previous evening.
+        return (
+            event.start.date(),
+            not event.all_day,
+            event.start,
+            rank.get(cal_name, len(rank)),
+            cal_name,
+            event.title,
+            event.id,
+        )
 
     ordered = sorted(events, key=key)
     shown, hidden = ordered[:limit], ordered[limit:]

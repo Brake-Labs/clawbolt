@@ -21,8 +21,8 @@ named, ``product.price`` included, still passes through.
 The size of a response is therefore set by the result count and the provider's
 trim, not by a character budget hidden in here. ``WEB_SEARCH_MAX_RESULTS`` sets
 the count for a call that does not ask for one; the agent picks per call
-otherwise. If that is ever too much, the fix is to ask for fewer results, not to
-serve half of each one.
+otherwise. If that is ever too much, ask for fewer results rather than adding a
+budget here: a cut in this module cannot know which field was the answer.
 """
 
 from typing import Any
