@@ -24,6 +24,7 @@ from backend.app.integrations._google_errors import (
 )
 from backend.app.integrations.calendar.provider import (
     CalendarEventCreate,
+    CalendarEventData,
     CalendarEventUpdate,
 )
 from backend.app.integrations.calendar.service import (
@@ -167,25 +168,90 @@ class CalendarCheckAvailabilityParams(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _format_event(event: Any, calendar_label: str = "") -> str:
-    """Format a single calendar event for LLM readability."""
-    parts = []
-    if calendar_label:
-        parts.append(f"[{calendar_label}]")
-    parts.append(event.title)
+# Most events one calendar_list_events result lists. A 90 to 180 day sweep of
+# every calendar returned 165 events in one call, and that result stayed in
+# history for the rest of the session. The earliest events are kept, so the
+# agent can continue from the last listed day.
+_MAX_LISTED_EVENTS = 60
+
+_DESCRIPTION_CHARS = 100
+
+
+def _format_event_line(event: CalendarEventData) -> str:
+    """One event under its day heading: time, title, location, notes, id."""
     if event.all_day:
-        parts.append(f"(all day, {event.start.strftime('%Y-%m-%d')})")
+        line = f"- all day {event.title}"
     else:
-        parts.append(f"{event.start.strftime('%Y-%m-%d %H:%M')} - {event.end.strftime('%H:%M')}")
+        same_day = event.end.date() == event.start.date()
+        end = event.end.strftime("%H:%M" if same_day else "%Y-%m-%d %H:%M")
+        line = f"- {event.start.strftime('%H:%M')}-{end} {event.title}"
     if event.location:
-        parts.append(f"@ {event.location}")
+        line += f" @ {event.location}"
     if event.description:
-        desc = event.description[:100]
-        if len(event.description) > 100:
+        desc = event.description[:_DESCRIPTION_CHARS]
+        if len(event.description) > _DESCRIPTION_CHARS:
             desc += "..."
-        parts.append(f"| {desc}")
-    parts.append(f"[id: {event.id}]")
-    return " | ".join(parts)
+        line += f" | {desc}"
+    return f"{line} | id: {event.id}"
+
+
+def _format_event_list(
+    events: list[tuple[str, CalendarEventData]],
+    calendar_order: list[str],
+    *,
+    show_label: bool,
+    limit: int = _MAX_LISTED_EVENTS,
+) -> str:
+    """Render events grouped by calendar, then by day, earliest first.
+
+    Each calendar label and each date prints once, and every event keeps its
+    id on its own line. Past ``limit`` the latest events are left out and a
+    footer counts them per calendar. Ordering is total (start, calendar,
+    title, id), so the same events always render the same text.
+    """
+    rank = {name: i for i, name in enumerate(calendar_order)}
+
+    def key(pair: tuple[str, CalendarEventData]) -> tuple:
+        cal_name, event = pair
+        return (event.start, rank.get(cal_name, len(rank)), cal_name, event.title, event.id)
+
+    ordered = sorted(events, key=key)
+    shown, hidden = ordered[:limit], ordered[limit:]
+
+    if hidden:
+        header = f"Found {len(ordered)} event(s), showing the first {len(shown)} by start time:"
+    else:
+        header = f"Found {len(ordered)} event(s):"
+    lines = [header]
+
+    by_calendar = sorted(shown, key=lambda pair: (rank.get(pair[0], len(rank)), pair[0]))
+    current_cal: str | None = None
+    current_day: str | None = None
+    for cal_name, event in by_calendar:
+        if show_label and cal_name != current_cal:
+            lines.append(f"[{cal_name}]")
+            current_day = None
+        current_cal = cal_name
+        day = event.start.strftime("%Y-%m-%d %a")
+        if day != current_day:
+            lines.append(day)
+            current_day = day
+        lines.append(_format_event_line(event))
+
+    if hidden:
+        per_cal: dict[str, int] = {}
+        for cal_name, _ in hidden:
+            per_cal[cal_name] = per_cal.get(cal_name, 0) + 1
+        counts = ", ".join(
+            f"{name} {per_cal[name]}"
+            for name in sorted(per_cal, key=lambda n: (rank.get(n, len(rank)), n))
+        )
+        first_hidden = hidden[0][1].start.strftime("%Y-%m-%d")
+        lines.append(
+            f"({len(hidden)} more event(s) from {first_hidden} on not shown: {counts}. "
+            "Narrow the date range or pass calendar_id to see them.)"
+        )
+    return "\n".join(lines)
 
 
 def _resolve_tz(tz_name: str) -> tzinfo:
@@ -558,7 +624,7 @@ def create_calendar_tools(
             ]
 
         logger.debug("list_events querying calendars: %s", query_cals)
-        all_events: list[tuple[str, Any]] = []
+        all_events: list[tuple[str, CalendarEventData]] = []
         skipped: list[str] = []
         for cal_id, cal_name in query_cals:
             try:
@@ -606,16 +672,12 @@ def create_calendar_tools(
                 content=f"No events found between {start_date} and {end_date}.{skip_note}"
             )
 
-        # Sort by event start time
-        all_events.sort(key=lambda pair: pair[1].start)
-
-        show_label = len(query_cals) > 1
-        lines = [f"Found {len(all_events)} event(s):"]
-        for cal_name, event in all_events:
-            lines.append(f"- {_format_event(event, calendar_label=cal_name if show_label else '')}")
-        if skip_note:
-            lines.append(skip_note)
-        return ToolResult(content="\n".join(lines))
+        content = _format_event_list(
+            all_events,
+            [name for _, name in query_cals],
+            show_label=len(query_cals) > 1,
+        )
+        return ToolResult(content=content + skip_note)
 
     async def calendar_create_event(
         title: str,
@@ -942,14 +1004,18 @@ def create_calendar_tools(
             tags={ToolTags.READ_ONLY},
             description=(
                 "List events on Google Calendar within a date range. "
-                "Returns event titles, times, locations, and IDs. "
-                "When no calendar_id is specified, queries all enabled calendars."
+                "Returns event titles, times, locations, and IDs, grouped by "
+                "calendar and day. When no calendar_id is specified, queries all "
+                f"enabled calendars. Lists at most {_MAX_LISTED_EVENTS} events, "
+                "earliest first; a footer counts the rest per calendar."
             ),
             function=calendar_list_events,
             params_model=CalendarListEventsParams,
             usage_hint=(
                 "List upcoming calendar events. Use ISO 8601 dates. "
-                "Always check the calendar before scheduling new events."
+                "Always check the calendar before scheduling new events. "
+                "Keep ranges to a month or less; if the result is capped, "
+                "narrow the range or pass calendar_id."
             ),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
