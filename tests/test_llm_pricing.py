@@ -15,7 +15,8 @@ from decimal import Decimal
 import pytest
 from genai_prices import Usage, calc_price
 
-from backend.app.services.llm_pricing import compute_cost, is_known_model
+from backend.app.config import settings
+from backend.app.services.llm_pricing import compute_cost, is_known_model, resolve_price_ref
 
 # ---------------------------------------------------------------------------
 # Known / unknown model
@@ -206,3 +207,103 @@ def test_known_anthropic_models_all_produce_nonzero_cost() -> None:
     ):
         cost = compute_cost(model, 1000, 500, provider="anthropic")
         assert cost > Decimal("0"), f"{model} priced at zero"
+
+
+# ---------------------------------------------------------------------------
+# Claude 5 (genai-prices >= 0.1.8)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("model", ["claude-opus-5-5", "claude-opus-5", "claude-sonnet-5"])
+def test_claude_5_models_are_priced(model: str) -> None:
+    assert is_known_model(model, provider="anthropic") is True
+    assert compute_cost(model, 1000, 500, provider="anthropic") > Decimal("0")
+
+
+def test_claude_opus_5_5_is_not_priced_as_claude_opus_5() -> None:
+    """0.1.7 prefix-matched ``claude-opus-5-5`` onto ``claude-opus-5`` and
+    billed it at the older, dearer rate. Its own entry is cheaper."""
+    newer = compute_cost("claude-opus-5-5", 1_000_000, 1_000_000, provider="anthropic")
+    older = compute_cost("claude-opus-5", 1_000_000, 1_000_000, provider="anthropic")
+    assert Decimal("0") < newer < older
+
+
+# ---------------------------------------------------------------------------
+# Gateway route prefixes and operator aliases
+# ---------------------------------------------------------------------------
+
+
+def test_route_prefixed_name_prices_like_the_bare_model() -> None:
+    """A gateway route name is ``<route>:<model id>``. The price is the model's."""
+    prefixed = compute_cost(
+        "clawbolt-anthropic:claude-opus-5-5",
+        input_tokens=1200,
+        output_tokens=300,
+        provider="anthropic",
+        cache_creation_input_tokens=400,
+        cache_read_input_tokens=5000,
+    )
+    bare = compute_cost(
+        "claude-opus-5-5",
+        input_tokens=1200,
+        output_tokens=300,
+        provider="anthropic",
+        cache_creation_input_tokens=400,
+        cache_read_input_tokens=5000,
+    )
+    assert prefixed == bare
+    assert prefixed > Decimal("0")
+    assert is_known_model("clawbolt-anthropic:claude-opus-5-5", provider="anthropic") is True
+    assert resolve_price_ref("clawbolt-anthropic:claude-opus-5-5", provider="anthropic") == (
+        "claude-opus-5-5"
+    )
+
+
+def test_only_the_part_after_the_last_colon_is_the_model() -> None:
+    assert resolve_price_ref("gw:eu:claude-sonnet-5", provider="anthropic") == "claude-sonnet-5"
+
+
+def test_a_name_the_library_knows_is_not_rewritten() -> None:
+    assert resolve_price_ref("claude-sonnet-5", provider="anthropic") == "claude-sonnet-5"
+
+
+def test_route_prefix_with_an_unknown_model_is_still_unpriced() -> None:
+    model = "clawbolt-anthropic:not-a-real-model-99"
+    assert is_known_model(model, provider="anthropic") is False
+    assert resolve_price_ref(model, provider="anthropic") is None
+    assert compute_cost(model, 1000, 1000, provider="anthropic") == Decimal("0.000000")
+
+
+def test_an_alias_resolves_to_its_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "llm_pricing_aliases", "clawbolt-prod=claude-opus-5")
+    assert is_known_model("clawbolt-prod", provider="anthropic") is True
+    assert resolve_price_ref("clawbolt-prod", provider="anthropic") == "claude-opus-5"
+    assert compute_cost("clawbolt-prod", 1000, 500, provider="anthropic") == compute_cost(
+        "claude-opus-5", 1000, 500, provider="anthropic"
+    )
+
+
+def test_an_alias_applies_to_the_bare_name_behind_a_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "llm_pricing_aliases", "clawbolt-prod=claude-opus-5")
+    assert resolve_price_ref("gw:clawbolt-prod", provider="anthropic") == "claude-opus-5"
+
+
+def test_an_alias_does_not_override_a_name_the_library_knows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Aliases fill gaps; a stale one must not reprice a real model id."""
+    monkeypatch.setattr(settings, "llm_pricing_aliases", "claude-sonnet-5=claude-opus-5")
+    assert resolve_price_ref("claude-sonnet-5", provider="anthropic") == "claude-sonnet-5"
+
+
+def test_an_alias_to_an_unknown_target_stays_unpriced(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "llm_pricing_aliases", "clawbolt-prod=not-a-real-model-99")
+    assert is_known_model("clawbolt-prod", provider="anthropic") is False
+    assert compute_cost("clawbolt-prod", 1000, 500, provider="anthropic") == Decimal("0.000000")
+
+
+def test_without_an_alias_the_gateway_alias_is_unpriced() -> None:
+    assert is_known_model("clawbolt-prod", provider="anthropic") is False
+    assert compute_cost("clawbolt-prod", 1000, 500, provider="anthropic") == Decimal("0.000000")

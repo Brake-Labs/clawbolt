@@ -34,7 +34,7 @@ from backend.app.models import (
     User,
 )
 from backend.app.query_helpers import iso
-from backend.app.services.llm_pricing import compute_cost, is_known_model
+from backend.app.services.llm_pricing import UNPRICED_HINT, compute_cost, is_known_model
 
 logger = logging.getLogger(__name__)
 
@@ -406,17 +406,16 @@ def _build_llm_usage_log(
     pricing_available = priced and is_known_model(model, provider=provider)
     if (
         priced
-        and not is_known_model(model, provider=provider)
+        and not pricing_available
         and (prompt_tokens or completion_tokens)
         and (provider, model) not in _warned_unpriced_models
     ):
         _warned_unpriced_models.add((provider, model))
         logger.warning(
-            "genai-prices does not know provider=%r model=%r; logging "
-            "usage with cost=0. Bump the genai-prices dependency to "
-            "pick up new model pricing.",
+            "genai-prices does not know provider=%r model=%r; logging usage with cost=0. %s",
             provider,
             model,
+            UNPRICED_HINT,
         )
 
     return LLMUsageLog(

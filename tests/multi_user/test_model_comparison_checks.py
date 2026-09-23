@@ -1328,6 +1328,26 @@ def test_the_production_window_rides_on_the_summary() -> None:
     assert summary.production.billed_prompt_tokens == 1000
 
 
+def test_a_route_prefixed_model_is_priced_like_the_bare_model() -> None:
+    """Same resolution as the usage log, so the tile and the log agree."""
+    costs = []
+    for model in ("clawbolt-anthropic:claude-opus-5-5", "claude-opus-5-5"):
+        turn = _turn(1)
+        turn.candidate.model = model
+        summary = report.aggregate([turn], target=LLMTarget(provider="anthropic", model=model))
+        assert summary.candidate.cost_unavailable_reason == ""
+        costs.append(summary.candidate.total_cost)
+    assert costs[0] is not None
+    assert costs[0] > 0
+    assert costs[0] == costs[1]
+
+
+def test_the_unknown_model_note_names_the_alias_setting() -> None:
+    target = LLMTarget(provider="anthropic", model="test-model")
+    summary = report.aggregate([_turn(1)], target=target)
+    assert any("LLM_PRICING_ALIASES" in note for note in summary.notes)
+
+
 def test_a_priced_model_reports_a_cost() -> None:
     target = LLMTarget(provider="anthropic", model="claude-sonnet-4-20250514")
     turn = _turn(1)

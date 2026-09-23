@@ -10,10 +10,12 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
 from sqlalchemy import select
 
+from backend.app.config import settings
 from backend.app.database import db_session_async
-from backend.app.models import LLMUsageLog, User
+from backend.app.models import LLMEndpoint, LLMUsageLog, User
 from scripts.backfill_llm_costs import backfill_costs
 
 
@@ -137,3 +139,131 @@ async def test_zero_token_row_is_skipped(test_user: User) -> None:
     assert result.scanned == 0
     assert result.updated == 0
     assert await _cost_of(row_id) == Decimal("0.000000")
+
+
+async def _row_state(row_id: int) -> tuple[Decimal, bool, str]:
+    async with db_session_async() as db:
+        row = (await db.execute(select(LLMUsageLog).where(LLMUsageLog.id == row_id))).scalar_one()
+        return row.cost, row.pricing_available, row.model
+
+
+async def _add_unpriced_row(user: User, *, model: str, endpoint: str = "") -> int:
+    """A row as the logger wrote it before the model could be priced."""
+    async with db_session_async() as db:
+        row = LLMUsageLog(
+            user_id=user.id,
+            endpoint=endpoint,
+            provider="anthropic",
+            model=model,
+            pricing_available=False,
+            input_tokens=7100,
+            output_tokens=530,
+            total_tokens=7630,
+            cost=Decimal("0.000000"),
+            purpose="agent_main",
+            cache_creation_input_tokens=900,
+            cache_read_input_tokens=40_000,
+        )
+        db.add(row)
+        await db.commit()
+        await db.refresh(row)
+        return row.id
+
+
+async def _add_endpoint(name: str, *, pricing: str) -> None:
+    async with db_session_async() as db:
+        db.add(LLMEndpoint(name=name, dialect="anthropic", pricing=pricing))
+        await db.commit()
+
+
+async def test_apply_reprices_a_route_prefixed_row_and_marks_it_priced(test_user: User) -> None:
+    row_id = await _add_unpriced_row(test_user, model="clawbolt-anthropic:claude-opus-5-5")
+
+    result = await backfill_costs(apply=True)
+
+    cost, priced, model = await _row_state(row_id)
+    assert result.updated == 1
+    assert cost == result.total_added
+    assert cost > Decimal("0")
+    assert priced is True
+    # The stored model is what was sent; only the price lookup changed.
+    assert model == "clawbolt-anthropic:claude-opus-5-5"
+
+
+async def test_apply_reprices_an_aliased_row(
+    test_user: User, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "llm_pricing_aliases", "clawbolt-prod=claude-opus-5")
+    row_id = await _add_unpriced_row(test_user, model="clawbolt-prod")
+
+    result = await backfill_costs(apply=True)
+
+    cost, priced, model = await _row_state(row_id)
+    assert result.updated == 1
+    assert cost > Decimal("0")
+    assert priced is True
+    assert model == "clawbolt-prod"
+
+
+async def test_dry_run_changes_neither_cost_nor_pricing_flag(test_user: User) -> None:
+    row_id = await _add_unpriced_row(test_user, model="clawbolt-anthropic:claude-opus-5-5")
+
+    result = await backfill_costs(apply=False)
+
+    assert result.applied is False
+    assert result.updated == 1
+    assert result.total_added > Decimal("0")
+    assert await _row_state(row_id) == (
+        Decimal("0.000000"),
+        False,
+        "clawbolt-anthropic:claude-opus-5-5",
+    )
+
+
+async def test_rows_from_an_unpriced_endpoint_are_left_alone(test_user: User) -> None:
+    """The endpoint said the (provider, model) pair does not name who billed
+    the tokens. A backfill must not overrule that with a price-list hit."""
+    await _add_endpoint("gw-unpriced", pricing="unpriced")
+    row_id = await _add_unpriced_row(test_user, model="claude-opus-5-5", endpoint="gw-unpriced")
+
+    result = await backfill_costs(apply=True)
+
+    assert result.updated == 0
+    assert result.skipped_endpoint == 1
+    assert await _row_state(row_id) == (Decimal("0.000000"), False, "claude-opus-5-5")
+
+
+async def test_rows_from_a_deleted_endpoint_are_left_alone(test_user: User) -> None:
+    """Whether a deleted endpoint was priced is no longer knowable."""
+    row_id = await _add_unpriced_row(test_user, model="claude-opus-5-5", endpoint="gone")
+
+    result = await backfill_costs(apply=True)
+
+    assert result.updated == 0
+    assert result.skipped_endpoint == 1
+    assert await _row_state(row_id) == (Decimal("0.000000"), False, "claude-opus-5-5")
+
+
+async def test_rows_from_a_priced_endpoint_are_repriced(test_user: User) -> None:
+    await _add_endpoint("gw-priced", pricing="auto")
+    row_id = await _add_unpriced_row(test_user, model="claude-opus-5-5", endpoint="gw-priced")
+
+    result = await backfill_costs(apply=True)
+
+    assert result.updated == 1
+    cost, priced, _ = await _row_state(row_id)
+    assert cost > Decimal("0")
+    assert priced is True
+
+
+async def test_a_row_whose_model_is_still_unknown_keeps_its_flag(test_user: User) -> None:
+    row_id = await _add_unpriced_row(test_user, model="clawbolt-anthropic:not-a-real-model-99")
+
+    result = await backfill_costs(apply=True)
+
+    assert result.updated == 0
+    assert await _row_state(row_id) == (
+        Decimal("0.000000"),
+        False,
+        "clawbolt-anthropic:not-a-real-model-99",
+    )

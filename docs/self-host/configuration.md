@@ -81,6 +81,34 @@ entirely, so a role pinned to a bare provider cannot keep an endpoint whose
 dialect would then supersede that provider. The same holds for the compaction
 and heartbeat roles.
 
+### Cost tracking behind a gateway
+
+Every LLM call writes a row to `llm_usage_logs` priced by
+[genai-prices](https://github.com/pydantic/genai-prices) from the provider and
+model name. A gateway often names its routes rather than the vendor model, so
+the lookup tries, in order: the name as sent, an alias for it, the part after
+the last `:` (so `clawbolt-anthropic:claude-opus-5-5` prices as
+`claude-opus-5-5` with no configuration), and an alias for that part. The
+stored model name is never rewritten.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LLM_PRICING_ALIASES` | (none) | Comma-separated `name=model` pairs mapping a gateway alias to a model genai-prices knows, e.g. `clawbolt-prod=claude-opus-5`. Only consulted when the name as sent does not price, so it cannot reprice a real model id |
+
+A name that still does not resolve is logged with `cost = 0` and
+`pricing_available = false`, and the log warns once per process naming the
+model. An endpoint with `pricing: unpriced` skips the lookup entirely.
+
+`LLM_PRICING_ALIASES` is read from the environment only. It is not in the
+admin settings store, because it describes the gateway's route table, which
+belongs to the deployment. (For settings that are in the store, an
+environment variable still wins over the stored value at startup.) A
+malformed entry stops the app at startup.
+
+To reprice rows logged before an alias or a genai-prices bump, run
+`scripts/backfill_llm_costs.py` with the same environment. It is a dry run
+unless given `--apply`.
+
 ## Telegram settings
 
 | Variable | Default | Description |
