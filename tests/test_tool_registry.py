@@ -547,10 +547,11 @@ async def test_read_only_is_never_combined_with_a_mutating_tag() -> None:
 
 # Every tool that writes, sends, uploads, or deletes. The complement of
 # ``ToolTags.READ_ONLY``, kept as an explicit roster so a new tool cannot ship
-# unclassified: ``model_comparison.checks.is_mutating_call`` reads "not
-# READ_ONLY" as "this call would mutate a real account", and the comparison
-# report counts it as a write on either side, so an unconsidered default is a
-# wrong answer in one direction or the other.
+# unclassified: ``tools.base.is_mutating_call`` reads "not READ_ONLY" as
+# "this call would mutate a real account". The comparison report counts it as
+# a write on either side, and the cold-start history rebuild keeps its result
+# verbatim, so an unconsidered default is a wrong answer in one direction or
+# the other.
 # Adding a name here is a claim that calling it changes something a user would
 # notice.
 _MUTATING_TOOLS = frozenset(

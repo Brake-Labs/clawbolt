@@ -32,7 +32,7 @@ from backend.app.agent.messages import (
     ToolResultMessage,
     UserMessage,
 )
-from backend.app.agent.tools.base import Tool, ToolTags
+from backend.app.agent.tools.base import Tool, ToolTags, is_mutating_call
 from backend.app.services.model_comparison.types import (
     Finding,
     Issue,
@@ -135,41 +135,6 @@ def _first_error(exc: ValidationError) -> str:
     first = errors[0]
     loc = ".".join(str(part) for part in first.get("loc", ()))
     return f"{loc or '<root>'}: {first.get('msg', 'invalid')}"
-
-
-def is_mutating_call(tool: Tool, args: dict[str, Any]) -> bool:
-    """Whether this call would change something real.
-
-    Untagged means mutating, which is why every read tool carries
-    ``ToolTags.READ_ONLY`` and ``test_every_tool_is_classified_read_or_write``
-    refuses to pass while one does not. A tool nobody classified is treated as
-    the dangerous case, so the cost of forgetting the tag is a false finding an
-    operator can dismiss rather than a real write nobody was shown.
-
-    The approval policy cannot answer this, in either direction.
-    ``ApprovalPolicy`` defaults ``default_level`` to ``ASK``, so most search
-    and list tools are gated too: reading the gate as "mutating" charged a
-    candidate with an unrequested write for running a saved-file search.
-    Reading it the other way is just as wrong, because ``write_file``,
-    ``edit_file``, ``update_heartbeat`` and ``manage_integration`` all write
-    without being gated, and a candidate that rewrote the user's MEMORY.md or
-    disconnected an integration raised nothing at all.
-
-    The tag classifies a whole tool, so a multi-action tool carries
-    ``Tool.read_only_when`` as well: ``manage_integration(action="status")``
-    only lists integrations, and charging it as a write buried the report in
-    findings over lookups. A predicate that raises answers "mutating", the
-    safe direction.
-    """
-    if ToolTags.READ_ONLY in tool.tags:
-        return False
-    if tool.read_only_when is None:
-        return True
-    try:
-        return not tool.read_only_when(args)
-    except Exception:
-        logger.warning("read_only_when for %s raised; treating the call as mutating", tool.name)
-        return True
 
 
 # A property is a record ID when its name says so (``id``, ``work_order_id``,

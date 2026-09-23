@@ -15,12 +15,13 @@ Two things are keyed to epochs, each behind its own setting:
   (``system_prompt.render_workspace_updates``) and folds into the snapshot at
   the next cold start. See :func:`remember_workspace_snapshot`.
 - ``cold_start_compaction_enabled``: the history before the epoch's first
-  message is rebuilt to a budget, once, when the epoch opens. Old tool
-  results become stubs, and only if the prose alone is still over budget are
-  the oldest turns dropped (and compacted into memory, as a trim would). The
-  rebuild is a pure function of the stored rows and their timestamps, so
-  every later turn in the epoch renders the same bytes and the history only
-  grows by appending. See :func:`build_history_view`.
+  message is rebuilt to a budget, once, when the epoch opens. Old results of
+  calls that only read become stubs (a write's result stays, as it may be the
+  only record of an ID), and only if the rest is still over budget are the
+  oldest turns dropped (and compacted into memory, as a trim would). The
+  rebuild is a pure function of the stored rows, their timestamps and the
+  turn's tool schema, so every later turn in the epoch renders the same bytes
+  and the history only grows by appending. See :func:`build_history_view`.
 
 The definition of a cold start lives in one place, :func:`is_cold_gap`, and
 is computed from message timestamps rather than from process state. That is
@@ -34,8 +35,9 @@ import datetime
 import json
 import logging
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 from backend.app.agent.context import (
     _advance_trim_watermark_only,
@@ -51,6 +53,7 @@ from backend.app.agent.messages import (
     UserMessage,
 )
 from backend.app.agent.system_prompt import WorkspaceSnapshot
+from backend.app.agent.tools.base import Tool, is_mutating_call
 from backend.app.config import settings
 from backend.app.enums import MessageDirection
 from backend.app.services.llm_service import breakpoint_ttls
@@ -225,14 +228,31 @@ def elided_result_stub(tool_name: str, chars: int) -> str:
     return f"[tool result elided: {tool_name}, {chars} chars; re-run only if it just reads]"
 
 
+def _is_write(tools_by_name: Mapping[str, Tool], name: str, args: dict[str, Any]) -> bool:
+    """Whether a stored call's result must stay verbatim in a rebuilt history.
+
+    A write's result is often the only place the record it made is named
+    ("created invoice 643"), and a stub would invite the model to guess the
+    ID or repeat the write. A tool missing from this turn's schema, or a
+    result with no call above it, cannot be classified and counts as a write.
+    """
+    tool = tools_by_name.get(name)
+    return tool is None or is_mutating_call(tool, args)
+
+
 def _render(
     pre_groups: list[list[StoredMessage]],
     post: list[StoredMessage],
     tz_name: str,
     verbatim_from: int,
     preceding: Sequence[StoredMessage],
+    tools_by_name: Mapping[str, Tool],
 ) -> tuple[list[AgentMessage], int, int]:
-    """Render the rows, eliding tool results in turns before *verbatim_from*.
+    """Render the rows, eliding read results in turns before *verbatim_from*.
+
+    Only results of calls that just read are elided. A write's result stays
+    verbatim at any age and size, error or not (see :func:`_is_write`), and
+    counts towards the tokens returned, so the budget steps see it.
 
     Rendered in one pass so timestamp markers read the same as they would
     without the rebuild. *preceding* is the rows just before the first one
@@ -252,7 +272,7 @@ def _render(
 
     out: list[AgentMessage] = []
     pre_part: list[AgentMessage] = []
-    tool_names: dict[str, str] = {}
+    calls: dict[str, tuple[str, dict[str, Any]]] = {}
     group: int | None = None
     elided = 0
     for m in rendered:
@@ -260,19 +280,21 @@ def _render(
             group = group_of.get(m.seq)
         if isinstance(m, AssistantMessage):
             for tc in m.tool_calls:
-                tool_names[tc.id] = tc.name
+                calls[tc.id] = (tc.name, tc.arguments)
         if (
             isinstance(m, ToolResultMessage)
             and group is not None
             and group < verbatim_from
             and len(m.content) > _ELIDE_MIN_CHARS
         ):
-            m = ToolResultMessage(
-                tool_call_id=m.tool_call_id,
-                content=elided_result_stub(tool_names.get(m.tool_call_id, "tool"), len(m.content)),
-                is_error=m.is_error,
-            )
-            elided += 1
+            name, args = calls.get(m.tool_call_id, (None, {}))
+            if name is not None and not _is_write(tools_by_name, name, args):
+                m = ToolResultMessage(
+                    tool_call_id=m.tool_call_id,
+                    content=elided_result_stub(name, len(m.content)),
+                    is_error=m.is_error,
+                )
+                elided += 1
         out.append(m)
         if group is not None:
             pre_part.append(m)
@@ -285,6 +307,7 @@ def build_history_view(
     tz_name: str,
     *,
     compact: bool,
+    tools_by_name: Mapping[str, Tool],
     preceding: Sequence[StoredMessage] = (),
 ) -> HistoryView:
     """Render the history for the turn answering *current*.
@@ -294,19 +317,25 @@ def build_history_view(
     only seed the timestamp markers, so the first row renders the same bytes
     whether it is mid-history or the first row after the trim watermark.
 
+    *tools_by_name* is the turn's tool schema, read only to tell a call that
+    reads from one that writes (``tools.base.is_mutating_call``).
+
     With *compact* False this is the plain rendering, and only the epoch is
     worked out. With it True the history the epoch inherited is rebuilt:
 
-    1. Tool results from turns older than the last
+    1. Results of read calls from turns older than the last
        ``cold_start_verbatim_turns`` become stubs. Each stub keeps its
-       ``tool_use_id``, so every ``tool_use`` still has its result.
+       ``tool_use_id``, so every ``tool_use`` still has its result. Write
+       results are never stubbed: they may be the only record of an ID.
     2. While the rebuilt history is over ``cold_start_history_budget_tokens``,
-       the verbatim window shrinks, one turn at a time, to nothing. Tool
-       results can be fetched again; prose cannot.
+       the verbatim window shrinks, one turn at a time, to nothing. Read
+       results can be fetched again; prose and write results cannot.
     3. While it is still over budget, or holds more than
        ``context_trim_target_turns`` turns, the oldest turns are dropped
        whole until it is at ``_DROP_TO_FRACTION`` of the budget. The caller
-       compacts them into memory.
+       compacts them into memory, write results included. Kept write results
+       count towards the budget, so they are what drives the drop when they
+       alone exceed it.
 
     Rows appended during the epoch are never touched, and the rebuild reads
     nothing but the rows, so it renders the same bytes on every turn of the
@@ -340,7 +369,12 @@ def build_history_view(
         verbatim = min(settings.cold_start_verbatim_turns, len(kept))
         while True:
             messages, tokens, elided = _render(
-                kept, post, tz_name, verbatim_from=len(kept) - verbatim, preceding=before(first)
+                kept,
+                post,
+                tz_name,
+                verbatim_from=len(kept) - verbatim,
+                preceding=before(first),
+                tools_by_name=tools_by_name,
             )
             if tokens <= budget or verbatim == 0:
                 return messages, tokens, elided
@@ -349,9 +383,10 @@ def build_history_view(
     start = 0
     messages, tokens, elided = fit_verbatim(0)
     if tokens > budget or len(groups) > max_turns:
-        # Step 3. Everything is already a stub here, so drop from the front
-        # with no verbatim window, re-rendering after each drop so the check
-        # reads the bytes that will be sent. Always keep the newest turn.
+        # Step 3. Every read result is already a stub here (write results
+        # never are), so drop from the front with no verbatim window,
+        # re-rendering after each drop so the check reads the bytes that
+        # will be sent. Always keep the newest turn.
         drop_to = int(budget * _DROP_TO_FRACTION)
         while start < len(groups) - 1 and (tokens > drop_to or len(groups) - start > max_turns):
             start += 1
@@ -361,6 +396,7 @@ def build_history_view(
                 tz_name,
                 verbatim_from=len(groups),
                 preceding=before(start),
+                tools_by_name=tools_by_name,
             )
         # Then widen the verbatim window again as far as the budget allows.
         # This is the same computation the next turn runs on the rows that
@@ -380,9 +416,17 @@ class EpochHistoryRenderer:
     stays where it is and only the rendering changes.
     """
 
-    def __init__(self, user_id: str, *, compact: bool) -> None:
+    def __init__(
+        self, user_id: str, *, compact: bool, tools_by_name: Mapping[str, Tool] | None = None
+    ) -> None:
+        # The rebuild needs the turn's tools to tell reads from writes. Without
+        # them every call would count as a write and nothing would be elided,
+        # so a compacting renderer must be given them.
+        if compact and tools_by_name is None:
+            raise ValueError("a compacting EpochHistoryRenderer needs the turn's tools_by_name")
         self._user_id = user_id
         self._compact = compact
+        self._tools_by_name: Mapping[str, Tool] = tools_by_name or {}
         self.epoch: PromptEpoch | None = None
 
     async def __call__(
@@ -393,7 +437,12 @@ class EpochHistoryRenderer:
         preceding: Sequence[StoredMessage] = (),
     ) -> list[AgentMessage]:
         view = build_history_view(
-            rows, current, tz_name, compact=self._compact, preceding=preceding
+            rows,
+            current,
+            tz_name,
+            compact=self._compact,
+            tools_by_name=self._tools_by_name,
+            preceding=preceding,
         )
         self.epoch = view.epoch
         if self._compact and view.epoch.cold_start:
