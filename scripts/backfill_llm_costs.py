@@ -147,6 +147,7 @@ async def backfill_costs(
                     provider=row.provider,
                     cache_creation_input_tokens=row.cache_creation_input_tokens,
                     cache_read_input_tokens=row.cache_read_input_tokens,
+                    cache_creation_1h_input_tokens=row.cache_creation_1h_input_tokens,
                 )
                 if new_cost <= 0:
                     continue
