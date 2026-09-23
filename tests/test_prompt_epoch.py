@@ -408,8 +408,7 @@ async def test_system_block_is_byte_identical_within_an_epoch(
     current_turn = messages[-1]["content"]
     assert "## Workspace Updates" in current_turn
     assert "MEMORY.md changed" in current_turn
-    assert "Removed:\n- - Customer prefers mornings" in current_turn
-    assert "Added:\n+ - Customer prefers afternoons" in current_turn
+    assert "\n-- Customer prefers mornings\n+- Customer prefers afternoons\n" in current_turn
     # Only the change rides the turn, not the unchanged facts.
     assert "Fact number 5" not in current_turn
 
@@ -422,6 +421,23 @@ def test_a_change_larger_than_the_file_sends_the_file() -> None:
         updates == 'MEMORY.md changed after "Your Memory" above was captured. It now reads:\n- two'
     )
     assert render_workspace_updates(old, old) == ""
+
+
+def test_a_repeated_line_is_placed_by_its_context() -> None:
+    """The edit names which customer paid, not just that a "paid" line changed."""
+    customers = [f"Test Customer {c}" for c in "ABCDEFGH"]
+    old_memory = "\n".join(
+        f"## {name}\n- deposit paid: no\n- notes: " + "x" * 60 for name in customers
+    )
+    new_memory = old_memory.replace(
+        "## Test Customer C\n- deposit paid: no", "## Test Customer C\n- deposit paid: yes"
+    )
+    updates = render_workspace_updates(
+        WorkspaceSnapshot(soul="", user="", memory=old_memory),
+        WorkspaceSnapshot(soul="", user="", memory=new_memory),
+    )
+    assert "It now reads" not in updates
+    assert " ## Test Customer C\n-- deposit paid: no\n+- deposit paid: yes" in updates
 
 
 @patch("backend.app.agent.core.amessages")

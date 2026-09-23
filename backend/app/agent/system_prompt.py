@@ -254,27 +254,29 @@ async def capture_workspace(user: User) -> WorkspaceSnapshot:
     )
 
 
+_DELTA_CONTEXT_LINES = 2
+
+
 def _describe_change(heading: str, filename: str, old: str, new: str) -> str:
     """Tell the model how *filename* differs from its copy under *heading*.
 
-    Lists the removed and added lines, or the whole current file when that
-    is shorter than the change list.
+    A unified diff with the unchanged lines around each change, or the whole
+    current file when that is shorter. The context is what places an edit:
+    a bare "- paid: no" then "+ paid: yes" cannot say which customer it was.
     """
-    old_lines, new_lines = old.splitlines(), new.splitlines()
-    removed: list[str] = []
-    added: list[str] = []
-    matcher = difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False)
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag in ("replace", "delete"):
-            removed.extend(old_lines[i1:i2])
-        if tag in ("replace", "insert"):
-            added.extend(new_lines[j1:j2])
-    parts = [f'{filename} changed after "{heading}" above was captured. Apply these edits to it:']
-    if removed:
-        parts.append("Removed:\n" + "\n".join(f"- {line}" for line in removed))
-    if added:
-        parts.append("Added:\n" + "\n".join(f"+ {line}" for line in added))
-    delta = "\n".join(parts)
+    lines = list(
+        difflib.unified_diff(
+            old.splitlines(), new.splitlines(), n=_DELTA_CONTEXT_LINES, lineterm=""
+        )
+    )
+    # Drop the ---/+++ file header (always the first two lines); the sentence
+    # below names the file. Filtering by prefix would also drop a removed
+    # Markdown rule ("---" becomes "----").
+    body = "\n".join(lines[2:])
+    delta = (
+        f'{filename} changed after "{heading}" above was captured. Apply this'
+        ' diff to it ("-" removed, "+" added, " " unchanged context):\n' + body
+    )
     if len(delta) < len(new):
         return delta
     return f'{filename} changed after "{heading}" above was captured. It now reads:\n{new}'

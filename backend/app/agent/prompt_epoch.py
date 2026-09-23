@@ -212,7 +212,10 @@ def _group_turns(rows: list[StoredMessage]) -> list[list[StoredMessage]]:
 
 def elided_result_stub(tool_name: str, chars: int) -> str:
     """What an old tool result is replaced with in a rebuilt history."""
-    return f"[tool result elided: {tool_name}, {chars} chars; re-run the tool if needed]"
+    # Not "re-run the tool": the call above the stub may have been a write
+    # (created an event, sent an email), and repeating it would repeat the
+    # action. Only a lookup is safe to redo.
+    return f"[tool result elided: {tool_name}, {chars} chars; re-run only if it just reads]"
 
 
 def _render(
