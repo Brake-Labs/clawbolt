@@ -76,6 +76,11 @@ class ComparisonRun(Base):
     candidate_provider: Mapped[str] = mapped_column(String(64), default="")
     candidate_model: Mapped[str] = mapped_column(String(128), default="")
     candidate_reasoning_effort: Mapped[str] = mapped_column(String(16), default="")
+    # How each turn's history was rendered (``types.HistoryMode``). Frozen
+    # at creation for the same reason as the effort: the setting it defaults
+    # from can change, and a run whose history shape is unknown cannot be
+    # read against another.
+    history_mode: Mapped[str] = mapped_column(String(32), default="full", server_default="full")
 
     requested_samples: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(32), default="pending", index=True)

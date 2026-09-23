@@ -3953,6 +3953,11 @@ export interface components {
              * @default 50
              */
             sample_count: number;
+            /**
+             * History Mode
+             * @default
+             */
+            history_mode: ("full" | "cold_start_compaction") | "";
         };
         /**
          * ComparisonRunItem
@@ -3981,6 +3986,8 @@ export interface components {
             candidate_model: string;
             /** Candidate Reasoning Effort */
             candidate_reasoning_effort: string;
+            /** History Mode */
+            history_mode: string;
             /** Requested Samples */
             requested_samples: number;
             /** Status */

@@ -7323,6 +7323,23 @@
             "minimum": 1.0,
             "title": "Sample Count",
             "default": 50
+          },
+          "history_mode": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "full",
+                  "cold_start_compaction"
+                ]
+              },
+              {
+                "type": "string",
+                "const": ""
+              }
+            ],
+            "title": "History Mode",
+            "default": ""
           }
         },
         "type": "object",
@@ -7377,6 +7394,10 @@
           "candidate_reasoning_effort": {
             "type": "string",
             "title": "Candidate Reasoning Effort"
+          },
+          "history_mode": {
+            "type": "string",
+            "title": "History Mode"
           },
           "requested_samples": {
             "type": "integer",
@@ -7448,6 +7469,7 @@
           "candidate_provider",
           "candidate_model",
           "candidate_reasoning_effort",
+          "history_mode",
           "requested_samples",
           "status",
           "progress_completed",

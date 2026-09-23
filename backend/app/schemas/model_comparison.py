@@ -20,6 +20,10 @@ from pydantic import BaseModel, Field
 
 from backend.app.schemas.common import ReasoningEffort
 
+# ``services.model_comparison.types.HistoryMode``, spelled out so the exported
+# spec carries the values.
+HistoryModeName = Literal["full", "cold_start_compaction"]
+
 
 class ComparisonRunCreate(BaseModel):
     """Request to replay a user's recent turns through a candidate model.
@@ -38,6 +42,10 @@ class ComparisonRunCreate(BaseModel):
     # measured.
     candidate_reasoning_effort: ReasoningEffort | Literal[""] = ""
     sample_count: int = Field(default=50, ge=1)
+    # How each turn's history is rendered. Empty means whatever the live loop
+    # does today (``cold_start_compaction_enabled``), frozen at creation.
+    # Replay the same turns once each way to read what the rebuild changes.
+    history_mode: HistoryModeName | Literal[""] = ""
 
 
 class ComparisonModelTotals(BaseModel):
@@ -177,6 +185,7 @@ class ComparisonRunItem(BaseModel):
     candidate_provider: str
     candidate_model: str
     candidate_reasoning_effort: str
+    history_mode: str
     requested_samples: int
     status: str
     progress_completed: int

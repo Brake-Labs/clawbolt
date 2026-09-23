@@ -122,7 +122,35 @@ describe('ModelComparisonTab', () => {
         // freezes onto the run rather than reading per call.
         candidateReasoningEffort: '',
         sampleCount: 65,
+        // Empty follows the live loop's history setting, resolved the same way.
+        historyMode: '',
       }),
+    );
+  });
+
+  it('replays with the history mode the operator picks', async () => {
+    // Replaying the same turns once each way is how the cold-start rebuild
+    // is read, so the form must send the choice through.
+    const api = await import('../admin-api');
+    vi.mocked(api.startComparisonRun).mockResolvedValue(run({ status: 'pending' }));
+    renderTab();
+
+    await screen.findByRole('option', { name: 'consenting@example.com' });
+    await userEvent.selectOptions(screen.getByRole('combobox', { name: 'User' }), 'user-1');
+    await userEvent.type(screen.getByLabelText('provider'), 'anthropic');
+    await userEvent.type(screen.getByLabelText('model'), 'candidate');
+    await userEvent.selectOptions(
+      screen.getByRole('combobox', { name: 'History' }),
+      'cold_start_compaction',
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: 'Run comparison' }));
+
+    await waitFor(() =>
+      expect(api.startComparisonRun).toHaveBeenCalledWith(
+        'user-1',
+        expect.objectContaining({ historyMode: 'cold_start_compaction' }),
+      ),
     );
   });
 

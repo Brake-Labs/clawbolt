@@ -49,6 +49,8 @@ from backend.app.agent.system_prompt import WorkspaceSnapshot, render_workspace_
 from backend.app.agent.tools.base import Tool, ToolResult
 from backend.app.config import settings
 from backend.app.models import User
+from backend.app.services.model_comparison.sampling import ReplayFixture, assemble_for_sample
+from backend.app.services.model_comparison.types import HistoryMode, ReplaySample
 from tests.conftest import create_test_session
 from tests.mocks.llm import extract_system_text, make_text_response, make_tool_call_response
 
@@ -487,3 +489,30 @@ async def test_both_settings_off_keep_the_old_layout(
     assert "## Tool Guidelines" in current_turn
     assert "A fact" not in system
     assert "Tool Guidelines" not in system
+
+
+# -- the comparison harness ---------------------------------------------------
+
+
+async def test_harness_replays_with_and_without_the_rebuild(
+    test_user: User, one_hour_cache: None
+) -> None:
+    t = _long_history(8)
+    current = t.ask(600, "back after lunch")
+    fixture = ReplayFixture(user=test_user, rows=t.rows)
+    sample = ReplaySample(
+        seq=current.seq, timestamp=current.timestamp, message_context=current.body
+    )
+
+    full = await assemble_for_sample(fixture, sample, HistoryMode.FULL)
+    compacted = await assemble_for_sample(fixture, sample, HistoryMode.COLD_START_COMPACTION)
+
+    def results(messages: list[AgentMessage]) -> list[str]:
+        return [m.content for m in messages if isinstance(m, ToolResultMessage)]
+
+    assert all(r in (BIG, "short result") for r in results(full.messages))
+    assert any(r.startswith("[tool result elided") for r in results(compacted.messages))
+    _assert_pairs_intact(compacted.messages)
+    # Same system block and same current turn: only the history differs.
+    assert full.stable_system == compacted.stable_system
+    assert full.messages[-1] == compacted.messages[-1]
