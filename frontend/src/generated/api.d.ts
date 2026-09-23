@@ -3871,9 +3871,45 @@ export interface components {
             /** Cost Unavailable Reason */
             cost_unavailable_reason: string;
             /** Latency P50 Ms */
-            latency_p50_ms: number;
+            latency_p50_ms: number | null;
             /** Latency P95 Ms */
-            latency_p95_ms: number;
+            latency_p95_ms: number | null;
+        };
+        /**
+         * ComparisonProductionUsage
+         * @description What the user's live loop billed over the window the run sampled.
+         *
+         *     The other half of the cost tile. Not a like-for-like total: the window is
+         *     the sampled turns' own timestamps, so it covers every call the live agent
+         *     made inside it, while the candidate's figure counts one decision per
+         *     turn. The console labels it as the user's spend over the same days rather
+         *     than as what the replay would have cost.
+         *
+         *     ``calls`` is 0 when there is nothing to show (no usage rows in the
+         *     window, no parseable sample timestamps, or the read failed), which the
+         *     console renders as unavailable.
+         */
+        ComparisonProductionUsage: {
+            /** Calls */
+            calls: number;
+            /** Input Tokens */
+            input_tokens: number;
+            /** Output Tokens */
+            output_tokens: number;
+            /** Cache Read Tokens */
+            cache_read_tokens: number;
+            /** Cache Creation Tokens */
+            cache_creation_tokens: number;
+            /** Billed Prompt Tokens */
+            billed_prompt_tokens: number;
+            /** Total Cost Usd */
+            total_cost_usd: string | null;
+            /** Unpriced Calls */
+            unpriced_calls: number;
+            /** Window Start */
+            window_start: string;
+            /** Window End */
+            window_end: string;
         };
         /**
          * ComparisonReportResponse
@@ -4036,13 +4072,20 @@ export interface components {
             writes_total: number;
             /** Writes Matched */
             writes_matched: number;
+            /** Writes Same Record */
+            writes_same_record: number;
             /** Writes Args Differ */
             writes_args_differ: number;
             /** Writes Missed */
             writes_missed: number;
+            /** Writes Not Reached */
+            writes_not_reached: number;
+            /** Writes Measured */
+            writes_measured: number;
             /** Write Match Rate */
             write_match_rate: number;
             candidate: components["schemas"]["ComparisonModelTotals"];
+            production: components["schemas"]["ComparisonProductionUsage"];
             /** Notes */
             notes: string[];
         };
@@ -4118,6 +4161,12 @@ export interface components {
             candidate_arguments: {
                 [key: string]: unknown;
             } | null;
+            /** Record Ids */
+            record_ids: {
+                [key: string]: string[];
+            };
+            /** Differing Arguments */
+            differing_arguments: string[];
         };
         /**
          * DataSharingConsentRequest

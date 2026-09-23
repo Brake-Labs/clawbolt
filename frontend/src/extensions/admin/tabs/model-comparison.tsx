@@ -49,9 +49,9 @@ const RUN_PAGE_SIZE = 25;
 
 /** A settled run's headline numbers, or *empty* while it has none.
  *
- * Two numbers and no verdict, which is the whole point: hard safety
- * violations on each side, and how many of production's writes the candidate
- * reached. A reader who wants more opens the report.
+ * Hard safety violations on each side, and how many of production's writes
+ * the candidate reached identically. A reader who wants more opens the
+ * report.
  */
 function RunHeadline({ run }: { run: ComparisonRun }) {
   const summary = run.summary;
@@ -63,8 +63,15 @@ function RunHeadline({ run }: { run: ComparisonRun }) {
       </span>
       {' / '}
       {summary.production_violations} violations
-      {summary.writes_total > 0
-        ? ` | ${summary.writes_matched}/${summary.writes_total} writes`
+      {/* Over ``writes_measured``, not ``writes_total``: a write on a turn
+          whose replay ran out of lookup rounds was never put to the
+          candidate, and counting it in the denominator here would report a
+          measurement failure as a lower score. */}
+      {summary.writes_measured > 0
+        ? ` | ${summary.writes_matched}/${summary.writes_measured} writes`
+        : ''}
+      {summary.outcome_counts.no_candidate_output
+        ? ` | ${summary.outcome_counts.no_candidate_output} silent`
         : ''}
     </span>
   );

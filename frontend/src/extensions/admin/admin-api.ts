@@ -1275,9 +1275,7 @@ export async function diagnoseEmailDelivery(): Promise<EmailDiagnostics> {
 // their real conversations and the report renders them back. Content is
 // PII-redacted server-side.
 //
-// There is no verdict on the wire, and adding one back is the change this
-// rewrite exists to prevent. The console shows counts and the turns
-// themselves.
+// There is no verdict on the wire: counts and the turns themselves.
 
 export type ComparisonRunStatus =
   | 'pending'
@@ -1287,11 +1285,19 @@ export type ComparisonRunStatus =
   | 'interrupted'
   | 'cancelled';
 
-/** How a turn's candidate decision reads against the writes production made. */
+/** How a turn's candidate decision reads against the writes production made.
+ *
+ * ``no_candidate_output`` and ``replay_incomplete`` are the two that are not
+ * about the writes: the candidate said nothing at all, and the replay ran out
+ * of lookup rounds before the candidate decided.
+ */
 export type TurnOutcome =
   | 'not_replayed'
+  | 'no_candidate_output'
+  | 'replay_incomplete'
   | 'no_write'
   | 'write_matched'
+  | 'write_same_record'
   | 'write_args_differ'
   | 'write_missed';
 

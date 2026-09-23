@@ -7145,11 +7145,25 @@
             "title": "Cost Unavailable Reason"
           },
           "latency_p50_ms": {
-            "type": "number",
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Latency P50 Ms"
           },
           "latency_p95_ms": {
-            "type": "number",
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Latency P95 Ms"
           }
         },
@@ -7169,6 +7183,72 @@
         ],
         "title": "ComparisonModelTotals",
         "description": "Token, cost, and latency totals for the candidate across a run."
+      },
+      "ComparisonProductionUsage": {
+        "properties": {
+          "calls": {
+            "type": "integer",
+            "title": "Calls"
+          },
+          "input_tokens": {
+            "type": "integer",
+            "title": "Input Tokens"
+          },
+          "output_tokens": {
+            "type": "integer",
+            "title": "Output Tokens"
+          },
+          "cache_read_tokens": {
+            "type": "integer",
+            "title": "Cache Read Tokens"
+          },
+          "cache_creation_tokens": {
+            "type": "integer",
+            "title": "Cache Creation Tokens"
+          },
+          "billed_prompt_tokens": {
+            "type": "integer",
+            "title": "Billed Prompt Tokens"
+          },
+          "total_cost_usd": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Cost Usd"
+          },
+          "unpriced_calls": {
+            "type": "integer",
+            "title": "Unpriced Calls"
+          },
+          "window_start": {
+            "type": "string",
+            "title": "Window Start"
+          },
+          "window_end": {
+            "type": "string",
+            "title": "Window End"
+          }
+        },
+        "type": "object",
+        "required": [
+          "calls",
+          "input_tokens",
+          "output_tokens",
+          "cache_read_tokens",
+          "cache_creation_tokens",
+          "billed_prompt_tokens",
+          "total_cost_usd",
+          "unpriced_calls",
+          "window_start",
+          "window_end"
+        ],
+        "title": "ComparisonProductionUsage",
+        "description": "What the user's live loop billed over the window the run sampled.\n\nThe other half of the cost tile. Not a like-for-like total: the window is\nthe sampled turns' own timestamps, so it covers every call the live agent\nmade inside it, while the candidate's figure counts one decision per\nturn. The console labels it as the user's spend over the same days rather\nthan as what the replay would have cost.\n\n``calls`` is 0 when there is nothing to show (no usage rows in the\nwindow, no parseable sample timestamps, or the read failed), which the\nconsole renders as unavailable."
       },
       "ComparisonReportResponse": {
         "properties": {
@@ -7500,6 +7580,10 @@
             "type": "integer",
             "title": "Writes Matched"
           },
+          "writes_same_record": {
+            "type": "integer",
+            "title": "Writes Same Record"
+          },
           "writes_args_differ": {
             "type": "integer",
             "title": "Writes Args Differ"
@@ -7508,12 +7592,23 @@
             "type": "integer",
             "title": "Writes Missed"
           },
+          "writes_not_reached": {
+            "type": "integer",
+            "title": "Writes Not Reached"
+          },
+          "writes_measured": {
+            "type": "integer",
+            "title": "Writes Measured"
+          },
           "write_match_rate": {
             "type": "number",
             "title": "Write Match Rate"
           },
           "candidate": {
             "$ref": "#/components/schemas/ComparisonModelTotals"
+          },
+          "production": {
+            "$ref": "#/components/schemas/ComparisonProductionUsage"
           },
           "notes": {
             "items": {
@@ -7536,10 +7631,14 @@
           "production_checked_findings",
           "writes_total",
           "writes_matched",
+          "writes_same_record",
           "writes_args_differ",
           "writes_missed",
+          "writes_not_reached",
+          "writes_measured",
           "write_match_rate",
           "candidate",
+          "production",
           "notes"
         ],
         "title": "ComparisonSummary",
@@ -7714,6 +7813,23 @@
               }
             ],
             "title": "Candidate Arguments"
+          },
+          "record_ids": {
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "type": "object",
+            "title": "Record Ids"
+          },
+          "differing_arguments": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Differing Arguments"
           }
         },
         "type": "object",
@@ -7721,7 +7837,9 @@
           "tool_name",
           "outcome",
           "key_arguments",
-          "candidate_arguments"
+          "candidate_arguments",
+          "record_ids",
+          "differing_arguments"
         ],
         "title": "ComparisonWrite",
         "description": "One write the live turn made, and what the candidate did about it."

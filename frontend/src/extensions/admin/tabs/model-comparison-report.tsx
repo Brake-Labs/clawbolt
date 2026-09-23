@@ -5,7 +5,6 @@ import {
   deleteComparisonRun,
   getComparisonProgress,
   getComparisonReport,
-  type ComparisonModelTotals,
   type ComparisonReport,
   type ComparisonSummary,
   type ComparisonToolCall,
@@ -22,6 +21,7 @@ import {
   OUTCOME_COPY,
   POLL_MS,
   pct,
+  WRITE_OUTCOME_COPY,
 } from './model-comparison-common';
 
 // One comparison run's report, at its own URL under the run's public id.
@@ -32,9 +32,9 @@ import {
 //
 // Three things drive the layout:
 //
-// - There is no verdict, and the page must not read as one. The top of the
-//   page is two counts and a write-match rate, none of which is a threshold
-//   anything was compared against.
+// - The page must not read as a verdict. The top of it is a handful of
+//   counts and a write-match rate, none of which is a threshold anything was
+//   compared against.
 // - Safety findings are shown per side. The candidate's count means nothing
 //   without production's beside it, and three of the checks cannot be asked
 //   of the record at all, which the page says rather than printing a zero.
@@ -66,9 +66,28 @@ function describeCandidate(endpoint: string, model: string, effort: string): str
  * ``total_cost_usd`` is null rather than "0.000000" whenever nothing can
  * price the tokens, so this never has to decide whether a zero is real.
  */
-function money(totals: ComparisonModelTotals): string {
+function money(totals: { total_cost_usd: string | null }): string {
   if (totals.total_cost_usd == null) return 'not available';
   return `$${Number(totals.total_cost_usd).toFixed(4)}`;
+}
+
+/** What the user's live loop billed over the same days, for the cost tile.
+ *
+ * Not a like-for-like figure and the hint says so: the window covers every
+ * call the live agent made inside it, including tool rounds the replay never
+ * reached, while the candidate's number counts one decision per turn. It is
+ * here because a candidate cost with nothing beside it reads as what the
+ * deployment would pay, and that comparison was never on the page.
+ */
+function productionCostHint(production: ComparisonSummary['production']): string {
+  if (production.calls === 0) return 'No production usage recorded for this window';
+  const spend = money(production);
+  const partial = production.unpriced_calls
+    ? `, ${production.unpriced_calls} of them unpriced`
+    : '';
+  return `Production billed ${spend} over ${production.calls.toLocaleString()} call${
+    production.calls === 1 ? '' : 's'
+  } in the same window${partial}`;
 }
 
 function Stat({ label, value, hint }: { label: string; value: string; hint?: string }) {
@@ -145,6 +164,8 @@ function ViolationPanel({ summary }: { summary: ComparisonSummary }) {
 
 function SummaryGrid({ summary }: { summary: ComparisonSummary }) {
   const totals = summary.candidate;
+  const silent = summary.outcome_counts.no_candidate_output ?? 0;
+  const incomplete = summary.outcome_counts.replay_incomplete ?? 0;
   return (
     <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
       <Stat
@@ -152,17 +173,32 @@ function SummaryGrid({ summary }: { summary: ComparisonSummary }) {
         value={String(summary.candidate_violations)}
         hint={`Production ${summary.production_violations} on the checks that apply to it`}
       />
+      {/* Its own tile rather than a line in the writes hint. A turn the
+          candidate answered with nothing passes every safety check by having
+          nothing to check, so the violation count beside it is a zero that
+          means the opposite of what it looks like. */}
+      <Stat
+        label="Answered with nothing"
+        value={String(silent)}
+        hint={
+          silent
+            ? 'Turns production answered and the candidate returned no text and no tool call'
+            : 'The candidate answered every turn production answered'
+        }
+      />
       <Stat
         label="Writes reached"
         value={
-          summary.writes_total
-            ? `${summary.writes_matched}/${summary.writes_total}`
+          summary.writes_measured
+            ? `${summary.writes_matched}/${summary.writes_measured}`
             : 'no write turns'
         }
         hint={
-          summary.writes_total
-            ? `${pct(summary.write_match_rate)} matched, ${summary.writes_args_differ} same tool with different arguments, ${summary.writes_missed} not made`
-            : 'The live turns in this sample wrote nothing'
+          summary.writes_measured
+            ? `${pct(summary.write_match_rate)} matched on every argument, ${summary.writes_same_record} same record with different arguments, ${summary.writes_args_differ} same tool only, ${summary.writes_missed} not made`
+            : summary.writes_total
+              ? `${summary.writes_total} write(s), none measured: every replay ran out of lookup rounds`
+              : 'The live turns in this sample wrote nothing'
         }
       />
       <Stat
@@ -171,7 +207,7 @@ function SummaryGrid({ summary }: { summary: ComparisonSummary }) {
         hint={
           totals.total_cost_usd == null
             ? 'See the note below'
-            : `${totals.billed_prompt_tokens.toLocaleString()} prompt tokens billed`
+            : productionCostHint(summary.production)
         }
       />
       <Stat
@@ -182,22 +218,21 @@ function SummaryGrid({ summary }: { summary: ComparisonSummary }) {
       <Stat
         label="Turns replayed"
         value={String(summary.turns_replayed)}
-        hint={`of ${summary.turns_total} sampled`}
+        hint={`of ${summary.turns_total} attempted`}
       />
       <Stat
         label="Turns that failed"
         value={String(summary.turns_failed)}
-        hint="The provider did not answer"
+        hint={
+          incomplete
+            ? `The provider did not answer. ${incomplete} more ran out of lookup rounds`
+            : 'The provider did not answer'
+        }
       />
       <Stat
-        label="Output tokens"
-        value={totals.output_tokens.toLocaleString()}
-        hint={`${totals.input_tokens.toLocaleString()} uncached prompt tokens`}
-      />
-      <Stat
-        label="Prompt cache writes"
-        value={totals.cache_creation_tokens.toLocaleString()}
-        hint={`${totals.cache_read_tokens.toLocaleString()} read back`}
+        label="Candidate prompt tokens"
+        value={totals.billed_prompt_tokens.toLocaleString()}
+        hint={`${totals.output_tokens.toLocaleString()} output, ${totals.cache_read_tokens.toLocaleString()} read from cache`}
       />
     </div>
   );
@@ -236,9 +271,15 @@ function TurnCard({ turn }: { turn: ComparisonTurn }) {
   const outcome = OUTCOME_COPY[turn.outcome as TurnOutcome];
   // Expand what an operator is here for. A retired tool name alone is not
   // worth opening a diff for, and auto-expanding those buried the turns that
-  // were.
+  // were. ``no_candidate_output`` is here because it is the one outcome with
+  // no benign reading, and it would otherwise be the emptiest card on the
+  // page and read as the least interesting.
   const [open, setOpen] = useState(
-    violations.length > 0 || turn.outcome === 'write_missed' || turn.outcome === 'write_args_differ',
+    violations.length > 0 ||
+      turn.outcome === 'no_candidate_output' ||
+      turn.outcome === 'write_missed' ||
+      turn.outcome === 'write_args_differ' ||
+      turn.outcome === 'write_same_record',
   );
   return (
     <div className="rounded-[--radius-md] border border-border bg-card">
@@ -322,17 +363,28 @@ function TurnCard({ turn }: { turn: ComparisonTurn }) {
                   className="break-all rounded-[--radius-sm] bg-panel px-2 py-1 font-mono text-muted-foreground"
                 >
                   <span className="font-semibold text-foreground">{write.tool_name}</span>{' '}
-                  {OUTCOME_COPY[
-                    (write.outcome === 'matched'
-                      ? 'write_matched'
-                      : write.outcome === 'same_tool_different_args'
-                        ? 'write_args_differ'
-                        : 'write_missed') as TurnOutcome
-                  ]?.label ?? write.outcome}
-                  {' | compared on '}
+                  {WRITE_OUTCOME_COPY[write.outcome] ?? write.outcome}
+                  {/* What differed, named. Without this the reader has to
+                      diff two JSON blobs to find the one field that moved,
+                      which is the whole difference between a paraphrase and
+                      a tenfold amount error. */}
+                  {write.differing_arguments.length > 0 ? (
+                    <>
+                      {' | differs on '}
+                      <span className="text-warning-text">
+                        {write.differing_arguments.join(', ')}
+                      </span>
+                    </>
+                  ) : null}
+                  {Object.keys(write.record_ids).length > 0
+                    ? ` | record ${Object.entries(write.record_ids)
+                        .map(([path, values]) => `${path}=${values.join('/')}`)
+                        .join(' ')}`
+                    : ''}
+                  {' | production sent '}
                   {JSON.stringify(write.key_arguments)}
                   {write.candidate_arguments
-                    ? ` | candidate passed ${JSON.stringify(write.candidate_arguments)}`
+                    ? ` | candidate sent ${JSON.stringify(write.candidate_arguments)}`
                     : ''}
                 </li>
               ))}
@@ -386,6 +438,11 @@ function TurnCard({ turn }: { turn: ComparisonTurn }) {
                     <p className="whitespace-pre-wrap text-sm text-foreground">
                       {turn.candidate_text}
                     </p>
+                  ) : turn.outcome === 'no_candidate_output' ? (
+                    // Said outright. An empty column beside a production
+                    // reply reads as a rendering gap, not as the model
+                    // returning nothing.
+                    <p className="text-sm text-error-text">Returned no text and no tool call.</p>
                   ) : null}
                 </>
               )}
