@@ -6,9 +6,11 @@ from typing import Any
 from PIL import Image
 
 from backend.app.agent.llm_parsing import get_response_text
+from backend.app.agent.observer import PURPOSE_VISION
 from backend.app.config import settings
 from backend.app.services.llm_endpoints import resolve_target, role_selection
 from backend.app.services.llm_service import amessages_streamed, prepare_system_with_caching
+from backend.app.services.llm_usage import log_llm_usage
 
 logger = logging.getLogger(__name__)
 
@@ -105,8 +107,18 @@ def _build_vision_content(
     return blocks
 
 
-async def analyze_image(image_bytes: bytes, mime_type: str, context: str = "") -> str:
-    """Send an image to a vision LLM and get a text description."""
+async def analyze_image(
+    image_bytes: bytes,
+    mime_type: str,
+    context: str = "",
+    user_id: str | None = None,
+) -> str:
+    """Send an image to a vision LLM and get a text description.
+
+    With *user_id*, the call's usage is written to ``llm_usage_logs`` under
+    ``PURPOSE_VISION``, the same way the agent loop logs its own rounds. A
+    failed usage write is logged and swallowed, never raised.
+    """
     logger.info(
         "Sending image to vision LLM: mime_type=%s, size=%d bytes", mime_type, len(image_bytes)
     )
@@ -143,4 +155,14 @@ async def analyze_image(image_bytes: bytes, mime_type: str, context: str = "") -
         **target.reasoning_kwargs("none"),
     )
     logger.debug("Vision LLM response received for mime_type=%s", mime_type)
+    if user_id:
+        await log_llm_usage(
+            user_id,
+            target.model,
+            response,
+            PURPOSE_VISION,
+            provider=target.provider,
+            endpoint=target.endpoint,
+            priced=target.priced,
+        )
     return get_response_text(response)

@@ -882,7 +882,7 @@ async def process_inbound_from_bus(
                 user.id,
                 inbound.text[:100],
             )
-            decision = await classify_approval_response(inbound.text)
+            decision = await classify_approval_response(inbound.text, user_id=user.id)
 
         if decision == AMBIGUOUS_APPROVAL_REPLY:
             # Short filler ("lol", "huh", "ok wait") is neither a yes/no nor a

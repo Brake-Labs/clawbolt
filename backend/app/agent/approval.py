@@ -32,11 +32,13 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from backend.app.agent.observer import PURPOSE_APPROVAL_CLASSIFICATION
 from backend.app.bus import OutboundMessage
 from backend.app.config import settings
 from backend.app.database import AsyncSessionLocal, db_session_async
 from backend.app.models import ApprovalEvent, PendingApprovalRow, UserPermissionSet
 from backend.app.query_helpers import fetch_all
+from backend.app.services.llm_usage import log_chat_completion_usage
 
 logger = logging.getLogger(__name__)
 
@@ -918,6 +920,7 @@ def _parse_approval_response(text: str) -> ApprovalDecision | None:
 
 async def classify_approval_response(
     text: str,
+    user_id: str | None = None,
 ) -> ApprovalDecision | Literal["ambiguous"] | None:
     """Classify a natural-language approval response using an LLM.
 
@@ -929,6 +932,9 @@ async def classify_approval_response(
     wait") that is neither a clear yes/no nor a clear new request: the caller
     re-prompts instead of interrupting the pending batch. Returns ``None`` if
     the LLM call fails or the message is a clear, unrelated new request.
+
+    With *user_id*, the call's usage is logged under
+    ``PURPOSE_APPROVAL_CLASSIFICATION``.
     """
 
     class ApprovalClassification(BaseModel):
@@ -1003,6 +1009,13 @@ async def classify_approval_response(
     except Exception:
         logger.warning("LLM approval classification failed for text: %r", text[:100], exc_info=True)
         return None
+
+    if user_id:
+        # Not routed through ``resolve_target``, so there is no endpoint to
+        # record: the call goes to (provider, model) at ``llm_api_base``.
+        await log_chat_completion_usage(
+            user_id, model, response, PURPOSE_APPROVAL_CLASSIFICATION, provider=provider
+        )
 
     parsed = response.choices[0].message.parsed  # type: ignore[union-attr]
     if parsed is None:
