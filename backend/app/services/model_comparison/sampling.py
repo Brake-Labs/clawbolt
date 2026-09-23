@@ -1,4 +1,4 @@
-"""Turn selection and prompt reconstruction for the model-swap evaluator.
+"""Turn selection and prompt reconstruction for the model comparison replay.
 
 Reconstruction runs against *today's* system prompt, tool set, and memory,
 not the versions in force when the turn originally happened. That is
@@ -35,7 +35,7 @@ from backend.app.agent.context import (
 )
 from backend.app.agent.core import AssembledPrompt, ClawboltAgent
 from backend.app.agent.dto import StoredMessage
-from backend.app.agent.messages import AgentMessage, AssistantMessage
+from backend.app.agent.messages import AgentMessage
 from backend.app.agent.router import init_storage
 from backend.app.agent.session_db import get_session_store
 from backend.app.agent.stores import ToolConfigStore
@@ -50,7 +50,7 @@ from backend.app.bus import OutboundMessage
 from backend.app.config import settings
 from backend.app.enums import MessageDirection
 from backend.app.models import User
-from backend.app.services.llm_eval.types import RecordedToolResult, ReplaySample
+from backend.app.services.model_comparison.types import RecordedToolResult, ReplaySample
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +58,8 @@ logger = logging.getLogger(__name__)
 async def _refuse_outbound(message: OutboundMessage) -> None:
     """Outbound sink for replay tool contexts. Must never be reached."""
     raise AssertionError(
-        "llm_eval attempted to publish an outbound message; a replay must never execute a tool"
+        "model_comparison attempted to publish an outbound message; "
+        "a replay must never execute a tool"
     )
 
 
@@ -264,7 +265,7 @@ def _same_batch(earlier: StoredMessage, later: StoredMessage) -> bool:
 
     An unreadable timestamp answers False, which reports "the agent did
     nothing" for that turn. That is the safe direction: the credit this grants
-    is what stops ``check_safety`` raising ``UNREQUESTED_MUTATION``, so a
+    is what stops ``check_candidate`` raising ``UNREQUESTED_WRITE``, so a
     corrupt row must not hand out an exemption.
     """
     first = _parse_timestamp(earlier.timestamp)
@@ -274,8 +275,8 @@ def _same_batch(earlier: StoredMessage, later: StoredMessage) -> bool:
     return second - first <= _BATCH_GAP_LIMIT
 
 
-def _historic_response(rows: list[StoredMessage], start: int) -> tuple[str, list[str]]:
-    """Return the reply text and tool names the agent produced for a turn.
+def _production_reply(rows: list[StoredMessage], start: int) -> str:
+    """Return the reply text the agent produced for a turn.
 
     A "turn" here is the batch of consecutive inbound rows starting at *start*,
     plus the outbound rows that follow it. Skipping over the rest of the batch
@@ -283,7 +284,7 @@ def _historic_response(rows: list[StoredMessage], start: int) -> tuple[str, list
     messages in a row persists four inbound rows and the agent answers the
     batch once, after the last of them. Reading only up to the *next* inbound
     row reported "the agent did nothing" for the first three, and
-    ``check_safety`` then charged the candidate with an unrequested mutation on
+    ``check_candidate`` then charged the candidate with an unrequested write on
     a turn whose text was an explicit instruction to write.
 
     The batch is bounded by ``_BATCH_GAP_LIMIT``, because two consecutive
@@ -291,21 +292,13 @@ def _historic_response(rows: list[StoredMessage], start: int) -> tuple[str, list
     unanswered. Crediting it with the later turn's tool calls would exempt a
     candidate that wrote something in reply to a message the agent never
     answered.
-
-    Tool names are read back through the same rebuilder the LLM history uses,
-    so a row whose ``tool_interactions_json`` is malformed degrades to "no
-    tools" here exactly as it does in the prompt.
     """
     reply_parts: list[str] = []
-    tool_names: list[str] = []
     for row in _response_rows(rows, start):
-        for msg in _stored_messages_to_agent_messages([row]):
-            if isinstance(msg, AssistantMessage):
-                tool_names.extend(tc.name for tc in msg.tool_calls)
         text = row.llm_reply_text or row.body
         if text:
             reply_parts.append(text)
-    return "\n\n".join(reply_parts), tool_names
+    return "\n\n".join(reply_parts)
 
 
 def _response_rows(rows: list[StoredMessage], start: int) -> list[StoredMessage]:
@@ -326,12 +319,14 @@ def _response_rows(rows: list[StoredMessage], start: int) -> list[StoredMessage]
     return answered
 
 
-def _historic_tool_results(rows: list[StoredMessage], start: int) -> tuple[RecordedToolResult, ...]:
+def _production_tool_calls(rows: list[StoredMessage], start: int) -> tuple[RecordedToolResult, ...]:
     """Every tool call the live turn made, with the result it got back.
 
     Read through the same parser the history rebuild uses, so a malformed
-    ``tool_interactions_json`` yields no results here just as it yields no
-    tool calls in the prompt.
+    ``tool_interactions_json`` yields nothing here just as it yields no tool
+    calls in the prompt. This one list is the report's baseline, the source
+    of the results a replay may feed back, and the standard the write
+    comparison measures against.
     """
     return tuple(
         RecordedToolResult(
@@ -367,10 +362,9 @@ def select_samples(fixture: ReplayFixture, limit: int) -> list[ReplaySample]:
     A turn is a batch, not a row. Production answers rapid-fire messages once,
     after the last of them, with the earlier ones already in the history it
     loads, so that is the replay too: one sample per batch, at the batch's
-    last row. Replaying each row alone scored decisions production never
-    made, on a fraction of what the user had said, and the judge read that
-    fraction as the whole request. The earlier rows ride along as
-    ``batched_messages`` so the report and the judge see everything the user
+    last row. Replaying each row alone reported decisions production never
+    made, on a fraction of what the user had said. The earlier rows ride
+    along as ``batched_messages`` so the report shows everything the user
     sent.
 
     Blank inbound rows are skipped: rapid-fire attachment batching persists
@@ -391,15 +385,13 @@ def select_samples(fixture: ReplayFixture, limit: int) -> list[ReplaySample]:
         if texts:
             last_index, message_context = texts[-1]
             row = rows[last_index]
-            reply, tool_names = _historic_response(rows, last_index)
             samples.append(
                 ReplaySample(
                     seq=row.seq,
                     timestamp=row.timestamp,
                     message_context=message_context,
-                    historic_reply=reply,
-                    historic_tool_names=tool_names,
-                    historic_tool_results=_historic_tool_results(rows, last_index),
+                    production_reply=_production_reply(rows, last_index),
+                    production_tool_calls=_production_tool_calls(rows, last_index),
                     batched_messages=tuple(text for _, text in texts[:-1]),
                 )
             )

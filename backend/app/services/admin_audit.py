@@ -97,18 +97,18 @@ class AdminAction(StrEnum):
     # is the natural response for non-consenting users.
     EXPORT_LLM_PAYLOADS = "export_llm_payloads"
 
-    # Model-swap evaluator. Starting a run replays the user's real
-    # conversations through two models, and the report renders their message
-    # bodies back to the admin, so those two are consent-gated content access
-    # in the same sense as the shared-data routes below. Listing, cancelling
-    # and deleting touch run metadata rather than content and are not gated.
-    VIEW_LLM_EVAL_RUNS = "view_llm_eval_runs"
-    START_LLM_EVAL_RUN = "start_llm_eval_run"
-    VIEW_LLM_EVAL_REPORT = "view_llm_eval_report"
-    CANCEL_LLM_EVAL_RUN = "cancel_llm_eval_run"
-    # Deleting a run destroys the evidence a verdict was drawn from, so the
-    # audit row is the only remaining record that the run existed at all.
-    DELETE_LLM_EVAL_RUN = "delete_llm_eval_run"
+    # Model comparison. Starting a run replays the user's real conversations
+    # through a candidate model, and the report renders their message bodies
+    # back to the admin, so those two are consent-gated content access in the
+    # same sense as the shared-data routes below. Listing, cancelling and
+    # deleting touch run metadata rather than content and are not gated.
+    VIEW_MODEL_COMPARISON_RUNS = "view_model_comparison_runs"
+    START_MODEL_COMPARISON_RUN = "start_model_comparison_run"
+    VIEW_MODEL_COMPARISON_REPORT = "view_model_comparison_report"
+    CANCEL_MODEL_COMPARISON_RUN = "cancel_model_comparison_run"
+    # Deleting a run destroys the evidence a switching decision was made on,
+    # so the audit row is the only remaining record that the run existed.
+    DELETE_MODEL_COMPARISON_RUN = "delete_model_comparison_run"
 
     # Consent-gated content access (issue #325 item 3). These are the
     # only routes that surface message bodies / memory text to admins;

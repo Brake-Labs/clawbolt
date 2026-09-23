@@ -34,9 +34,10 @@ class ToolTags(StrEnum):
     ``manage_integration`` all write *without* being gated, so reading it the
     other way misses them.
 
-    The model-swap evaluator is the consumer: it flags a candidate that
-    reaches for a mutating tool neither the incumbent nor the live turn
-    called. See ``llm_eval.metrics.is_mutating_call``.
+    The model comparison report is the consumer: it flags a candidate that
+    reaches for a mutating tool the live turn did not call, and it reads this
+    to tell production's writes from its lookups. See
+    ``model_comparison.checks.is_mutating_call``.
     """
 
 
@@ -102,7 +103,8 @@ class Tool:
     reads and ``disable`` writes. Leave the tag off such a tool (untagged
     still means mutating) and set this to a predicate over the call's
     arguments that answers True for the actions that only read. The
-    model-swap evaluator consults it through ``llm_eval.metrics.is_mutating_call``.
+    model comparison report consults it through
+    ``model_comparison.checks.is_mutating_call``.
     Never consulted for execution: it describes a call, it does not gate one.
     """
     precheck: Callable[[dict[str, Any]], str | None] | None = None

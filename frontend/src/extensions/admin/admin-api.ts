@@ -5,8 +5,8 @@ import client from '@/lib/api-client';
 //
 // Anything whose name matches a schema in the generated spec is aliased to it,
 // so those cannot drift. The rest are hand-written because the backend name
-// differs (SharedDataMessage vs SharedDataMessageItem, EvalRun vs
-// AdminLLMEvalRunItem, ...); those are only as accurate as the last person to
+// differs (SharedDataMessage vs SharedDataMessageItem, ComparisonRun vs
+// ComparisonRunItem, ...); those are only as accurate as the last person to
 // touch them, so prefer aliasing a renamed schema over editing one by hand.
 
 export interface AdminUser {
@@ -1267,14 +1267,17 @@ export async function diagnoseEmailDelivery(): Promise<EmailDiagnostics> {
   return data as EmailDiagnostics;
 }
 
-// --- Model-swap evaluator ---
+// --- Model comparison report ---
 //
-// Replays a user's recent turns through their current model and a candidate
-// model. Consent-gated: every endpoint 403s for a user who has not opted into
-// data sharing, because a run reads their real conversations and the report
-// renders them back. Content is PII-redacted server-side.
+// Replays a user's recent turns through a candidate model and lays each
+// decision beside what production actually did. Consent-gated: every endpoint
+// 403s for a user who has not opted into data sharing, because a run reads
+// their real conversations and the report renders them back. Content is
+// PII-redacted server-side.
+//
+// There is no verdict on the wire: counts and the turns themselves.
 
-export type EvalRunStatus =
+export type ComparisonRunStatus =
   | 'pending'
   | 'running'
   | 'completed'
@@ -1282,256 +1285,99 @@ export type EvalRunStatus =
   | 'interrupted'
   | 'cancelled';
 
-export type EvalRecommendation =
-  | 'safe_to_switch'
-  | 'switch_with_monitoring'
-  | 'do_not_switch'
-  | 'inconclusive';
+/** How a turn's candidate decision reads against the writes production made.
+ *
+ * ``no_candidate_output`` and ``replay_incomplete`` are the two that are not
+ * about the writes: the candidate said nothing at all, and the replay ran out
+ * of lookup rounds before the candidate decided.
+ */
+export type TurnOutcome =
+  | 'not_replayed'
+  | 'no_candidate_output'
+  | 'replay_incomplete'
+  | 'no_write'
+  | 'write_matched'
+  | 'write_same_record'
+  | 'write_args_differ'
+  | 'write_missed';
 
-export type EvalModelTotals = components['schemas']['AdminLLMEvalModelTotals'];
-
-export interface EvalSummary {
-  turns_total: number;
-  turns_completed: number;
-  turns_failed: number;
-  agreement_counts: Record<string, number>;
-  /** The candidate's findings by kind. */
-  safety_counts: Record<string, number>;
-  /** The incumbent's findings by kind. null on runs recorded before the
-   * incumbent was checked too, which is not the same as "had none". */
-  baseline_safety_counts?: Record<string, number> | null;
-  // Subset of safety_counts that counts in the safety comparison. A provider
-  // error is recorded above but is a failure to measure, not candidate behavior.
-  blocking_findings: number;
-  /** Turns with a safety finding per side, paired. null on older runs. */
-  safety_comparison?: EvalSideComparison | null;
-  judge_counts: Record<string, number>;
-  /**
-   * Why the unjudged turns were skipped. Added to judge_counts these account
-   * for every turn, so the report never leaves a silent remainder between the
-   * judged count and the turn count.
-   */
-  judge_skip_counts: Record<string, number>;
-  identical_rate: number;
-  divergence_rate: number;
-  /** The divergence ceiling this run was held to: the incumbent's own
-   * divergence from itself plus a margin, or a fixed fallback. null on
-   * older runs. */
-  divergence_threshold?: number | null;
-  /** The incumbent's divergence from itself for this user, when calibrated. */
-  divergence_noise_floor?: number | null;
-  silent_noop_rate: number;
-  /**
-   * The subset of silent_noop_rate the judge did not score for the candidate,
-   * which is what the recommendation blocks on. Prose is the right answer to
-   * some messages.
-   *
-   * null on a run whose summary predates the field. Zero and "never measured"
-   * mean opposite things, so do not coalesce them.
-   */
-  silent_noop_blocking_rate: number | null;
-  baseline: EvalModelTotals;
-  candidate: EvalModelTotals;
-  recommendation: EvalRecommendation;
-  reasons: string[];
-  warnings: string[];
-}
-
-interface EvalSideComparison {
-  candidate_turns: number;
-  baseline_turns: number;
-  candidate_only: number;
-  baseline_only: number;
-  p_value: number;
-}
-
-export interface EvalRun {
-  /** The run's public id, which is also its report URL segment. */
-  id: string;
-  user_id: string;
-  user_email: string;
-  /** False once the user withdraws consent: the report is no longer readable. */
-  user_consented: boolean;
-  /** Named endpoint each side was sent to, or '' for a bare provider. */
-  baseline_endpoint: string;
-  baseline_provider: string;
-  baseline_model: string;
-  /** The effort the run was frozen at, not whatever the setting says now. */
-  baseline_reasoning_effort: string;
-  candidate_endpoint: string;
-  candidate_provider: string;
-  candidate_model: string;
-  candidate_reasoning_effort: string;
-  judge_model: string;
-  requested_samples: number;
-  status: EvalRunStatus;
-  progress_completed: number;
-  progress_total: number;
-  recommendation: string;
-  error: string;
-  created_at: string;
-  started_at?: string | null;
-  completed_at?: string | null;
-  summary?: EvalSummary | null;
-}
-
-export interface EvalToolCall {
-  name: string;
-  arguments: Record<string, unknown>;
-}
-
-export interface EvalDecision {
-  text: string;
-  tool_calls: EvalToolCall[];
-  stop_reason: string;
-  input_tokens: number;
-  output_tokens: number;
-  cache_read_tokens: number;
-  /** Prompt tokens written to cache. Needed to read the token columns: a
-   * model whose whole prompt is a fresh cache write reports a tiny
-   * input_tokens next to an uncached model's enormous one, same prompt. */
-  cache_creation_tokens: number;
-  latency_ms: number;
-  error: string;
-  /** Read-only calls the replay answered from the live turn's recorded
-   * results before this decision. Absent on runs recorded before replays
-   * continued past a first decision. */
-  replayed_lookups?: EvalLookup[];
-}
-
-interface EvalLookup {
-  name: string;
-  arguments: Record<string, unknown>;
-  result: string;
-  is_error: boolean;
-}
-
-export interface EvalSafetyIssue {
-  finding: string;
-  tool_name: string;
-  detail: string;
-  /**
-   * Whether this finding counts in the safety comparison between the models.
-   * Served by the API so the report does not keep its own copy of
-   * metrics.SAFETY_FINDINGS. One such finding does not decide a run.
-   */
-  blocking: boolean;
-  /** Whose finding it is. Absent on rows recorded before the incumbent was
-   * checked too, which were always the candidate's. */
-  side?: 'baseline' | 'candidate';
-}
-
-export interface EvalTurn {
-  message_seq: number;
-  message_timestamp: string;
-  user_message: string;
-  historic_reply: string;
-  historic_tool_names: string[];
-  baseline: EvalDecision;
-  candidate: EvalDecision;
-  agreement: string;
-  safety_issues: EvalSafetyIssue[];
-  judge_verdict: string;
-  judge_rationale: string;
-  /** Set when judge_verdict is 'not_judged': which skip reason applied. */
-  judge_skip_reason: string;
-}
-
-export interface EvalReport {
-  run: EvalRun;
-  turns: EvalTurn[];
-  total_turns: number;
-}
-
-export interface EvalRunList {
-  runs: EvalRun[];
-  /** Runs matching the query, not just this page. */
-  total: number;
-  /** LLM_EVAL_MAX_SAMPLES: the largest run the API will start. */
-  max_samples: number;
-  /** Below this many compared turns a run reports inconclusive, not a pass. */
-  min_turns_for_verdict: number;
-  /** The largest ``limit`` the endpoint accepts. Growing past it is a 422. */
-  max_page_size: number;
-}
+export type ComparisonModelTotals = components['schemas']['ComparisonModelTotals'];
+export type ComparisonSummary = components['schemas']['ComparisonSummary'];
+export type ComparisonRun = components['schemas']['ComparisonRunItem'];
+export type ComparisonToolCall = components['schemas']['ComparisonToolCall'];
+export type ComparisonWrite = components['schemas']['ComparisonWrite'];
+export type ComparisonFinding = components['schemas']['ComparisonFinding'];
+export type ComparisonTurn = components['schemas']['ComparisonTurnItem'];
+export type ComparisonReport = components['schemas']['ComparisonReportResponse'];
+export type ComparisonRunList = components['schemas']['ComparisonRunListResponse'];
+export type ComparisonRunProgress = components['schemas']['ComparisonRunProgress'];
 
 /** Counters only: no conversation content, and no audit row per poll. */
-export interface EvalRunProgress {
-  id: string;
-  status: EvalRunStatus;
-  progress_completed: number;
-  progress_total: number;
-  recommendation: string;
-}
-
-export async function getEvalRunProgress(runId: string): Promise<EvalRunProgress> {
+export async function getComparisonProgress(runId: string): Promise<ComparisonRunProgress> {
   const { data, error } = await client.GET(
-    `/api/admin/llm-eval/runs/${encodeURIComponent(runId)}/progress` as never,
+    `/api/admin/model-comparison/runs/${encodeURIComponent(runId)}/progress` as never,
   );
-  if (error) throwApiError(error, 'Failed to load evaluation progress');
-  return data as EvalRunProgress;
+  if (error) throwApiError(error, 'Failed to load comparison progress');
+  return data as ComparisonRunProgress;
 }
 
 /** Runs across every user, or one user's when ``userId`` is given. */
-export async function listEvalRuns(
+export async function listComparisonRuns(
   opts: { userId?: string; limit?: number; offset?: number } = {},
-): Promise<EvalRunList> {
+): Promise<ComparisonRunList> {
   const params = new URLSearchParams();
   if (opts.userId) params.set('user_id', opts.userId);
   params.set('limit', String(opts.limit ?? 25));
   if (opts.offset) params.set('offset', String(opts.offset));
   const { data, error } = await client.GET(
-    `/api/admin/llm-eval/runs?${params.toString()}` as never,
+    `/api/admin/model-comparison/runs?${params.toString()}` as never,
   );
-  if (error) throwApiError(error, 'Failed to load evaluation runs');
-  return data as EvalRunList;
+  if (error) throwApiError(error, 'Failed to load comparison runs');
+  return data as ComparisonRunList;
 }
 
-export async function startEvalRun(
+export async function startComparisonRun(
   userId: string,
   body: {
     candidateEndpoint?: string;
     candidateProvider?: string;
     candidateModel: string;
     /** '' means "whatever the deployment runs at", resolved server-side. */
-    baselineReasoningEffort?: string;
     candidateReasoningEffort?: string;
     sampleCount: number;
-    judgeEnabled: boolean;
   },
-): Promise<EvalRun> {
+): Promise<ComparisonRun> {
   const { data, error } = await client.POST(
-    `/api/admin/llm-eval/users/${encodeURIComponent(userId)}/runs` as never,
+    `/api/admin/model-comparison/users/${encodeURIComponent(userId)}/runs` as never,
     {
       body: {
         candidate_endpoint: body.candidateEndpoint ?? '',
         candidate_provider: body.candidateProvider ?? '',
         candidate_model: body.candidateModel,
-        baseline_reasoning_effort: body.baselineReasoningEffort ?? '',
         candidate_reasoning_effort: body.candidateReasoningEffort ?? '',
         sample_count: body.sampleCount,
-        judge_enabled: body.judgeEnabled,
       },
     } as never,
   );
-  if (error) throwApiError(error, 'Failed to start evaluation');
-  return data as EvalRun;
+  if (error) throwApiError(error, 'Failed to start the comparison');
+  return data as ComparisonRun;
 }
 
-export async function getEvalReport(runId: string, limit = 50): Promise<EvalReport> {
+/** The run plus its turns, the ones worth reading first. */
+export async function getComparisonReport(runId: string, limit = 10): Promise<ComparisonReport> {
   const { data, error } = await client.GET(
-    `/api/admin/llm-eval/runs/${encodeURIComponent(runId)}?limit=${limit}` as never,
+    `/api/admin/model-comparison/runs/${encodeURIComponent(runId)}?limit=${limit}` as never,
   );
-  if (error) throwApiError(error, 'Failed to load evaluation report');
-  return data as EvalReport;
+  if (error) throwApiError(error, 'Failed to load the comparison report');
+  return data as ComparisonReport;
 }
 
-export async function cancelEvalRun(runId: string): Promise<EvalRun> {
+export async function cancelComparisonRun(runId: string): Promise<ComparisonRun> {
   const { data, error } = await client.POST(
-    `/api/admin/llm-eval/runs/${encodeURIComponent(runId)}/cancel` as never,
+    `/api/admin/model-comparison/runs/${encodeURIComponent(runId)}/cancel` as never,
   );
-  if (error) throwApiError(error, 'Failed to cancel evaluation');
-  return data as EvalRun;
+  if (error) throwApiError(error, 'Failed to cancel the comparison');
+  return data as ComparisonRun;
 }
 
 /**
@@ -1541,9 +1387,9 @@ export async function cancelEvalRun(runId: string): Promise<EvalRun> {
  * paid provider, so it has to be cancelled first. Callers should surface that
  * message rather than swallow it, since "cancel, then delete" is the remedy.
  */
-export async function deleteEvalRun(runId: string): Promise<void> {
+export async function deleteComparisonRun(runId: string): Promise<void> {
   const { error } = await client.DELETE(
-    `/api/admin/llm-eval/runs/${encodeURIComponent(runId)}` as never,
+    `/api/admin/model-comparison/runs/${encodeURIComponent(runId)}` as never,
   );
-  if (error) throwApiError(error, 'Failed to delete evaluation');
+  if (error) throwApiError(error, 'Failed to delete the comparison');
 }

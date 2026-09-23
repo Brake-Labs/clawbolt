@@ -48,9 +48,9 @@ from backend.app.models.llm import (
     LLMPayloadCapture,
     LLMUsageLog,
 )
-from backend.app.models.llm_eval import (
-    LLMEvalRun,
-    LLMEvalTurnResult,
+from backend.app.models.model_comparison import (
+    ComparisonRun,
+    ComparisonTurn,
 )
 from backend.app.models.moderation import ReportedConversation
 from backend.app.models.types import EncryptedString
@@ -70,13 +70,13 @@ __all__ = [
     "ChannelRoute",
     "ChatSession",
     "CompactionEvent",
+    "ComparisonRun",
+    "ComparisonTurn",
     "DeletedUserUsage",
     "EncryptedString",
     "HeartbeatLog",
     "IdempotencyKey",
     "LLMEndpoint",
-    "LLMEvalRun",
-    "LLMEvalTurnResult",
     "LLMPayloadCapture",
     "LLMUsageLog",
     "MemoryDocument",

@@ -1,4 +1,4 @@
-"""Turn selection and history reconstruction for the model-swap evaluator.
+"""Turn selection and history reconstruction for the model comparison report.
 
 The property that matters: replaying turn N must show the model exactly what
 the agent saw before turn N, and nothing that came after. A slice that leaks
@@ -21,16 +21,17 @@ from backend.app.agent.messages import AssistantMessage, UserMessage
 from backend.app.agent.session_db import reset_session_stores
 from backend.app.config import settings
 from backend.app.models import ChatSession, Message, User
-from backend.app.services.llm_eval.sampling import (
+from backend.app.services.model_comparison.sampling import (
     ReplayFixture,
-    _historic_response,
     _history_for,
+    _production_reply,
+    _production_tool_calls,
     assemble_for_sample,
     build_fixture,
     sample_clock,
     select_samples,
 )
-from backend.app.services.llm_eval.types import RecordedToolResult, ReplaySample
+from backend.app.services.model_comparison.types import RecordedToolResult, ReplaySample
 
 BASE_TIME = _dt.datetime(2026, 5, 1, 12, 0, tzinfo=_dt.UTC)
 
@@ -138,8 +139,8 @@ async def test_historic_tool_calls_are_recovered(
     )
     fixture = await _fixture_for(test_user)
     samples = select_samples(fixture, limit=10)
-    assert samples[0].historic_tool_names == ["create_job"]
-    assert samples[0].historic_reply == "Booked."
+    assert samples[0].production_tool_names == ["create_job"]
+    assert samples[0].production_reply == "Booked."
 
 
 async def test_history_slice_excludes_the_turn_and_everything_after(
@@ -246,8 +247,8 @@ async def test_a_bounded_read_gives_the_same_samples_as_a_full_one(
         assert [s.message_context for s in bounded_samples] == [
             s.message_context for s in full_samples
         ]
-        assert [s.historic_reply for s in bounded_samples] == [
-            s.historic_reply for s in full_samples
+        assert [s.production_reply for s in bounded_samples] == [
+            s.production_reply for s in full_samples
         ]
         # And the history each sample reconstructs is the same window.
         assert [m.content for m in _history_for(bounded, bounded_samples[0])] == [
@@ -392,10 +393,10 @@ async def test_a_rapid_fire_batch_is_replayed_once_at_its_last_row(
     assert sample.message_context == "build and send"
     assert sample.batched_messages == ("rebuild the stalls", "add 5000 for the staircase")
     assert sample.user_text == "rebuild the stalls\n\nadd 5000 for the staircase\n\nbuild and send"
-    assert sample.historic_tool_names == ["qb_update"]
-    assert sample.historic_reply == "sent"
+    assert sample.production_tool_names == ["qb_update"]
+    assert sample.production_reply == "sent"
     # Recorded with its result, so a replay can answer a matching lookup.
-    assert sample.historic_tool_results == (
+    assert sample.production_tool_calls == (
         RecordedToolResult(name="qb_update", arguments={"estimate_id": "635"}, result="ok"),
     )
 
@@ -442,8 +443,8 @@ async def test_a_trailing_turn_with_no_response_yet_reports_no_tools(
     samples = select_samples(fixture, limit=10)
 
     trailing = next(s for s in samples if s.seq == 3)
-    assert trailing.historic_tool_names == []
-    assert trailing.historic_reply == ""
+    assert trailing.production_tool_names == []
+    assert trailing.production_reply == ""
 
 
 # ---------------------------------------------------------------------------
@@ -524,7 +525,8 @@ def test_rapid_fire_rows_seconds_apart_share_the_batch_response() -> None:
         _row(2, "inbound", "build and send", BASE_TIME + _dt.timedelta(seconds=2)),
         _row(3, "outbound", "sent", BASE_TIME + _dt.timedelta(seconds=8), tools=_WRITE),
     ]
-    assert _historic_response(rows, 0) == ("sent", ["qb_send"])
+    assert _production_reply(rows, 0) == "sent"
+    assert [c.name for c in _production_tool_calls(rows, 0)] == ["qb_send"]
 
 
 def test_an_orphaned_turn_is_not_credited_with_a_later_turns_tool_calls() -> None:
@@ -533,16 +535,18 @@ def test_an_orphaned_turn_is_not_credited_with_a_later_turns_tool_calls() -> Non
     ``agent.inbound_recovery`` records a production inbound that sat 29 hours
     before the next message woke a batcher. Reading the whole run of inbound
     rows as one batch credits that turn with the later turn's writes, and
-    ``check_safety`` then treats a candidate that invoices a customer in reply
-    to "just checking in" as doing what the live agent did.
+    ``check_candidate`` then treats a candidate that invoices a customer in
+    reply to "just checking in" as doing what the live agent did.
     """
     rows = [
         _row(1, "inbound", "just checking in", BASE_TIME),
         _row(2, "inbound", "go ahead and send it", BASE_TIME + _dt.timedelta(hours=3)),
         _row(3, "outbound", "sent", BASE_TIME + _dt.timedelta(hours=3, seconds=6), tools=_WRITE),
     ]
-    assert _historic_response(rows, 0) == ("", [])
-    assert _historic_response(rows, 1) == ("sent", ["qb_send"])
+    assert _production_reply(rows, 0) == ""
+    assert _production_tool_calls(rows, 0) == ()
+    assert _production_reply(rows, 1) == "sent"
+    assert [c.name for c in _production_tool_calls(rows, 1)] == ["qb_send"]
 
 
 def test_a_corrupt_timestamp_does_not_hand_out_a_batch_exemption() -> None:
@@ -552,4 +556,5 @@ def test_a_corrupt_timestamp_does_not_hand_out_a_batch_exemption() -> None:
         _row(3, "outbound", "sent", BASE_TIME, tools=_WRITE),
     ]
     rows[1].timestamp = "not a timestamp"
-    assert _historic_response(rows, 0) == ("", [])
+    assert _production_reply(rows, 0) == ""
+    assert _production_tool_calls(rows, 0) == ()

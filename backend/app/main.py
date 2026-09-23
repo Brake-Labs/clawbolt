@@ -53,7 +53,7 @@ from backend.app.query_helpers import fetch_all
 from backend.app.routers import (
     account,
     admin,
-    admin_llm_eval,
+    admin_model_comparison,
     admin_reported_conversations,
     admin_shared_data,
     app_config,
@@ -84,10 +84,13 @@ from backend.app.services.admin_alerts import (
 from backend.app.services.health_monitor import LOCAL_BASE_URL, health_monitor
 from backend.app.services.heartbeat_usage import install_heartbeat_usage_hook
 from backend.app.services.llm_endpoints import resolve_target, role_selection
-from backend.app.services.llm_eval import interrupted_run_sweeper, mark_interrupted_runs
 from backend.app.services.llm_payload_capture import install_llm_payload_capture
 from backend.app.services.llm_resolver import install_user_llm_resolver
 from backend.app.services.llm_service import LLMTarget
+from backend.app.services.model_comparison import (
+    interrupted_run_sweeper,
+    mark_interrupted_runs,
+)
 from backend.app.services.oauth import oauth_refresh_scheduler
 from backend.app.services.telegram_webhook import discover_bot_username
 from backend.app.services.tool_failure_alerts import install_tool_failure_alerts
@@ -697,7 +700,7 @@ def create_app() -> FastAPI:
         app.include_router(google_oauth.router, prefix="/api")
         app.include_router(admin.router, prefix="/api")
         app.include_router(admin_shared_data.router, prefix="/api")
-        app.include_router(admin_llm_eval.router, prefix="/api")
+        app.include_router(admin_model_comparison.router, prefix="/api")
         app.include_router(admin_reported_conversations.router, prefix="/api")
         app.include_router(account.router, prefix="/api")
         app.include_router(channels_router.router, prefix="/api")
