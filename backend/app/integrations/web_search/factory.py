@@ -60,15 +60,15 @@ _RETRY_HINT = (
 # next to the data keeps it in view when the model decides how to phrase a
 # figure. The second sentence is the green-lid case: a listing page puts several
 # products' prices side by side, and only the field pairing says which is which.
+#
+# Kept short because it is repeated on every call and stays in history. The
+# tool's usage_hint carries the longer framing once per schema.
 _RESULT_FOOTER = (
-    "These are search results and may be out of date. Any figure you repeat "
-    "from them needs its source URL and should be given as a ballpark to "
-    "confirm, never as a firm quote. A price belongs to the item named in the "
-    "same result: check it matches what was asked for, and give the range when "
-    "results disagree. If nothing here carries the detail you needed, the query "
-    "was probably too broad and landed on category pages; name the specific "
-    "product and size and search once more before telling the user you could "
-    "not find it. Do not infer a figure from a page that does not state one."
+    "Results may be out of date: give any figure with its source URL, as a "
+    "ballpark to confirm, never as a firm quote. A price belongs to the item "
+    "named in its own result; give the range when results disagree. No useful "
+    "detail means the query was too broad: name the product and size and "
+    "search once more. Never infer a figure a page does not state."
 )
 
 
@@ -210,7 +210,10 @@ def _create_web_search_tools(provider: SearchProvider, cache: SearchCache) -> li
             description=(
                 "Search the web. Returns the top results with their source "
                 "URLs and whatever details the search engine has for each one. "
-                "Write your own search query from what the user asked."
+                "Write your own search query from what the user asked. Long "
+                "lists in a result (products, offers, snippets, FAQs) are cut "
+                "to the first few, with a *_not_shown count; search more "
+                "narrowly for the rest."
             ),
             function=web_search,
             params_model=WebSearchParams,

@@ -7,17 +7,22 @@ four-field model and silently dropped Brave's ``product.price``, which was the
 one field a materials estimate actually needed.
 
 Nothing here drops information. There is no field allowlist, no denylist, and no
-truncation: a result the provider considered worth returning is rendered whole.
-The two transformations applied are markup removal (in the provider, where
-``<strong>`` highlight tags are stripped) and skipping keys whose value is null
-or an empty string, neither of which carries anything the model could use.
+truncation: every record this module is handed is rendered whole, and no value
+is ever cut short. The only skip is a key whose value is null or an empty
+string, which carries nothing the model could use.
 
-The size of a response is therefore set by the result count, rather than by a
-character budget hidden in here. A live Brave result runs roughly 2,000
-characters, so the default of three lands near 6,000 and the ceiling of twenty
-near 40,000. ``WEB_SEARCH_MAX_RESULTS`` sets the count for a call that does not
-ask for one; the agent picks per call otherwise. If that is ever too much, the
-fix is to ask for fewer results, not to serve half of each one.
+Shaping belongs to the provider, which knows its own field names. Brave's
+(``brave.py``) strips ``<strong>`` markup, drops a short denylist of
+presentation-only keys (image and favicon URLs, site chrome, display flags),
+and caps a few repeated lists with a ``<key>_not_shown`` count. That is a
+denylist, not an allowlist, so the failure above cannot recur: a field nobody
+named, ``product.price`` included, still passes through.
+
+The size of a response is therefore set by the result count and the provider's
+trim, not by a character budget hidden in here. ``WEB_SEARCH_MAX_RESULTS`` sets
+the count for a call that does not ask for one; the agent picks per call
+otherwise. If that is ever too much, the fix is to ask for fewer results, not to
+serve half of each one.
 """
 
 from typing import Any
