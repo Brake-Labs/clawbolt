@@ -1,7 +1,7 @@
 """Vision and approval-classifier calls write their token usage to ``llm_usage_logs``.
 
-Both are LLM calls made outside the agent loop, so before this they were
-missing from every per-user cost figure.
+Both run outside the agent loop, so they log their own rows rather than
+riding on the loop's per-round logging.
 """
 
 from __future__ import annotations
