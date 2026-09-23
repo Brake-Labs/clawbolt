@@ -34,6 +34,7 @@ import datetime
 import json
 import logging
 from collections import OrderedDict
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from backend.app.agent.context import (
@@ -223,11 +224,15 @@ def _render(
     post: list[StoredMessage],
     tz_name: str,
     verbatim_from: int,
+    preceding: Sequence[StoredMessage],
 ) -> tuple[list[AgentMessage], int, int]:
     """Render the rows, eliding tool results in turns before *verbatim_from*.
 
     Rendered in one pass so timestamp markers read the same as they would
-    without the rebuild. Returns the messages, the estimated tokens of the
+    without the rebuild. *preceding* is the rows just before the first one
+    rendered, including any turns the rebuild dropped, so the first kept row
+    renders as it will on the next turn, when the dropped rows sit below the
+    trim watermark. Returns the messages, the estimated tokens of the
     inherited part, and how many results were elided.
     """
     group_of: dict[int, int] = {}
@@ -235,7 +240,9 @@ def _render(
         for row in rows:
             group_of[row.seq] = g
     flat = [row for rows in pre_groups for row in rows]
-    rendered = _stored_messages_to_agent_messages([*flat, *post], tz_name=tz_name)
+    rendered = _stored_messages_to_agent_messages(
+        [*flat, *post], tz_name=tz_name, preceding=preceding
+    )
 
     out: list[AgentMessage] = []
     pre_part: list[AgentMessage] = []
@@ -272,8 +279,14 @@ def build_history_view(
     tz_name: str,
     *,
     compact: bool,
+    preceding: Sequence[StoredMessage] = (),
 ) -> HistoryView:
     """Render the history for the turn answering *current*.
+
+    *preceding* is the rows just before *rows* (see
+    ``context._stored_messages_to_agent_messages``). They render nothing and
+    only seed the timestamp markers, so the first row renders the same bytes
+    whether it is mid-history or the first row after the trim watermark.
 
     With *compact* False this is the plain rendering, and only the epoch is
     worked out. With it True the history the epoch inherited is rebuilt:
@@ -296,13 +309,14 @@ def build_history_view(
     """
     if current is None:
         return HistoryView(
-            messages=_stored_messages_to_agent_messages(rows, tz_name=tz_name),
+            messages=_stored_messages_to_agent_messages(rows, tz_name=tz_name, preceding=preceding),
             epoch=PromptEpoch(key=0, cold_start=True),
         )
     epoch, boundary = find_epoch(rows, current)
     if not compact or boundary == 0:
         return HistoryView(
-            messages=_stored_messages_to_agent_messages(rows, tz_name=tz_name), epoch=epoch
+            messages=_stored_messages_to_agent_messages(rows, tz_name=tz_name, preceding=preceding),
+            epoch=epoch,
         )
 
     groups = _group_turns(rows[:boundary])
@@ -310,19 +324,24 @@ def build_history_view(
     budget = settings.cold_start_history_budget_tokens
     max_turns = settings.context_trim_target_turns
 
-    def fit_verbatim(kept: list[list[StoredMessage]]) -> tuple[list[AgentMessage], int, int]:
+    def before(first: int) -> list[StoredMessage]:
+        """The rows ahead of ``groups[first:]``: *preceding*, then the dropped turns."""
+        return [*preceding, *(row for group in groups[:first] for row in group)]
+
+    def fit_verbatim(first: int) -> tuple[list[AgentMessage], int, int]:
         """Steps 1 and 2: the widest verbatim window that fits the budget."""
+        kept = groups[first:]
         verbatim = min(settings.cold_start_verbatim_turns, len(kept))
         while True:
             messages, tokens, elided = _render(
-                kept, post, tz_name, verbatim_from=len(kept) - verbatim
+                kept, post, tz_name, verbatim_from=len(kept) - verbatim, preceding=before(first)
             )
             if tokens <= budget or verbatim == 0:
                 return messages, tokens, elided
             verbatim -= 1
 
     start = 0
-    messages, tokens, elided = fit_verbatim(groups)
+    messages, tokens, elided = fit_verbatim(0)
     if tokens > budget or len(groups) > max_turns:
         # Step 3. Everything is already a stub here, so drop from the front
         # with no verbatim window, re-rendering after each drop so the check
@@ -330,12 +349,18 @@ def build_history_view(
         drop_to = int(budget * _DROP_TO_FRACTION)
         while start < len(groups) - 1 and (tokens > drop_to or len(groups) - start > max_turns):
             start += 1
-            _, tokens, _ = _render(groups[start:], post, tz_name, verbatim_from=len(groups))
+            _, tokens, _ = _render(
+                groups[start:],
+                post,
+                tz_name,
+                verbatim_from=len(groups),
+                preceding=before(start),
+            )
         # Then widen the verbatim window again as far as the budget allows.
         # This is the same computation the next turn runs on the rows that
         # remain, so the result is a fixed point: it drops nothing more and
         # renders the same bytes.
-        messages, tokens, elided = fit_verbatim(groups[start:])
+        messages, tokens, elided = fit_verbatim(start)
 
     dropped = [row for group in groups[:start] for row in group]
     return HistoryView(messages=messages, epoch=epoch, dropped_rows=dropped, elided_results=elided)
@@ -355,9 +380,15 @@ class EpochHistoryRenderer:
         self.epoch: PromptEpoch | None = None
 
     async def __call__(
-        self, rows: list[StoredMessage], current: StoredMessage | None, tz_name: str
+        self,
+        rows: list[StoredMessage],
+        current: StoredMessage | None,
+        tz_name: str,
+        preceding: Sequence[StoredMessage] = (),
     ) -> list[AgentMessage]:
-        view = build_history_view(rows, current, tz_name, compact=self._compact)
+        view = build_history_view(
+            rows, current, tz_name, compact=self._compact, preceding=preceding
+        )
         self.epoch = view.epoch
         if self._compact and view.epoch.cold_start:
             logger.info(
@@ -368,7 +399,9 @@ class EpochHistoryRenderer:
                 len(view.dropped_rows),
             )
         if view.dropped_rows and settings.compaction_enabled:
-            dropped = _stored_messages_to_agent_messages(view.dropped_rows, tz_name=tz_name)
+            dropped = _stored_messages_to_agent_messages(
+                view.dropped_rows, tz_name=tz_name, preceding=preceding
+            )
             await trigger_compaction_for_dropped(self._user_id, dropped)
             # The compaction event's range ends at the last row that renders
             # a message. Rows after it that render nothing (an approval

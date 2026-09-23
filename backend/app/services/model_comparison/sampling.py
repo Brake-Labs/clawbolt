@@ -420,13 +420,16 @@ def _history_for(
     them itself.
     """
     preceding = [r for r in fixture.rows if r.seq < sample.seq]
-    window = preceding[-settings.conversation_history_limit :]
+    window_start = max(len(preceding) - settings.conversation_history_limit, 0)
     current = next((r for r in fixture.rows if r.seq == sample.seq), None)
     return build_history_view(
-        window,
+        preceding[window_start:],
         current,
         fixture.tz_name,
         compact=history_mode == HistoryMode.COLD_START_COMPACTION,
+        # The rows above the window seed the first row's time marker, as
+        # ``load_conversation_history`` does for the live turn.
+        preceding=preceding[:window_start],
     ).messages
 
 

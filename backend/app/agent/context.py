@@ -531,10 +531,15 @@ def _stored_messages_to_agent_messages(
     return history
 
 
-# Renders the loaded rows (the window, the current row, the timezone) into
-# the history the LLM sees. See ``prompt_epoch.EpochHistoryRenderer``.
+# Renders the loaded rows (the window, the current row, the timezone, and
+# the rows just before the window) into the history the LLM sees. The last
+# argument is the ``preceding`` that :func:`_stored_messages_to_agent_messages`
+# takes; a renderer that drops it gives the first row after the trim
+# watermark a fresh time marker, and the turn after a trim rewrites the whole
+# history cache again. See ``prompt_epoch.EpochHistoryRenderer``.
 HistoryRenderer = Callable[
-    [list[StoredMessage], StoredMessage | None, str], Awaitable[list[AgentMessage]]
+    [list[StoredMessage], StoredMessage | None, str, Sequence[StoredMessage]],
+    Awaitable[list[AgentMessage]],
 ]
 
 
@@ -566,7 +571,8 @@ async def load_conversation_history(
     silently lost.
 
     *render* replaces the plain row-to-message rendering and is handed the
-    current row too. Row selection above it is unchanged.
+    current row and the same *preceding* rows the plain rendering uses.
+    Row selection above it is unchanged.
     """
     all_messages = session.messages
 
@@ -613,7 +619,9 @@ async def load_conversation_history(
         preceding = below + preceding
 
     if render is not None:
-        history = await render(messages, all_messages[-1] if all_messages else None, tz_name)
+        history = await render(
+            messages, all_messages[-1] if all_messages else None, tz_name, preceding
+        )
     else:
         history = _stored_messages_to_agent_messages(messages, tz_name=tz_name, preceding=preceding)
     logger.debug(

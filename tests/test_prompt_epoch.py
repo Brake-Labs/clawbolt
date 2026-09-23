@@ -254,9 +254,11 @@ def test_cold_start_drops_the_oldest_turns_when_prose_is_over_budget(
         assert view.dropped_rows
         assert view.dropped_rows[0].seq == 1
         # A fixed point: the rows that remain rebuild to the same bytes and
-        # drop nothing more, so the rest of the epoch appends to this.
+        # drop nothing more, so the rest of the epoch appends to this. The
+        # dropped rows are below the watermark then, and the loader passes
+        # them as ``preceding``.
         kept = [r for r in t.rows[:-1] if r.seq > view.dropped_rows[-1].seq]
-        again = build_history_view(kept, current, "", compact=True)
+        again = build_history_view(kept, current, "", compact=True, preceding=view.dropped_rows)
     assert not again.dropped_rows
     assert _api(again.messages) == _api(view.messages)
 
