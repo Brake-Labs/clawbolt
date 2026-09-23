@@ -58,14 +58,13 @@ def build_work_order_write_tools(service: AppFolioVendorService) -> list[Tool]:
     return [
         Tool(
             name=ToolName.APPFOLIO_UPDATE_WORK_ORDER_STATUS,
-            description="Update the status code on an AppFolio work order.",
+            description=(
+                "Set the status of an AppFolio work order, e.g. to mark a job in"
+                " progress, completed, or back to needs-action."
+            ),
             function=appfolio_update_work_order_status,
             params_model=AppFolioUpdateWorkOrderStatusParams,
             concurrency_group=work_order_concurrency_key,
-            usage_hint=(
-                "Use to mark a job in-progress, completed, or back to needs-action."
-                " Confirm the target status with the user when uncertain."
-            ),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 description_builder=lambda args: (
@@ -76,13 +75,13 @@ def build_work_order_write_tools(service: AppFolioVendorService) -> list[Tool]:
         ),
         Tool(
             name=ToolName.APPFOLIO_UNDO_WORK_ORDER_STATUS,
-            description="Revert a recent status change on an AppFolio work order.",
+            description=(
+                "Revert a status change on an AppFolio work order, only when the user"
+                " explicitly asks to undo one they just made."
+            ),
             function=appfolio_undo_work_order_status,
             params_model=AppFolioUndoWorkOrderStatusParams,
             concurrency_group=work_order_concurrency_key,
-            usage_hint=(
-                "Use only when the user explicitly asks to undo a status change they just made."
-            ),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 description_builder=lambda args: (

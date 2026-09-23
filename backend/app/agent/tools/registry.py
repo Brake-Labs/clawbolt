@@ -130,10 +130,7 @@ class ListCapabilitiesParams(BaseModel):
 
     category: str | None = Field(
         default=None,
-        description=(
-            "Category name to look up usage guidance for. Omit to see all "
-            "available categories and connection status."
-        ),
+        description="Category to get guidance for. Omit to list categories and connection status.",
     )
 
 
@@ -230,45 +227,38 @@ def create_list_capabilities_tool(
             guidance_msg += skill_guidance_block(category, skill_instructions)
         return ToolResult(content=guidance_msg)
 
-    summary_lines = [
-        f"  - {name}: {summary}" for name, summary in sorted(specialist_summaries.items())
-    ]
-    summary_block = "\n".join(summary_lines)
-    unauth_hint = ""
-    if _unauthenticated:
-        unauth_lines = [f"  - {name} (not connected)" for name in sorted(_unauthenticated)]
-        unauth_hint = (
-            "\nThe following integrations are configured but not yet connected:\n"
-            + "\n".join(unauth_lines)
-            + "\nIf the user asks about them, let them know they need to "
-            "connect the integration first."
+    # The hint names categories only. Each loaded tool already carries its own
+    # description, and the one-line summaries are what a no-argument call
+    # returns, so repeating them here would bill every request for both.
+    hint_parts: list[str] = []
+    if specialist_summaries:
+        hint_parts.append(
+            "list_capabilities: connected categories (tools already loaded): "
+            f"{', '.join(sorted(specialist_summaries))}. Call it with a category name "
+            "for usage guidance on that category's tools."
         )
-    disabled_hint = ""
+    if _unauthenticated:
+        hint_parts.append(
+            f"Configured but not connected: {', '.join(sorted(_unauthenticated))}. "
+            "If the user asks about one, tell them to connect it first."
+        )
     if _disabled_subs:
-        disabled_hint = (
-            "\nSome tools are disabled by the user. If a user asks about a "
-            "capability that seems related to an available category, check if "
-            "it might be a disabled tool and let them know they can re-enable it."
+        hint_parts.append(
+            "Some tools are disabled by the user. If a request fits an available "
+            "category but no loaded tool, it may be a disabled one; tell the user "
+            "they can re-enable it."
         )
     return Tool(
         name=ToolName.LIST_CAPABILITIES,
         tags={ToolTags.READ_ONLY},
         description=(
-            "Discover specialist capabilities and look up usage guidance. "
-            "Call without arguments to see connected and unconnected categories. "
-            "Call with a category name for detailed usage guidance for that "
+            "Without arguments, list connected and unconnected specialist "
+            "categories. With a category name, return usage guidance for that "
             "category's already-loaded tools."
         ),
         function=list_capabilities,
         params_model=ListCapabilitiesParams,
-        usage_hint=(
-            "You have specialist capabilities (tools already loaded):\n"
-            f"{summary_block}\n"
-            "Call list_capabilities with a category name when you need usage "
-            "guidance for that category's tools."
-            f"{unauth_hint}"
-            f"{disabled_hint}"
-        ),
+        usage_hint=" ".join(hint_parts),
     )
 
 

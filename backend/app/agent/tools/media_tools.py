@@ -35,14 +35,11 @@ class AnalyzePhotoParams(BaseModel):
     """Parameters for the analyze_photo tool."""
 
     handle: str = Field(
-        description="The media handle token (e.g. 'media_ab12cd') from the attachment label.",
+        description="Media handle from the attachment label, e.g. 'media_ab12cd'.",
     )
     context: str = Field(
         default="",
-        description=(
-            "Optional short context to guide the analysis. "
-            "Leave empty to use the current turn's message text."
-        ),
+        description="Short context to guide the analysis. Omit to use the current message.",
     )
 
 
@@ -50,14 +47,10 @@ class DiscardMediaParams(BaseModel):
     """Parameters for the discard_media tool."""
 
     handle: str = Field(
-        description="The media handle token to discard.",
+        description="Media handle to discard.",
     )
     reason: str = Field(
-        description=(
-            "Why the media is being discarded. Quote the user's exact "
-            "request (e.g. 'user said \"don\\'t save this one\"') to skip "
-            "the approval prompt; otherwise the user is asked first."
-        ),
+        description="The user's request, quoted (e.g. 'user said \"don\\'t save this one\"').",
     )
 
 
@@ -141,39 +134,26 @@ def create_media_tools(
             name=ToolName.ANALYZE_PHOTO,
             tags={ToolTags.READ_ONLY},
             description=(
-                "Run vision analysis on a staged photo. Default: do not call. "
-                "Use only when the user has asked you to look at the image, or "
-                "you have a clear need to see its contents to help. Results "
-                "are cached per-handle within the session so calling twice on "
-                "the same handle is cheap. "
-                "The handle is a ``media_XXXXXX`` token that appears in the "
-                "conversation context; pass it exactly as shown. Calling "
-                "twice with the same handle is idempotent: the cached "
-                "result is returned. To analyze a different photo the user "
-                "must send it again to obtain a new handle. Other "
-                "integrations (CompanyCam, AppFolio) accept the same handle "
-                "for cross-tool flows."
+                "Run vision analysis on a staged photo. Default: do not call. Use it "
+                "only when the user asked you to look at the image or you need its "
+                "contents to help. Pass the handle as shown in the conversation. "
+                "Results are cached per handle, so a repeat call is cheap and returns "
+                "the same result; a different photo needs a new handle, so the user "
+                "must send it again. CompanyCam and AppFolio tools accept the same "
+                "handle."
             ),
             function=analyze_photo,
             params_model=AnalyzePhotoParams,
-            usage_hint=(
-                "analyze_photo describes a photo. Call only when the user "
-                "asked for analysis or you genuinely need to see what's in "
-                "the image to help."
-            ),
         ),
         Tool(
             name=ToolName.DISCARD_MEDIA,
             description=(
-                "Discard a staged photo the user asked you not to save. Use this "
-                "only when the user's current message explicitly asks to drop the "
-                "photo. Quote the user's phrase in the reason argument; the user "
-                "will be asked to confirm. Idempotent: discarding an already-"
-                "discarded handle is safe."
+                "Discard a staged photo. Use only when the user's current message "
+                "explicitly asks to drop it; the user is asked to confirm. "
+                "Idempotent."
             ),
             function=discard_media,
             params_model=DiscardMediaParams,
-            usage_hint="Drop a staged photo per explicit user request.",
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 description_builder=lambda args: (

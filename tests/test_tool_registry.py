@@ -15,7 +15,14 @@ from pydantic import BaseModel, Field
 
 import backend.app.agent.tools.registry as _reg
 from backend.app.agent.approval import PermissionLevel
-from backend.app.agent.tools.base import Tool, ToolResult, ToolTags, tool_to_function_schema
+from backend.app.agent.tools.base import (
+    Tool,
+    ToolResult,
+    ToolTags,
+    _inline_refs,
+    _strip_titles,
+    tool_to_function_schema,
+)
 from backend.app.agent.tools.registry import (
     ToolContext,
     default_registry,
@@ -329,6 +336,66 @@ def test_every_required_param_is_defined_in_properties() -> None:
         "Every name in a tool's `required` list must also appear in `properties`, "
         "or the model is asked for a parameter it has no way to supply:\n" + "\n".join(broken)
     )
+
+
+def _contract(prop: dict[str, object]) -> dict[str, object]:
+    """What a property schema promises, ignoring prose and the null branch.
+
+    Types, enum values and bounds from every non-null branch, plus any default
+    other than null or "". The schema compaction may drop noise around these
+    but must never change them.
+    """
+    branches = prop.get("anyOf")
+    alternatives = cast("list[dict[str, object]]", branches) if branches else [prop]
+    keys = ("type", "enum", "minimum", "maximum", "minLength", "maxLength", "pattern")
+    out: dict[str, object] = {
+        "branches": sorted(
+            repr({k: alt[k] for k in keys if k in alt})
+            for alt in alternatives
+            if alt != {"type": "null"}
+        )
+    }
+    if prop.get("default") not in (None, ""):
+        out["default"] = prop["default"]
+    return out
+
+
+def test_schema_compaction_keeps_every_param_contract() -> None:
+    """Compacting a tool schema drops noise, never a name, type, bound or requirement.
+
+    ``compact_input_schema`` removes the nullable ``anyOf`` branch and the
+    null / empty-string defaults from every params model the agent sees.
+    Compared against Pydantic's raw schema for each model, the parameter
+    names, ``required`` list, non-null types, enum values, bounds and
+    informative defaults must all be unchanged.
+    """
+    models = _all_tool_params_models()
+    assert len(models) > 40, f"discovery looks broken, only found {len(models)} params models"
+
+    async def _noop(**_: object) -> ToolResult:
+        return ToolResult(content="")
+
+    drifted: list[str] = []
+    for qualname, model in sorted(models.items()):
+        raw = _strip_titles(_inline_refs(model.model_json_schema()))
+        tool = Tool(name="probe", description="", function=_noop, params_model=model)
+        compact = tool_to_function_schema(tool)["input_schema"]
+
+        raw_props = raw.get("properties") or {}
+        compact_props = compact.get("properties") or {}
+        if set(raw_props) != set(compact_props):
+            drifted.append(f"{qualname}: parameter names changed")
+            continue
+        if set(raw.get("required") or []) != set(compact.get("required") or []):
+            drifted.append(f"{qualname}: required changed")
+        for name, prop in raw_props.items():
+            if _contract(prop) != _contract(compact_props[name]):
+                drifted.append(f"{qualname}.{name}: {prop} became {compact_props[name]}")
+            compact_branches = cast("list[object]", compact_props[name].get("anyOf", []))
+            if len(compact_branches) == 2 and {"type": "null"} in compact_branches:
+                drifted.append(f"{qualname}.{name}: nullable branch survived compaction")
+
+    assert not drifted, "\n".join(drifted)
 
 
 def test_strip_titles_keeps_a_parameter_named_title() -> None:

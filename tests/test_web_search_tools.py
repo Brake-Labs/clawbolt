@@ -872,8 +872,8 @@ class TestSearchParameters:
         schema = tool_to_function_schema(tool)
 
         freshness = schema["input_schema"]["properties"]["freshness"]
-        allowed = {v for branch in freshness["anyOf"] for v in branch.get("enum", [])}
-        assert allowed == {"pd", "pw", "pm", "py"}
+        assert set(freshness["enum"]) == {"pd", "pw", "pm", "py"}
+        assert freshness["type"] == "string"
 
     def test_only_query_is_required(self) -> None:
         """Both new parameters are optional, so existing behavior is unchanged

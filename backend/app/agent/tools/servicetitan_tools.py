@@ -401,68 +401,44 @@ def build_servicetitan_tools(service: ServiceTitanService) -> list[Tool]:
             name=ToolName.SERVICETITAN_SEARCH_CUSTOMERS,
             tags={ToolTags.READ_ONLY},
             description=(
-                "Search ServiceTitan customers by name or phone substring."
-                " Returns a compact list of matches with id, name, type,"
-                " address, and contacts. Use this before st_get_customer"
-                " when only a name or phone fragment is known."
+                "Search ServiceTitan customers by name or phone fragment; numeric"
+                " queries go to the phone filter. Returns id, name, type, address, and"
+                " contacts for each match. Use it before st_get_customer when only a"
+                " fragment is known."
             ),
             function=st_search_customers,
             params_model=StSearchCustomersParams,
-            usage_hint=(
-                "Pass a name fragment (e.g. 'Acme', 'Jane Doe') or a"
-                " partial phone number (e.g. '5550101'). Tool detects"
-                " numeric queries and routes them to the phone filter."
-            ),
         ),
         Tool(
             name=ToolName.SERVICETITAN_GET_CUSTOMER,
             tags={ToolTags.READ_ONLY},
             description=(
-                "Fetch the full ServiceTitan customer record by numeric"
-                " id. Returns name, type, address, contacts, balance,"
-                " and flags (inactive, do-not-mail, do-not-service)."
+                "Fetch a ServiceTitan customer by a confirmed id: name, type, address,"
+                " contacts, balance, and flags (inactive, do-not-mail, do-not-service)."
+                " Returns NOT_FOUND when the id is not in the tenant."
             ),
             function=st_get_customer,
             params_model=StGetCustomerParams,
-            usage_hint=(
-                "Use after st_search_customers has yielded a confirmed"
-                " customer id. Returns NOT_FOUND when the id does not"
-                " exist in the tenant."
-            ),
         ),
         Tool(
             name=ToolName.SERVICETITAN_LIST_APPOINTMENTS,
             tags={ToolTags.READ_ONLY},
             description=(
-                "List ServiceTitan appointments in a date range. Defaults"
-                " to today (UTC) when no dates are given. Optionally"
-                " filter by appointment status. Returns id, jobId,"
-                " start/end, status, and assigned technician ids."
+                "List ServiceTitan appointments in a date range, optionally by status."
+                " With no arguments, returns today's (UTC) dispatch view. Returns id,"
+                " jobId, start/end, status, and assigned technician ids."
             ),
             function=st_list_appointments,
             params_model=StListAppointmentsParams,
-            usage_hint=(
-                "Call with no arguments for today's dispatch view. Pass"
-                " from_date / to_date (ISO 8601) to widen or narrow the"
-                " window. Pass status to filter (Scheduled, Dispatched,"
-                " Working, Done, Hold)."
-            ),
         ),
         Tool(
             name=ToolName.SERVICETITAN_ADD_JOB_NOTE,
             description=(
-                "Add a plain-text note to a ServiceTitan job. Optionally"
-                " pin the note above other notes in the job's feed."
-                " Visible to anyone in the tenant with job access."
+                "Add a plain-text note to a ServiceTitan job, visible to anyone in the"
+                " tenant with job access. The user is asked to approve it."
             ),
             function=st_add_job_note,
             params_model=StAddJobNoteParams,
-            usage_hint=(
-                "Confirm the job id with the user before calling. Use"
-                " pin_to_top=True only when the user explicitly asks for"
-                " a pinned note. The tool requests user approval at"
-                " runtime via its ApprovalPolicy."
-            ),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 resource_extractor=lambda args: (

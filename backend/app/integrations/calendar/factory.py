@@ -82,47 +82,31 @@ class CalendarListCalendarsParams(BaseModel):
 class CalendarListEventsParams(BaseModel):
     """Parameters for the calendar_list_events tool."""
 
-    start_date: str = Field(
-        description=("Start of the time range in ISO 8601 format (e.g. 2026-03-23T00:00:00).")
-    )
-    end_date: str = Field(
-        description=("End of the time range in ISO 8601 format (e.g. 2026-03-30T23:59:59).")
-    )
-    calendar_id: str = Field(
-        default="",
-        description=(
-            "Calendar ID to query. Leave empty to query all enabled calendars. "
-            "Specify a calendar ID to query only that calendar."
-        ),
-    )
+    start_date: str = Field(description="Range start, ISO 8601 (e.g. 2026-03-23T00:00:00).")
+    end_date: str = Field(description="Range end, ISO 8601 (e.g. 2026-03-30T23:59:59).")
+    calendar_id: str = Field(default="", description="Calendar to query. Omit for all.")
 
 
 class CalendarCreateEventParams(BaseModel):
     """Parameters for the calendar_create_event tool."""
 
-    title: str = Field(description="Event title (e.g. 'Job: Smith Kitchen Remodel').")
-    start: str = Field(description="Event start in ISO 8601 format (e.g. 2026-03-25T09:00:00).")
-    end: str = Field(description="Event end in ISO 8601 format (e.g. 2026-03-25T17:00:00).")
-    description: str = Field(default="", description="Event description or notes.")
-    location: str = Field(default="", description="Event location address.")
+    title: str = Field(description="Event title, e.g. 'Job: Smith - Kitchen Remodel'.")
+    start: str = Field(description="Start, ISO 8601 (e.g. 2026-03-25T09:00:00).")
+    end: str = Field(description="End, ISO 8601 (e.g. 2026-03-25T17:00:00).")
+    description: str = Field(default="", description="Event notes.")
+    location: str = Field(default="", description="Event address.")
     calendar_id: str = Field(
         default="",
-        description=(
-            "Calendar ID to create the event on. Required when multiple calendars are enabled."
-        ),
+        description="Target calendar. Required when multiple calendars are enabled.",
     )
     reminder_minutes_before: int | None = Field(
         default=None,
         ge=0,
         le=40320,
         description=(
-            "Popup reminder offset in minutes before the event start. "
-            "Set this for timed reminders the user requested. Pass 0 to fire "
-            "the popup at the exact event start (use this for 'remind me at "
-            "2pm': set start to 2pm and reminder_minutes_before to 0). Pass "
-            "a positive value (e.g. 5) to fire ahead of the event. Omit to "
-            "let the user's Google Calendar default reminders apply. Max "
-            "40320 (4 weeks)."
+            "Popup reminder, in minutes before start; 0 fires at the start time. Set it "
+            "for reminders the user asked for. Omit to use the calendar's default "
+            "reminders."
         ),
     )
 
@@ -130,37 +114,34 @@ class CalendarCreateEventParams(BaseModel):
 class CalendarUpdateEventParams(BaseModel):
     """Parameters for the calendar_update_event tool."""
 
-    event_id: str = Field(description="Google Calendar event ID to update.")
+    event_id: str = Field(description="Event ID from calendar_list_events.")
     title: str | None = Field(default=None, description="New event title.")
-    start: str | None = Field(default=None, description="New start in ISO 8601 format.")
-    end: str | None = Field(default=None, description="New end in ISO 8601 format.")
+    start: str | None = Field(default=None, description="New start, ISO 8601.")
+    end: str | None = Field(default=None, description="New end, ISO 8601.")
     description: str | None = Field(default=None, description="New description.")
     location: str | None = Field(default=None, description="New location.")
     calendar_id: str = Field(
         default="",
-        description=("Calendar ID. Required when multiple calendars are enabled."),
+        description="Required when multiple calendars are enabled.",
     )
 
 
 class CalendarDeleteEventParams(BaseModel):
     """Parameters for the calendar_delete_event tool."""
 
-    event_id: str = Field(description="Google Calendar event ID to delete.")
+    event_id: str = Field(description="Event ID from calendar_list_events.")
     calendar_id: str = Field(
         default="",
-        description=("Calendar ID. Required when multiple calendars are enabled."),
+        description="Required when multiple calendars are enabled.",
     )
 
 
 class CalendarCheckAvailabilityParams(BaseModel):
     """Parameters for the calendar_check_availability tool."""
 
-    start_date: str = Field(description="Start of the range in ISO 8601 format.")
-    end_date: str = Field(description="End of the range in ISO 8601 format.")
-    calendar_id: str = Field(
-        default="",
-        description=("Calendar ID to check. Leave empty to check all enabled calendars."),
-    )
+    start_date: str = Field(description="Range start, ISO 8601.")
+    end_date: str = Field(description="Range end, ISO 8601.")
+    calendar_id: str = Field(default="", description="Calendar to check. Omit for all.")
 
 
 # ---------------------------------------------------------------------------
@@ -999,13 +980,13 @@ def create_calendar_tools(
             name=ToolName.CALENDAR_LIST_CALENDARS,
             tags={ToolTags.READ_ONLY},
             description=(
-                "List the calendars the user has enabled for the assistant. "
-                "Shows calendar names and IDs, the connected Google account, and flags "
-                "saved calendars that account can no longer see."
+                "List the calendars enabled for the assistant: names, IDs, access, and "
+                "the connected Google account, flagging saved calendars that account "
+                "can no longer see. Use it to pick the right calendar and to confirm "
+                "write access before creating, updating, or deleting an event."
             ),
             function=calendar_list_calendars,
             params_model=CalendarListCalendarsParams,
-            usage_hint=("List enabled calendars to help the user pick the right one."),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ALWAYS,
             ),
@@ -1014,20 +995,15 @@ def create_calendar_tools(
             name=ToolName.CALENDAR_LIST_EVENTS,
             tags={ToolTags.READ_ONLY},
             description=(
-                "List events on Google Calendar within a date range. "
-                "Returns event titles, times, locations, and IDs, grouped by "
-                "calendar and day. When no calendar_id is specified, queries all "
-                f"enabled calendars. Lists at most {_MAX_LISTED_EVENTS} events, "
-                "earliest first; a footer counts the rest per calendar."
+                "List Google Calendar events in a date range (all enabled calendars "
+                "unless calendar_id is set): titles, times, locations, and IDs, grouped "
+                f"by calendar and day. Lists at most {_MAX_LISTED_EVENTS} events, "
+                "earliest first; a footer counts the rest per calendar. Keep ranges to "
+                "a month or less; if the result is capped, narrow the range or pass "
+                "calendar_id."
             ),
             function=calendar_list_events,
             params_model=CalendarListEventsParams,
-            usage_hint=(
-                "List upcoming calendar events. Use ISO 8601 dates. "
-                "Always check the calendar before scheduling new events. "
-                "Keep ranges to a month or less; if the result is capped, "
-                "narrow the range or pass calendar_id."
-            ),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 description_builder=lambda args: (
@@ -1038,19 +1014,13 @@ def create_calendar_tools(
         Tool(
             name=ToolName.CALENDAR_CREATE_EVENT,
             description=(
-                "Create a new event on Google Calendar. "
-                "Some calendars are read-only; check calendar_list_calendars "
-                "first to verify the target calendar allows creation. "
-                "Use 'Job: {client} - {description}' format for job events. "
-                "Include the job location. "
-                "Specify calendar_id when multiple calendars are enabled."
+                "Create a Google Calendar event. First confirm the calendar allows "
+                "writes and check availability with calendar_check_availability. Title "
+                "job events 'Job: {client} - {description}' and include the job "
+                "location."
             ),
             function=calendar_create_event,
             params_model=CalendarCreateEventParams,
-            usage_hint=(
-                "Create a calendar event. Check calendar_list_calendars for write access "
-                "and availability first. Use 'Job: Client - Description' format for job titles."
-            ),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 resource_extractor=lambda args: "create event",
@@ -1062,17 +1032,11 @@ def create_calendar_tools(
         Tool(
             name=ToolName.CALENDAR_UPDATE_EVENT,
             description=(
-                "Update an existing Google Calendar event. "
-                "Only works on calendars with update access (check calendar_list_calendars). "
-                "Pass the event_id from a prior calendar_list_events call "
-                "and only the fields to change."
+                "Update a Google Calendar event on a calendar that allows updates. "
+                "Pass only the fields to change."
             ),
             function=calendar_update_event,
             params_model=CalendarUpdateEventParams,
-            usage_hint=(
-                "Update an existing event. Verify the calendar allows updates first. "
-                "Get the event_id from calendar_list_events."
-            ),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 # Coarse resource (not per-event_id) so "always allow" and the
@@ -1091,16 +1055,11 @@ def create_calendar_tools(
         Tool(
             name=ToolName.CALENDAR_DELETE_EVENT,
             description=(
-                "Delete an event from Google Calendar. "
-                "Only works on calendars with delete access (check calendar_list_calendars). "
-                "Pass the event_id from a prior calendar_list_events call."
+                "Delete a Google Calendar event on a calendar that allows deletes. "
+                "Confirm with the user first."
             ),
             function=calendar_delete_event,
             params_model=CalendarDeleteEventParams,
-            usage_hint=(
-                "Delete a calendar event. Verify the calendar allows deletion first. "
-                "Confirm with the user before deleting."
-            ),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 # Coarse resource (not per-event_id) so "always allow" and the
@@ -1114,16 +1073,12 @@ def create_calendar_tools(
             name=ToolName.CALENDAR_CHECK_AVAILABILITY,
             tags={ToolTags.READ_ONLY},
             description=(
-                "Check free/busy status on Google Calendar for a date range. "
-                "Returns busy time slots. Use this before suggesting new "
-                "appointment times. "
-                "When no calendar_id is specified, checks all enabled calendars."
+                "Return busy time slots in a date range (all enabled calendars unless "
+                "calendar_id is set). Use it before suggesting appointment times or "
+                "creating an event."
             ),
             function=calendar_check_availability,
             params_model=CalendarCheckAvailabilityParams,
-            usage_hint=(
-                "Check availability before scheduling. Always use this before creating events."
-            ),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 description_builder=lambda args: (

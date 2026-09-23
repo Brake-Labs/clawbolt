@@ -109,12 +109,11 @@ class QBQueryParams(BaseModel):
 
     query: str = Field(
         description=(
-            "A QBO query string (SELECT only). Example: SELECT * FROM Invoice MAXRESULTS 20.\n"
-            "Common string-enum values that the model often gets wrong:\n"
+            "SELECT only, e.g. SELECT * FROM Invoice MAXRESULTS 20. Enum values often "
+            "gotten wrong:\n"
             "  Estimate.TxnStatus = 'Pending' | 'Accepted' | 'Closed' | 'Rejected'\n"
             "  Invoice.EmailStatus = 'NotSet' | 'NeedToSend' | 'EmailSent'\n"
-            "  Bill / Invoice / Estimate balance filtering uses Balance numeric, "
-            "  not a status enum."
+            "Filter Bill / Invoice / Estimate by the numeric Balance, not a status enum."
         )
     )
 
@@ -247,14 +246,8 @@ def _coerce_data_to_dict(value: Any) -> Any:
 class QBCreateParams(BaseModel):
     """Parameters for the qb_create tool."""
 
-    entity_type: str = Field(
-        description="QBO entity type to create: Customer, Estimate, Invoice, or Item"
-    )
-    data: dict[str, Any] = Field(
-        description=(
-            "QBO API payload for the entity as a JSON object. See SKILL.md for payload formats."
-        )
-    )
+    entity_type: str = Field(description="Customer, Estimate, Invoice, or Item.")
+    data: dict[str, Any] = Field(description="QBO API payload as a JSON object.")
 
     _coerce_data = field_validator("data", mode="before")(_coerce_data_to_dict)
 
@@ -262,15 +255,13 @@ class QBCreateParams(BaseModel):
 class QBUpdateParams(BaseModel):
     """Parameters for the qb_update tool."""
 
-    entity_type: str = Field(
-        description="QBO entity type to update: Customer, Estimate, Invoice, or Item"
-    )
+    entity_type: str = Field(description="Customer, Estimate, Invoice, or Item.")
     data: dict[str, Any] = Field(
         description=(
             "Only what changes, plus Id and SyncToken from a qb_query of this record. "
             "Fields you omit are kept. Line entries: with a line's Id, only the keys "
             "you send change on that line; without Id, the line is added. Lines you "
-            "omit are kept. See SKILL.md."
+            "omit are kept."
         )
     )
     delete_line_ids: list[str] = Field(
@@ -292,12 +283,12 @@ class QBSendParams(BaseModel):
     """Parameters for the qb_send tool."""
 
     entity_type: str = Field(
-        description="QBO entity type to send: Invoice or Estimate",
+        description="Invoice or Estimate.",
         default="Invoice",
     )
-    entity_id: str = Field(description="QuickBooks entity ID (numeric)")
+    entity_id: str = Field(description="QuickBooks entity ID (numeric).")
     email: str = Field(
-        description="Email address to send to",
+        description="Recipient email address.",
         pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$",
     )
 
@@ -1041,19 +1032,14 @@ def create_quickbooks_tools(
             name=ToolName.QB_QUERY,
             tags={ToolTags.READ_ONLY},
             description=(
-                "Run a read-only query against QuickBooks Online using QBO query language "
-                "(SQL-like SELECT statements). Use this to look up invoices, estimates, "
-                "customers, items, payments, and more. See the QuickBooks skill for "
-                "query syntax and available entities."
-            ),
-            function=qb_query,
-            params_model=QBQueryParams,
-            usage_hint=(
-                "Query QuickBooks for invoices, estimates, customers, items, and more. "
-                "Use SELECT ... FROM <Entity> syntax. Results over "
+                "Run a read-only QuickBooks Online query (SQL-like SELECT ... FROM "
+                "<Entity>) for invoices, estimates, customers, items, payments, and "
+                "more; the QuickBooks skill has the syntax and entities. Results over "
                 f"{_COMPACT_ABOVE_ROWS} rows are compact (filler dropped, long text "
                 "cut); query WHERE Id = '<Id>' for a whole record."
             ),
+            function=qb_query,
+            params_model=QBQueryParams,
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 resource_extractor=_extract_query_entity,
@@ -1063,17 +1049,12 @@ def create_quickbooks_tools(
         Tool(
             name=ToolName.QB_CREATE,
             description=(
-                "Create an entity in QuickBooks Online. Pass the entity type "
-                "(Customer, Estimate, Invoice, or Item) and the QBO API payload. "
-                "See the QuickBooks skill for payload formats and examples."
+                "Create a Customer, Estimate, Invoice, or Item in QuickBooks Online "
+                "from a QBO API payload built as the QuickBooks skill describes."
             ),
             function=qb_create,
             params_model=QBCreateParams,
             concurrency_group=_QB_WRITE_CONCURRENCY_GROUP,
-            usage_hint=(
-                "Create a Customer, Estimate, Invoice, or Item in QB. "
-                "Construct the QBO API payload as described in the skill docs."
-            ),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 resource_extractor=_extract_entity_type,
@@ -1085,19 +1066,12 @@ def create_quickbooks_tools(
         Tool(
             name=ToolName.QB_UPDATE,
             description=(
-                "Update an existing Customer, Estimate, Invoice, or Item in QuickBooks "
-                "Online. Send only what changes, with Id and SyncToken from a qb_query "
-                "of that record; the tool merges it into the stored record, so omitted "
-                "fields and lines are kept. See the QuickBooks skill."
+                "Update a Customer, Estimate, Invoice, or Item in QuickBooks Online. "
+                "The tool merges data into the stored record; see the QuickBooks skill."
             ),
             function=qb_update,
             params_model=QBUpdateParams,
             concurrency_group=_QB_WRITE_CONCURRENCY_GROUP,
-            usage_hint=(
-                "Update a Customer, Estimate, Invoice, or Item in QB. Send only the "
-                "change plus Id and SyncToken. Lines: by Id to change, no Id to add, "
-                "delete_line_ids to remove."
-            ),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 resource_extractor=_extract_entity_type,
@@ -1108,16 +1082,13 @@ def create_quickbooks_tools(
         Tool(
             name=ToolName.QB_SEND,
             description=(
-                "Send an invoice or estimate to a customer via QuickBooks email. "
-                "Pass the Id returned by qb_create or qb_query; never predict one."
+                "Email an invoice or estimate to a customer through QuickBooks. Pass "
+                "the Id returned by qb_create or qb_query; never predict one. Confirm "
+                "the email address with the user first."
             ),
             function=qb_send,
             params_model=QBSendParams,
             concurrency_group=_QB_WRITE_CONCURRENCY_GROUP,
-            usage_hint=(
-                "Send a QB invoice or estimate by email. "
-                "Confirm the email address with the user first."
-            ),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 resource_extractor=_extract_send_email,

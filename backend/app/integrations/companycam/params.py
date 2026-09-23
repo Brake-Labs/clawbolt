@@ -38,106 +38,103 @@ def _coerce_tags_to_list(value: Any) -> Any:
 
 
 class CompanyCamSearchParams(BaseModel):
-    query: str = Field(description="Search term: project name, address, or keyword")
+    query: str = Field(description="Client name, address, or keyword.")
 
 
 class CompanyCamCreateProjectParams(BaseModel):
-    name: str = Field(description="Project name (typically client name and address)")
-    address: str = Field(default="", description="Street address for the project")
+    name: str = Field(description="Project name: the client name and address.")
+    address: str = Field(default="", description="Street address.")
 
 
 class CompanyCamUpdateProjectParams(BaseModel):
-    project_id: str = Field(description="CompanyCam project ID to update")
-    name: str = Field(default="", description="New project name (leave empty to keep current)")
-    address: str = Field(default="", description="New street address (leave empty to keep current)")
+    project_id: str = Field(description="CompanyCam project ID.")
+    name: str = Field(default="", description="New project name. Omit to keep.")
+    address: str = Field(default="", description="New street address. Omit to keep.")
 
 
 class CompanyCamUploadPhotoParams(BaseModel):
-    project_id: str = Field(description="CompanyCam project ID to upload to")
+    project_id: str = Field(description="CompanyCam project ID.")
     original_url: str = Field(
-        description=(
-            "The handle of the photo to upload (e.g. ``media_XXXXXX`` as shown "
-            "in the conversation context). Required; do not leave blank."
-        ),
+        description="Media handle of the photo, e.g. 'media_ab12cd'. Never blank.",
     )
-    description: str = Field(default="", description="Photo description")
-    tags: list[str] = Field(default_factory=list, description="Tags to apply to the photo")
+    description: str = Field(default="", description="Photo description.")
+    tags: list[str] = Field(
+        default_factory=list, description="Tags, e.g. 'kitchen', 'demo', 'before'."
+    )
 
     _coerce_tags = field_validator("tags", mode="before")(_coerce_tags_to_list)
 
 
 class CompanyCamGetProjectParams(BaseModel):
-    project_id: str = Field(description="CompanyCam project ID")
+    project_id: str = Field(description="CompanyCam project ID.")
 
 
 class CompanyCamArchiveProjectParams(BaseModel):
-    project_id: str = Field(description="CompanyCam project ID to archive")
+    project_id: str = Field(description="CompanyCam project ID.")
 
 
 class CompanyCamDeleteProjectParams(BaseModel):
-    project_id: str = Field(description="CompanyCam project ID to permanently delete")
+    project_id: str = Field(description="CompanyCam project ID.")
 
 
 class CompanyCamUpdateNotepadParams(BaseModel):
-    project_id: str = Field(description="CompanyCam project ID")
-    notepad: str = Field(description="New notepad content for the project")
+    project_id: str = Field(description="CompanyCam project ID.")
+    notepad: str = Field(description="New notepad content.")
 
 
 class CompanyCamListDocumentsParams(BaseModel):
-    project_id: str = Field(description="CompanyCam project ID")
-    page: int = Field(default=1, description="Page number (default 1)")
+    project_id: str = Field(description="CompanyCam project ID.")
+    page: int = Field(default=1, description="Page number.")
 
 
 class CompanyCamAddCommentParams(BaseModel):
-    target_type: str = Field(description="Type of target: 'project' or 'photo'")
-    target_id: str = Field(description="ID of the project or photo to comment on")
-    content: str = Field(description="Comment text")
+    target_type: str = Field(description="'project' or 'photo'.")
+    target_id: str = Field(description="Project or photo ID.")
+    content: str = Field(description="Comment text.")
 
 
 class CompanyCamListCommentsParams(BaseModel):
-    target_type: str = Field(description="Type of target: 'project' or 'photo'")
-    target_id: str = Field(description="ID of the project or photo")
-    page: int = Field(default=1, description="Page number (default 1)")
+    target_type: str = Field(description="'project' or 'photo'.")
+    target_id: str = Field(description="Project or photo ID.")
+    page: int = Field(default=1, description="Page number.")
 
 
 class CompanyCamTagPhotoParams(BaseModel):
-    photo_id: str = Field(description="CompanyCam photo ID to tag")
-    tags: list[str] = Field(description="Tags to add to the photo")
+    photo_id: str = Field(description="CompanyCam photo ID.")
+    tags: list[str] = Field(description="Tags, e.g. 'before', 'kitchen', 'damage'.")
 
     _coerce_tags = field_validator("tags", mode="before")(_coerce_tags_to_list)
 
 
 class CompanyCamDeletePhotoParams(BaseModel):
-    photo_id: str = Field(description="CompanyCam photo ID to permanently delete")
+    photo_id: str = Field(description="CompanyCam photo ID.")
 
 
 class CompanyCamSearchPhotosParams(BaseModel):
     project_id: str = Field(
         default="",
-        description="Optional: filter to a specific project ID",
+        description="Project ID to filter to.",
     )
     start_date: str = Field(
         default="",
-        description="Optional: start date filter (ISO format, e.g. 2024-01-15)",
+        description="Start date, ISO (e.g. 2024-01-15).",
     )
     end_date: str = Field(
         default="",
-        description="Optional: end date filter (ISO format, e.g. 2024-01-31)",
+        description="End date, ISO (e.g. 2024-01-31).",
     )
-    page: int = Field(default=1, description="Page number (default 1)")
+    page: int = Field(default=1, description="Page number.")
 
 
 class CompanyCamListChecklistsParams(BaseModel):
-    project_id: str = Field(description="CompanyCam project ID")
+    project_id: str = Field(description="CompanyCam project ID.")
 
 
 class CompanyCamGetChecklistParams(BaseModel):
-    project_id: str = Field(description="CompanyCam project ID")
-    checklist_id: str = Field(description="Checklist ID to retrieve")
+    project_id: str = Field(description="CompanyCam project ID.")
+    checklist_id: str = Field(description="Checklist ID.")
 
 
 class CompanyCamCreateChecklistParams(BaseModel):
-    project_id: str = Field(description="CompanyCam project ID")
-    template_id: str = Field(
-        description="Checklist template ID to create from (use list_checklists to find templates)"
-    )
+    project_id: str = Field(description="CompanyCam project ID.")
+    template_id: str = Field(description="Checklist template ID.")

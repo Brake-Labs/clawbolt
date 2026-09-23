@@ -73,11 +73,10 @@ def create_messaging_tools(
     return [
         Tool(
             name=ToolName.SEND_MEDIA_REPLY,
-            description="Send a reply with a media attachment (e.g., PDF estimate).",
+            description="Send a reply with a file or image attached, e.g. a PDF estimate.",
             function=send_media_reply,
             params_model=SendMediaReplyParams,
             tags={ToolTags.SENDS_REPLY},
-            usage_hint=("When sending estimates or files, use this to send media to the user."),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ALWAYS,
                 description_builder=lambda args: "Send a file attachment",

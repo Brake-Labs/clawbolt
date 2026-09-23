@@ -1583,3 +1583,18 @@ async def test_preferred_channel_updates_on_channel_switch() -> None:
 
     assert resolved.id == "channel-switch-user"
     assert resolved.preferred_channel == "linq"
+
+
+def test_build_onboarding_system_prompt_includes_proactive_rules() -> None:
+    """Heartbeat and timed-reminder rules reach the onboarding agent too.
+
+    instructions.md and update_heartbeat defer to the Proactive Messaging
+    section, and onboarding users have the heartbeat and calendar tools.
+    """
+    user = User(id="8", user_id="proactive-test", phone="+15550007777")
+    _create_bootstrap(user)
+
+    prompt = build_onboarding_system_prompt(user)
+    assert "## Proactive Messaging" in prompt
+    assert "reminder_minutes_before=0" in prompt
+    assert "I'll ping you" in prompt

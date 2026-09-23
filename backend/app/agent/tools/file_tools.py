@@ -51,29 +51,22 @@ class UploadToStorageParams(BaseModel):
 
     folder_path: str | None = Field(
         default=None,
-        description=(
-            "Destination folder, leading slash required (e.g. '/Inbox', "
-            "'/Acme - 123 Main/photos'). Defaults to /Inbox when omitted."
-        ),
+        description="Destination folder with leading slash, e.g. '/Acme - 123 Main/photos'. "
+        "Defaults to /Inbox.",
     )
     description: str = Field(
         default="",
-        description=(
-            "Short human-readable description of the file. Used as the "
-            "Drive description field and as the filename slug."
-        ),
+        description="Short description of the file; used as the Drive description and "
+        "the filename slug.",
     )
     original_url: str | None = Field(
         default=None,
-        description=(
-            "Original URL or media handle (e.g. 'media_ab12cd') of the file "
-            "to upload. When omitted, the tool uses the only file attached "
-            "to the current message, or the most recently staged file."
-        ),
+        description="URL or media handle (e.g. 'media_ab12cd') of the file. Omit to use the "
+        "only file on the current message, else the most recently staged one.",
     )
     mime_type: str = Field(
         default="image/jpeg",
-        description="MIME type of the file (default: image/jpeg)",
+        description="MIME type of the file.",
     )
 
 
@@ -81,22 +74,15 @@ class MoveFileParams(BaseModel):
     """Parameters for the move_file tool."""
 
     from_path: str = Field(
-        description=(
-            "Current storage path of the file, as quoted by find_saved_files"
-            " (e.g. /Inbox/photo_001.jpg)"
-        ),
+        description="Storage path from find_saved_files, e.g. /Inbox/photo_001.jpg.",
     )
     to_folder_path: str = Field(
-        description=(
-            "Destination folder, leading slash required (e.g. '/Acme - 123 Main/photos')."
-        ),
+        description="Destination folder with leading slash, e.g. '/Acme - 123 Main/photos'.",
     )
     new_filename: str | None = Field(
         default=None,
-        description=(
-            "Optional new filename. When omitted the original filename is"
-            " kept (with a numeric suffix if a name collision occurs)."
-        ),
+        description="New filename. Omit to keep the current name (a numeric suffix is "
+        "added on collision).",
     )
 
 
@@ -105,16 +91,14 @@ class FindSavedFilesParams(BaseModel):
 
     query: str = Field(
         default="",
-        description=(
-            "Short text to match against filenames or saved descriptions. "
-            "Leave empty to list the most recent saved files."
-        ),
+        description="Text to match against filenames or saved descriptions. Omit to list "
+        "the most recent files.",
     )
     limit: int = Field(
         default=5,
         ge=1,
         le=10,
-        description="Maximum number of saved files to return.",
+        description="Maximum files to return.",
     )
 
 
@@ -122,14 +106,11 @@ class AnalyzeSavedFileParams(BaseModel):
     """Parameters for the analyze_saved_file tool."""
 
     file_ref: str = Field(
-        description=(
-            "Saved file reference from find_saved_files, normally a storage path"
-            " like /Astro Home/photos/foo.jpg"
-        ),
+        description="Storage path from find_saved_files, e.g. /Acme - 123 Main/photos/foo.jpg.",
     )
     context: str = Field(
         default="",
-        description="Optional short context to guide the analysis.",
+        description="Short context to guide the analysis.",
     )
 
 
@@ -138,28 +119,18 @@ class WriteToStorageParams(BaseModel):
 
     folder_path: str | None = Field(
         default=None,
-        description=(
-            "Destination folder, leading slash required (e.g. '/Inbox', "
-            "'/Acme - 123 Main/docs'). Defaults to /Inbox when omitted."
-        ),
+        description="Destination folder with leading slash, e.g. '/Acme - 123 Main/docs'. "
+        "Defaults to /Inbox.",
     )
     filename: str = Field(
-        description=(
-            "Filename to create (e.g. 'hi.txt', 'notes.md'). The file is "
-            "created as a new file; if a file with the same name already "
-            "exists in the destination folder, a numeric suffix is added "
-            "to avoid overwriting."
-        ),
+        description="Filename, e.g. 'notes.md'.",
     )
     content: str = Field(
-        description=(
-            "Text content to write to the file. The agent generates this "
-            "content from the conversation."
-        ),
+        description="Text content of the file.",
     )
     mime_type: str = Field(
         default="text/plain",
-        description="MIME type of the file (default: text/plain).",
+        description="MIME type of the file.",
     )
 
 
@@ -167,20 +138,13 @@ class EditStorageFileParams(BaseModel):
     """Parameters for the edit_storage_file tool."""
 
     file_path: str = Field(
-        description=(
-            "Storage path of the file to edit, as quoted by find_saved_files"
-            " (e.g. /Inbox/notes.txt)."
-        ),
+        description="Storage path from find_saved_files, e.g. /Inbox/notes.txt.",
     )
     old_text: str = Field(
-        description=(
-            "Exact text to find and replace in the file. Must match "
-            "uniquely; read the file first via read_from_storage to see "
-            "current contents."
-        ),
+        description="Text to replace; must match once in the file.",
     )
     new_text: str = Field(
-        description="Replacement text for the matched old_text.",
+        description="Replacement text.",
     )
 
 
@@ -188,10 +152,7 @@ class ReadFromStorageParams(BaseModel):
     """Parameters for the read_from_storage tool."""
 
     file_path: str = Field(
-        description=(
-            "Storage path of the file to read, as quoted by find_saved_files"
-            " (e.g. /Inbox/notes.txt)."
-        ),
+        description="Storage path from find_saved_files, e.g. /Inbox/notes.txt.",
     )
 
 
@@ -883,16 +844,12 @@ def create_file_tools(
         Tool(
             name=ToolName.UPLOAD_TO_STORAGE,
             description=(
-                "Upload a file attached to the current message (or a recently "
-                "received one still in the staging cache) to the user's cloud "
-                "storage. The caller picks the destination folder via "
-                "folder_path; when omitted the file lands in /Inbox. The "
-                "result includes a share link the user can tap. To move a "
-                "file that was already saved on a prior turn, use move_file."
+                "Upload a file from the current message, or one recently received and "
+                "still staged, to the user's Drive. Returns a share link the user can "
+                "tap. For a file saved on an earlier turn, use move_file."
             ),
             function=upload_to_storage,
             params_model=UploadToStorageParams,
-            usage_hint="Save a recently received file to the user's Drive and return the link.",
             # Serialize storage mutations within a turn so two uploads (or an
             # upload + move) cannot race on filename indexing or
             # collision-avoidance suffixing against the same Drive folder.
@@ -907,16 +864,11 @@ def create_file_tools(
         Tool(
             name=ToolName.MOVE_FILE,
             description=(
-                "Move a previously saved file to a new folder, optionally "
-                "renaming it. Use this when the user later supplies the "
-                "context that decides where a file should live (a client "
-                "folder, a topic-specific folder, etc.). Quote from_path "
-                "from find_saved_files (for example /Inbox/photo_001.jpg) "
-                "and pass to_folder_path with a leading slash."
+                "Move a saved file to another folder, optionally renaming it, e.g. once "
+                "the user says which client it belongs to."
             ),
             function=move_file,
             params_model=MoveFileParams,
-            usage_hint="Move a saved file to a different folder in the user's Drive.",
             concurrency_group="user_storage",
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
@@ -929,15 +881,13 @@ def create_file_tools(
             name=ToolName.FIND_SAVED_FILES,
             tags={ToolTags.READ_ONLY},
             description=(
-                "Find files that were already saved to durable storage. Use this "
-                "to pull up older receipts, photos, or documents by client name, "
-                "address, filename, or saved description. Only returns files "
-                "Clawbolt uploaded itself; files the user added to the Clawbolt "
-                "folder directly in Drive are not visible to this tool."
+                "Find files Clawbolt saved to the user's Drive (receipts, photos, "
+                "documents) by client name, address, filename, or saved description. "
+                "Search here before asking the user to resend a file. Files the user "
+                "added to the Drive folder directly are not visible."
             ),
             function=find_saved_files,
             params_model=FindSavedFilesParams,
-            usage_hint="Search durable saved files before asking the user to resend one.",
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 description_builder=lambda args: (
@@ -951,12 +901,11 @@ def create_file_tools(
             name=ToolName.ANALYZE_SAVED_FILE,
             tags={ToolTags.READ_ONLY},
             description=(
-                "Run vision analysis on a previously saved image in durable storage. "
-                "Quote the storage path returned by find_saved_files. Only works on images."
+                "Run vision analysis on a saved image, e.g. to inspect a receipt or "
+                "photo again without asking for a resend. Images only."
             ),
             function=analyze_saved_file,
             params_model=AnalyzeSavedFileParams,
-            usage_hint="Inspect a saved receipt or photo again without asking for a resend.",
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 description_builder=lambda args: f"Analyze saved file {args['file_ref']}",
@@ -965,15 +914,12 @@ def create_file_tools(
         Tool(
             name=ToolName.WRITE_TO_STORAGE,
             description=(
-                "Create a new text file in cloud storage with AI-generated content. "
-                "Use this when the user asks you to write a file from text you generate "
-                "(notes, summaries, documents, etc.). The file lands in the specified "
-                "folder; if a file with the same name already exists, a numeric suffix "
-                "is added to avoid overwriting."
+                "Create a new text file in the user's Drive from content you write "
+                "(notes, summaries, documents). An existing filename gets a numeric "
+                "suffix instead of being overwritten."
             ),
             function=write_to_storage,
             params_model=WriteToStorageParams,
-            usage_hint="Create a text file in the user's Drive from AI-generated content.",
             concurrency_group="user_storage",
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
@@ -985,14 +931,11 @@ def create_file_tools(
         Tool(
             name=ToolName.EDIT_STORAGE_FILE,
             description=(
-                "Edit an existing text file in cloud storage by replacing exact text. "
-                "Use this for targeted updates to notes, documents, or config files "
-                "in the user's Drive. Read the file first via read_from_storage to see "
-                "current contents."
+                "Edit a text file in the user's Drive by replacing exact text. Read it "
+                "first with read_from_storage."
             ),
             function=edit_storage_file,
             params_model=EditStorageFileParams,
-            usage_hint="Edit a text file in the user's Drive by replacing specific text.",
             concurrency_group="user_storage",
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
@@ -1003,14 +946,11 @@ def create_file_tools(
             name=ToolName.READ_FROM_STORAGE,
             tags={ToolTags.READ_ONLY},
             description=(
-                "Read a text file from cloud storage and return its contents. "
-                "Use this to view notes, documents, or config files that were "
-                "previously saved to the user's Drive. Only works on text files "
-                "created by write_to_storage or uploaded via upload_to_storage."
+                "Read a text file from the user's Drive. Works only on text files "
+                "Clawbolt wrote or uploaded."
             ),
             function=read_from_storage,
             params_model=ReadFromStorageParams,
-            usage_hint="Read a text file from the user's Drive.",
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 description_builder=lambda args: f"Read file {args.get('file_path', '')}",

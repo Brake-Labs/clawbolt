@@ -238,6 +238,71 @@ def _strip_titles(obj: Any, *, _in_name_map: bool = False) -> Any:
     return obj
 
 
+def _collapse_optional(prop: dict[str, Any]) -> dict[str, Any]:
+    """Rewrite one property's ``X | None = None`` schema as plain ``X``.
+
+    Pydantic renders an optional field as ``anyOf: [{X}, {"type": "null"}]``
+    plus ``default: null``. The parameter is already optional by being absent
+    from ``required``, so the null branch and the null default are noise the
+    model reads on every request. An empty-string default says no more than
+    that. The params model still accepts an explicit null and still fills the
+    default when the parameter is omitted, so validation is unchanged. A union
+    with more than one non-null branch is left alone.
+    """
+    branches = prop.get("anyOf")
+    if isinstance(branches, list) and len(branches) == 2:
+        non_null = [b for b in branches if b != {"type": "null"}]
+        if len(non_null) == 1 and isinstance(non_null[0], dict):
+            # The field's own keys (description, default) win over the
+            # branch's: an inlined nested model carries its docstring as
+            # ``description`` and would otherwise replace the field's.
+            merged = dict(non_null[0])
+            merged.update({k: v for k, v in prop.items() if k != "anyOf"})
+            prop = merged
+    if "default" in prop and (prop["default"] is None or prop["default"] == ""):
+        prop = {k: v for k, v in prop.items() if k != "default"}
+    return prop
+
+
+def _compact_properties(obj: Any) -> Any:
+    """Apply :func:`_collapse_optional` to every property schema, at any depth.
+
+    Keys of a ``properties`` map are parameter names, not keywords, so the
+    walk steps over them the way :func:`_strip_titles` does.
+    """
+    if isinstance(obj, list):
+        return [_compact_properties(item) for item in obj]
+    if not isinstance(obj, dict):
+        return obj
+    out: dict[str, Any] = {}
+    for key, value in obj.items():
+        if key == "properties" and isinstance(value, dict):
+            out[key] = {
+                name: _collapse_optional(_compact_properties(p)) if isinstance(p, dict) else p
+                for name, p in value.items()
+            }
+        else:
+            out[key] = _compact_properties(value)
+    return out
+
+
+def compact_input_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Drop JSON Schema noise that costs prompt tokens and carries no meaning.
+
+    - The root ``description`` is the params model's docstring, written for
+      developers ("Parameters for the X tool."). The tool's own description
+      is what the model reads.
+    - Optional parameters lose the ``null`` branch and ``null`` / ``""``
+      defaults (see :func:`_collapse_optional`).
+
+    Types, required-ness, enums, bounds and parameter descriptions are kept,
+    and the result is plain JSON Schema that both the Anthropic and OpenAI
+    tool formats accept.
+    """
+    schema = {k: v for k, v in schema.items() if k != "description"}
+    return _compact_properties(schema)
+
+
 def tool_to_function_schema(tool: Tool) -> dict[str, Any]:
     """Convert a Tool to the Anthropic Messages API tool schema.
 
@@ -248,6 +313,7 @@ def tool_to_function_schema(tool: Tool) -> dict[str, Any]:
     schema = tool.params_model.model_json_schema()
     schema = _inline_refs(schema)
     schema = _strip_titles(schema)
+    schema = compact_input_schema(schema)
 
     return {
         "name": tool.name,

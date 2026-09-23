@@ -248,6 +248,7 @@ def build_onboarding_system_prompt(
         SystemPromptBuilder,
         build_date_section,
         build_instructions_section,
+        build_proactive_section,
         build_tool_guidelines_section,
     )
 
@@ -290,6 +291,9 @@ def build_onboarding_system_prompt(
     if tool_guidelines:
         instructions += "\n\n## Tool Guidelines\n" + tool_guidelines
     builder.add_section("Instructions", instructions)
+    # Heartbeat and timed-reminder rules live here, and both instructions.md
+    # and the heartbeat tools point at this section by name.
+    builder.add_section("Proactive Messaging", build_proactive_section())
     builder.add_section("Current date", build_date_section(user))
 
     return builder.build()

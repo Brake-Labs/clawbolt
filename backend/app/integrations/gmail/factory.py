@@ -73,16 +73,15 @@ class GmailSearchParams(BaseModel):
 
     query: str = Field(
         description=(
-            "Gmail search query, using Gmail's native syntax. Examples: "
-            "'from:noreply@appfolio.com newer_than:1d', 'subject:invoice', "
-            "'is:unread', 'has:attachment'."
+            "Gmail query, e.g. 'from:noreply@appfolio.com newer_than:1d', "
+            "'subject:invoice', 'is:unread', 'has:attachment'."
         ),
     )
     max_results: int = Field(
         default=10,
         ge=1,
         le=50,
-        description="Number of messages to return (1-50). Default 10.",
+        description="Messages to return.",
     )
 
 
@@ -90,7 +89,7 @@ class GmailGetMessageParams(BaseModel):
     """Parameters for the gmail_get_message tool."""
 
     message_id: str = Field(
-        description="The Gmail message ID returned by gmail_search or gmail_list_recent.",
+        description="Gmail message ID from gmail_search or gmail_list_recent.",
     )
 
 
@@ -98,16 +97,13 @@ class GmailOpenAttachmentParams(BaseModel):
     """Parameters for the gmail_open_attachment tool."""
 
     message_id: str = Field(
-        description="The Gmail message ID the attachment belongs to.",
+        description="Gmail message ID.",
     )
     attachment_id: str = Field(
-        description="The attachment_id listed under 'Attachments' by gmail_get_message.",
+        description="attachment_id from gmail_get_message.",
     )
     filename: str = Field(
-        description=(
-            "The attachment's filename as listed. Shown to the user in the "
-            "approval prompt; must match the attachment."
-        ),
+        description="Filename as listed; must match. Shown in the approval prompt.",
     )
 
 
@@ -118,7 +114,7 @@ class GmailListRecentParams(BaseModel):
         default=10,
         ge=1,
         le=50,
-        description="Number of recent messages to return (1-50). Default 10.",
+        description="Messages to return.",
     )
 
 
@@ -126,30 +122,23 @@ class GmailSendParams(BaseModel):
     """Parameters for the gmail_send tool."""
 
     to: list[str] = Field(
-        description=(
-            "Recipient email addresses (one or more). Each entry may be a "
-            "bare address ('jane@example.com') or a name+address pair "
-            "('Jane Doe <jane@example.com>')."
-        ),
+        description="Recipients, as 'jane@example.com' or 'Jane Doe <jane@example.com>'.",
     )
-    subject: str = Field(description="Subject line of the email.")
-    body: str = Field(description="Plain-text body of the email.")
+    subject: str = Field(description="Subject line.")
+    body: str = Field(description="Plain-text body.")
     reply_to_message_id: str = Field(
         default="",
         description=(
-            "Optional Gmail message ID to reply to. When set, the new message "
-            "is threaded onto the original conversation and the In-Reply-To / "
-            "References headers are populated automatically. Leave empty to "
-            "send a brand-new message."
+            "Gmail message ID to reply to; threads the reply onto that conversation "
+            "and sets its headers. Omit for a new message."
         ),
     )
     attachments: list[str] = Field(
         default_factory=list,
         description=(
-            "Optional list of saved-file storage paths to attach (e.g. "
-            "'/Acme Plumbing/receipts/invoice_001.pdf'). Use find_saved_files "
-            "to discover paths. Each entry must point to an individual file, "
-            "not a folder. Total attachment size is capped at 20 MB."
+            "Storage paths of individual saved files (not folders) from "
+            "find_saved_files, e.g. '/Acme Plumbing/receipts/invoice_001.pdf'. "
+            "20 MB total."
         ),
     )
 
@@ -695,19 +684,12 @@ def create_gmail_tools(
             name=ToolName.GMAIL_SEARCH,
             tags={ToolTags.READ_ONLY},
             description=(
-                "Search the user's Gmail inbox using Gmail's native query "
-                "syntax (e.g. 'from:noreply@appfolio.com', 'subject:invoice', "
-                "'is:unread', 'newer_than:7d'). Returns a list of message "
-                "summaries (sender, subject, date, snippet, id)."
+                "Search the user's Gmail with Gmail query syntax; combine operators "
+                "for precise results. Returns summaries (sender, subject, date, "
+                "snippet, id). Always confirm before opening anything sensitive."
             ),
             function=gmail_search,
             params_model=GmailSearchParams,
-            usage_hint=(
-                "Use this when the user wants to find a specific email or "
-                "set of emails. Combine multiple Gmail operators in a single "
-                "query for precise results. Always confirm before opening "
-                "anything sensitive."
-            ),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 description_builder=lambda args: f"Search Gmail for: {args.get('query', '')}",
@@ -717,18 +699,12 @@ def create_gmail_tools(
             name=ToolName.GMAIL_GET_MESSAGE,
             tags={ToolTags.READ_ONLY},
             description=(
-                "Fetch the full body of a single Gmail message by its ID. "
-                "Returns headers, the plain-text body, a deduplicated "
-                "list of URLs found in the body, and any attachments "
-                "(filename, type, size, attachment_id)."
+                "Fetch one Gmail message: headers, plain-text body, attachments "
+                "(filename, type, size, attachment_id), and a deduplicated 'links' "
+                "list, the fastest way to find a magic link or unsubscribe URL."
             ),
             function=gmail_get_message,
             params_model=GmailGetMessageParams,
-            usage_hint=(
-                "Use after gmail_search or gmail_list_recent to read the "
-                "contents of a specific message. The 'links' list is the "
-                "fastest way to extract a magic link or unsubscribe URL."
-            ),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 description_builder=lambda args: f"Read Gmail message {args.get('message_id', '')}",
@@ -738,18 +714,14 @@ def create_gmail_tools(
             name=ToolName.GMAIL_OPEN_ATTACHMENT,
             tags={ToolTags.READ_ONLY},
             description=(
-                "Open an attachment from a Gmail message as if the user had "
-                "sent the file in chat. A PDF returns its text; an image or "
-                "other file returns a media handle for analyze_photo or "
-                "upload_to_storage. Files over the media size limit are refused."
+                "Open a Gmail attachment as if the user had sent it in chat; use it "
+                "instead of asking them to download and resend the file. A PDF returns "
+                "its text; an image or other file returns a media handle for "
+                "analyze_photo or upload_to_storage. Files over the media size limit "
+                "are refused."
             ),
             function=gmail_open_attachment,
             params_model=GmailOpenAttachmentParams,
-            usage_hint=(
-                "When the user asks about an emailed document or photo, open "
-                "it with gmail_open_attachment instead of asking them to "
-                "download and resend it."
-            ),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 description_builder=_describe_gmail_open_attachment,
@@ -759,15 +731,11 @@ def create_gmail_tools(
             name=ToolName.GMAIL_LIST_RECENT,
             tags={ToolTags.READ_ONLY},
             description=(
-                "List the most recent messages in the user's Gmail inbox. "
-                "Returns the same summary shape as gmail_search."
+                "List the most recent Gmail inbox messages, e.g. for 'what's in my "
+                "inbox'. Same summary shape as gmail_search."
             ),
             function=gmail_list_recent,
             params_model=GmailListRecentParams,
-            usage_hint=(
-                "Use when the user asks 'what's in my inbox' or wants a "
-                "general overview without a specific search query."
-            ),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 description_builder=lambda args: (
@@ -778,25 +746,12 @@ def create_gmail_tools(
         Tool(
             name=ToolName.GMAIL_SEND,
             description=(
-                "Send an email from the user's Gmail account. Pass "
-                "reply_to_message_id to thread the new message onto an "
-                "existing conversation (the original headers and threadId "
-                "are wired up for you). Optionally attach saved files by "
-                "passing their storage paths in 'attachments' (paths come "
-                "from find_saved_files, e.g. '/Acme/receipts/inv_001.pdf'). "
-                "Total attachment size is capped at 20 MB."
+                "Send or reply to an email from the user's Gmail, only when the user "
+                "explicitly asks. Confirm recipients, subject, body, and any "
+                "attachments in chat first. Default to plain text."
             ),
             function=gmail_send,
             params_model=GmailSendParams,
-            usage_hint=(
-                "Use when the user explicitly asks you to send or reply to "
-                "an email. Confirm recipients, subject, body, and any "
-                "attachments in chat before calling this tool. Default to "
-                "plain text bodies. To attach files, first run "
-                "find_saved_files to get storage paths and pass them in "
-                "the 'attachments' list; only individual files attach, not "
-                "folders."
-            ),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 description_builder=_describe_gmail_send,

@@ -24,7 +24,7 @@ class GetHeartbeatParams(BaseModel):
 class UpdateHeartbeatParams(BaseModel):
     """Parameters for the update_heartbeat tool."""
 
-    text: str = Field(description="The full updated heartbeat markdown text")
+    text: str = Field(description="The full new HEARTBEAT.md markdown.")
 
 
 def create_heartbeat_tools(user_id: str) -> list[Tool]:
@@ -61,44 +61,29 @@ def create_heartbeat_tools(user_id: str) -> list[Tool]:
         Tool(
             name=ToolName.GET_HEARTBEAT,
             tags={ToolTags.READ_ONLY},
-            description="Read the user's heartbeat notes.",
+            description="Read HEARTBEAT.md, the notes that drive your periodic check-ins.",
             function=get_heartbeat,
             params_model=GetHeartbeatParams,
-            usage_hint=(
-                "When asked about heartbeat notes, read them. "
-                "Do not call this for time-specific reminder requests."
-            ),
         ),
         Tool(
             name=ToolName.UPDATE_HEARTBEAT,
             description=(
-                "Update the user's heartbeat notes with new markdown text. "
-                "These notes drive the agent's own periodic check-ins, not "
-                "user-facing scheduled reminders. The heartbeat system "
-                "checks on the user's configured interval and surfaces "
-                "items within a window, not at an exact clock time. Do "
-                "not use this tool for time-specific reminders ('at 2pm', "
-                "'7:30am'). For those, call calendar_create_event with "
-                "reminder_minutes_before=0 if Google Calendar is connected; "
-                "otherwise tell the user you cannot fire at exact times and "
-                "offer to connect calendar or have them set it in their "
-                "phone. Overwrites the entire file: "
-                "include the current items plus whatever the user asked to "
-                "add or change, and never re-add items not in the current "
-                "file. Write recurring items as windows ('every morning', "
-                "'Mondays') rather than exact clock times."
+                "Overwrite HEARTBEAT.md, the notes that drive your periodic check-ins. "
+                "It is not a scheduler: a reminder at a clock time ('at 2pm') goes to "
+                "calendar_create_event as Proactive Messaging says, never here. Call "
+                "get_heartbeat first and pass the whole file: the current items plus "
+                "the requested change. Never re-add items missing from the current "
+                "file. Write recurring items as windows ('every morning', 'Mondays'), "
+                "not clock times."
             ),
             function=update_heartbeat,
             params_model=UpdateHeartbeatParams,
             usage_hint=(
-                "Always call get_heartbeat first to see the current content. "
-                "Only add, remove, or change what the user explicitly asked for; "
-                "do not proactively prune items that look stale. "
-                f"Exception: when the current message starts with "
-                f"'{SCHEDULED_TASK_PREFIX}', removing the one-time dated line "
-                "you just handled is correct. Recurring patterns "
-                "('every morning', 'Mondays', 'weekly') always stay. "
-                "Do not restore deleted items."
+                "update_heartbeat: change only what the user asked for; do not prune "
+                "items that look stale. Exception: when the current message starts "
+                f"with '{SCHEDULED_TASK_PREFIX}', remove the one-time dated line you "
+                "just handled. Recurring items ('every morning', 'Mondays', 'weekly') "
+                "always stay."
             ),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ALWAYS,

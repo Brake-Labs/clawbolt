@@ -307,6 +307,7 @@ def test_tool_has_description() -> None:
     assert "arithmetic" in tools[0].description.lower() or "math" in tools[0].description.lower()
 
 
-def test_tool_has_usage_hint() -> None:
+def test_tool_description_lists_supported_functions() -> None:
     tools = _create_calculator_tools()
-    assert tools[0].usage_hint
+    assert "sqrt" in tools[0].description
+    assert "pi" in tools[0].description

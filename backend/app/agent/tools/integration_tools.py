@@ -81,18 +81,13 @@ def _build_available_integrations_hint(registry: ToolRegistry) -> str:
     oauth_targets = sorted(list_oauth_integrations())
     web_connect_targets = sorted(_WEB_CONNECT_INTEGRATIONS)
 
-    display_names = [_display_name_for_oauth(registry, name) for name in oauth_targets]
-    display_names.extend(registry.get_display_name(name) for name in web_connect_targets)
-    display_names.sort()
-
-    all_targets = sorted({*oauth_targets, *web_connect_targets})
-    target_tokens = ", ".join(f"'{name}'" for name in all_targets)
+    labels = {name: _display_name_for_oauth(registry, name) for name in oauth_targets}
+    labels.update({name: registry.get_display_name(name) for name in web_connect_targets})
+    targets = ", ".join(f"'{name}' ({labels[name]})" for name in sorted(labels))
 
     return (
-        f"Integrations this deployment supports: {', '.join(display_names)}. "
-        f"Trust this list over any earlier manage_integration result in this "
-        f"conversation; capabilities can change between deployments. "
-        f"Valid connect targets: {target_tokens}."
+        f"Connect targets this deployment supports: {targets}. Trust this list "
+        f"over any earlier manage_integration result in this conversation."
     )
 
 
@@ -101,18 +96,15 @@ class ManageIntegrationParams(BaseModel):
 
     action: Literal["status", "enable", "disable", "connect", "disconnect"] = Field(
         description=(
-            "Action to perform: "
-            "'status' to list all integrations and their state, "
-            "'enable' or 'disable' to toggle a tool group, "
-            "'connect' to get an OAuth link for an integration, "
-            "'disconnect' to remove an OAuth connection."
+            "'status' lists every integration and its state; 'enable' / 'disable' "
+            "toggles a tool group; 'connect' returns a link the user taps to connect; "
+            "'disconnect' removes a connection."
         ),
     )
     target: str | None = Field(
         default=None,
         description=(
-            "Tool group name (for enable/disable) or OAuth integration name "
-            "(for connect/disconnect). Not needed for status."
+            "Tool group (enable/disable) or connect target (connect/disconnect). Omit for status."
         ),
     )
 
@@ -178,26 +170,19 @@ def create_integration_tools(ctx: ToolContext) -> list[Tool]:
         Tool(
             name=ToolName.MANAGE_INTEGRATION,
             description=(
-                "Manage integrations: view status, enable/disable tool groups, "
-                "connect/disconnect OAuth integrations. "
-                "Use this when the user asks about their integrations or wants to "
-                "change what tools are available."
+                "View and change the user's integrations. Use 'status' when asked what "
+                "is available, 'connect' when asked for a connection link, and "
+                "'enable' / 'disable' to change which tools are available."
             ),
             function=manage_integration,
             params_model=ManageIntegrationParams,
             usage_hint=(
-                f"Use manage_integration to help users control their integrations. "
-                f"{available_integrations_hint} "
-                f"Before offering ANY connect link, call action='status' first and "
-                f"skip integrations already showing as connected (do not re-prompt "
-                f"for something they already set up). "
-                f"Call with action='connect' and a target from the list above to "
-                f"generate an OAuth link the user can tap to connect. "
-                f"For 'appfolio_vendor' and 'servicetitan' there is no chat connect "
-                f"flow: those use secrets that must be entered in the Clawbolt web "
-                f"app, so action='connect' just tells the user to connect there. "
-                f"Never ask the user to paste those secrets into the chat. "
-                f"Call with action='enable'/'disable' and target=group_name to toggle tools."
+                f"manage_integration: {available_integrations_hint} Before offering any "
+                f"connect link, call action='status' and skip integrations already "
+                f"connected. 'appfolio_vendor' and 'servicetitan' have no chat connect "
+                f"flow: their secrets are entered in the Clawbolt web app, so 'connect' "
+                f"points the user there. Never ask the user to paste those secrets "
+                f"into the chat."
             ),
             # Enable/disable and connect/disconnect mutate the per-user
             # ``tool_configs`` row and the OAuth token store. Two of these

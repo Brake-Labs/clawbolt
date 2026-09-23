@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 class AppFolioListWorkOrdersParams(BaseModel):
     include_in_progress: bool = Field(
         default=True,
-        description="Include work orders that are currently in progress.",
+        description="Include in-progress work orders.",
     )
     include_completed: bool = Field(
         default=False,
@@ -20,43 +20,33 @@ class AppFolioListWorkOrdersParams(BaseModel):
     )
     include_estimates: bool = Field(
         default=True,
-        description=(
-            "Include work orders where the property manager is asking the"
-            " vendor for an estimate (AppFolio-side filter)."
-        ),
+        description="Include work orders where the property manager wants an estimate.",
     )
     customer_id: str = Field(
         default="",
-        description=(
-            "Optional AppFolio customer ID (property manager) to filter by."
-            " Leave empty to merge work orders across all customers."
-        ),
+        description="Customer (property manager) ID to filter by. Omit for all customers.",
     )
 
 
 class AppFolioSearchWorkOrdersParams(BaseModel):
     search_term: str = Field(
-        description=(
-            "Search query: work order number, address, unit, or any free text."
-            " Matches AppFolio's universal vendor-portal search."
-        ),
+        description="Work order number, address, unit, tenant name, or other free text.",
     )
 
 
 class AppFolioGetWorkOrderParams(BaseModel):
     customer_id: str = Field(
-        description="AppFolio customer (property manager) ID for this work order.",
+        description="Customer (property manager) ID from list or search output.",
     )
     work_order_id: str = Field(description="AppFolio work order ID.")
 
 
 class AppFolioUpdateWorkOrderStatusParams(BaseModel):
-    work_order_id: str = Field(description="AppFolio work order ID to update.")
+    work_order_id: str = Field(description="AppFolio work order ID.")
     status_code: int = Field(
         description=(
-            "Numeric status code AppFolio expects. Common values:"
-            " 0=new, 4=in progress, 8=completed."
-            " Confirm with the user when uncertain rather than guessing."
+            "Status code. Common: 0=new, 4=in progress, 8=completed. Confirm with the"
+            " user when uncertain rather than guessing."
         ),
     )
 
@@ -64,10 +54,7 @@ class AppFolioUpdateWorkOrderStatusParams(BaseModel):
 class AppFolioUndoWorkOrderStatusParams(BaseModel):
     work_order_id: str = Field(description="AppFolio work order ID.")
     previous_status: str = Field(
-        description=(
-            "The status the work order should revert to. Pass the prior"
-            " status code or label as returned by appfolio_get_work_order."
-        ),
+        description="Prior status code or label, as returned by appfolio_get_work_order.",
     )
 
 
@@ -76,78 +63,67 @@ class AppFolioListNotesParams(BaseModel):
 
 
 class AppFolioAddNoteParams(BaseModel):
-    work_order_id: str = Field(description="AppFolio work order ID to add a note to.")
-    body: str = Field(description="Note text. Visible to the property manager.")
+    work_order_id: str = Field(description="AppFolio work order ID.")
+    body: str = Field(description="Note text.")
     media_refs: list[str] = Field(
         default_factory=list,
         description=(
-            "Optional list of photo references from the conversation."
-            " Each entry is either an original_url from a sent image or a"
-            " media handle (e.g. 'media_xxxx') returned by analyze_photo."
-            " Photos are uploaded to AppFolio inline with the note."
+            "Photos from the conversation, each an image's original_url or a media"
+            " handle (e.g. 'media_ab12cd'). Uploaded inline with the note."
         ),
     )
 
 
 class AppFolioUpdateNoteParams(BaseModel):
     work_order_id: str = Field(description="AppFolio work order ID.")
-    note_id: str = Field(description="AppFolio note ID to edit.")
+    note_id: str = Field(description="Note ID.")
     body: str = Field(description="Replacement note text.")
     media_refs: list[str] = Field(
         default_factory=list,
-        description=(
-            "Optional list of photo references to attach, same shape as"
-            " appfolio_add_note. Existing attachments are preserved."
-        ),
+        description="More photos, as in appfolio_add_note. Existing attachments are kept.",
     )
 
 
 class AppFolioInvoiceLineItem(BaseModel):
-    description: str = Field(description="Line-item description (e.g. 'Labor: 4hr').")
-    quantity: float = Field(default=1.0, description="Quantity (decimal supported).")
+    description: str = Field(description="Line description, e.g. 'Labor: 4hr'.")
+    quantity: float = Field(default=1.0, description="Quantity; decimals allowed.")
     amount: float = Field(
         description=(
-            "Per-unit price in dollars. The line total (quantity x amount)"
-            " is what AppFolio actually stores, so a labor line of 5 hours"
-            " at $55/hr should be sent as quantity=5, amount=55, not"
-            " quantity=1, amount=275."
+            "Per-unit price in dollars. AppFolio stores quantity x amount, so 5 hours"
+            " at $55/hr is quantity=5, amount=55, not quantity=1, amount=275."
         ),
     )
 
 
 class AppFolioCreateInvoiceParams(BaseModel):
     customer_id: str = Field(
-        description="AppFolio customer (property manager) ID for this invoice.",
+        description="Customer (property manager) ID.",
     )
-    work_order_id: str = Field(description="Work order ID this invoice bills against.")
+    work_order_id: str = Field(description="Work order ID to bill.")
     line_items: list[AppFolioInvoiceLineItem] = Field(
-        description=(
-            "List of line items for the invoice. Each entry has description, quantity, and amount."
-        ),
+        description="Invoice lines.",
     )
     reference_number: str = Field(
         default="",
         description=(
-            "Optional vendor-side reference number to print on the invoice."
-            " The SPA defaults this to '<workOrderNumber>-<sequence>'; leave"
-            " empty to let AppFolio generate one."
+            "Vendor reference number to print. Omit to let AppFolio generate one"
+            " ('<workOrderNumber>-<sequence>')."
         ),
     )
 
 
 class AppFolioUploadInvoicePdfParams(BaseModel):
     customer_id: str = Field(
-        description="AppFolio customer (property manager) ID for this invoice.",
+        description="Customer (property manager) ID.",
     )
-    work_order_id: str = Field(description="Work order ID this invoice bills against.")
+    work_order_id: str = Field(description="Work order ID to bill.")
     media_refs: list[str] = Field(
         description=(
-            "Photo or PDF references from the conversation. Each entry is"
-            " an original_url or a media handle. AppFolio uploads them as"
-            " a single invoice document."
+            "PDFs or photos from the conversation, as original_url or media handle;"
+            " uploaded as one invoice document."
         ),
     )
     reference_number: str = Field(
         default="",
-        description="Optional vendor-side reference number printed on the invoice.",
+        description="Vendor reference number to print.",
     )
