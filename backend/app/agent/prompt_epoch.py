@@ -383,9 +383,10 @@ def build_history_view(
     start = 0
     messages, tokens, elided = fit_verbatim(0)
     if tokens > budget or len(groups) > max_turns:
-        # Step 3. Everything is already a stub here, so drop from the front
-        # with no verbatim window, re-rendering after each drop so the check
-        # reads the bytes that will be sent. Always keep the newest turn.
+        # Step 3. Every read result is already a stub here (write results
+        # never are), so drop from the front with no verbatim window,
+        # re-rendering after each drop so the check reads the bytes that
+        # will be sent. Always keep the newest turn.
         drop_to = int(budget * _DROP_TO_FRACTION)
         while start < len(groups) - 1 and (tokens > drop_to or len(groups) - start > max_turns):
             start += 1
