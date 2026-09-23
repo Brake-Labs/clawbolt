@@ -56,45 +56,64 @@ def canonical_args(args: dict[str, Any]) -> str:
         return repr(sorted(args.items()))
 
 
+def accept_args(tool: Tool, args: dict[str, Any]) -> tuple[dict[str, Any], BaseModel]:
+    """*args* as the live loop would take them, and the validated model.
+
+    The single place the comparison decides what a set of tool arguments
+    *means*. It applies the same numeric-to-string repair the agent applies
+    before giving up on a call
+    (``core_support._stringify_numbers_for_string_fields``), so every reader
+    here judges a call the way production judged it. Skipping the repair once
+    is enough to make two parts of this package disagree about one call: the
+    checks stayed silent on ``add_note(work_order_id=118600)`` while the write
+    comparison reported it as a different write from production's
+    ``"118600"``, naming a field that did not really differ.
+
+    Raises ``ValidationError`` when even the repaired arguments do not
+    validate. The returned dict is the arguments as accepted, which is what
+    ``Tool.precheck`` expects; the model is what fills in the defaults.
+    """
+    try:
+        return dict(args), tool.params_model.model_validate(args)
+    except ValidationError as exc:
+        coerced = _stringify_numbers_for_string_fields(args, exc)
+        if coerced is None:
+            raise
+        return coerced, tool.params_model.model_validate(coerced)
+
+
 def normalized_args(tool: Tool, args: dict[str, Any]) -> str:
     """Canonical arguments after the params model fills in its defaults.
 
     Two calls that differ only in whether an optional argument was spelled
-    out at its default value are the same call. Falls back to the raw
-    arguments when they do not validate.
+    out at its default value are the same call, and so are two that differ
+    only in whether a value was sent as a JSON number (``accept_args``).
+    Falls back to the raw arguments when they do not validate.
     """
     try:
-        return canonical_args(tool.params_model.model_validate(args).model_dump(mode="json"))
+        _, validated = accept_args(tool, args)
     except ValidationError:
         return canonical_args(args)
+    return canonical_args(validated.model_dump(mode="json"))
 
 
 def _args_are_valid(tool: Tool, args: dict[str, Any]) -> tuple[bool, str]:
     """Whether *args* would survive the agent's own validation of *tool*.
 
-    Applies the same numeric-to-string repair the agent applies before
-    giving up on a call (``core_support._stringify_numbers_for_string_fields``).
-    Skipping it would report ``invalid_args`` for calls production accepts,
-    which is the difference between "this model is unsafe" and "this model
-    writes house numbers as JSON numbers, like every model does".
+    The params model first, through ``accept_args`` so the numeric-to-string
+    repair applies. Reporting ``invalid_args`` without it is the difference
+    between "this model is unsafe" and "this model writes house numbers as
+    JSON numbers, like every model does".
 
     Then runs the tool's own ``precheck``, the argument checks that live in
     the tool body rather than the params model. A call the tool refuses
     before any side effect (``send_media_reply`` with an empty or
     ``about:blank`` URL) is an invalid call, not a message to the user.
     """
-    validated = args
     try:
-        tool.params_model.model_validate(args)
+        validated, _ = accept_args(tool, args)
     except ValidationError as exc:
-        coerced = _stringify_numbers_for_string_fields(args, exc)
-        if coerced is None:
-            return False, _first_error(exc)
-        try:
-            tool.params_model.model_validate(coerced)
-        except ValidationError as retry_exc:
-            return False, _first_error(retry_exc)
-        validated = coerced
+        return False, _first_error(exc)
     if tool.precheck is not None:
         try:
             refusal = tool.precheck(validated)

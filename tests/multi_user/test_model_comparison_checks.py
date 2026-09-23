@@ -10,6 +10,7 @@ write, or a cost of zero standing in for a cost nobody knows.
 from __future__ import annotations
 
 from decimal import Decimal
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -584,11 +585,24 @@ class _ReplyParams(BaseModel):
     body: str
 
 
+class _QbPayloadParams(BaseModel):
+    """A write whose record lives inside a free-form payload.
+
+    ``qb_update``'s ``data`` is a ``dict[str, Any]``, so the params model
+    declares nothing about what is inside it and cannot settle whether an ID
+    was sent as a JSON number or a string.
+    """
+
+    entity_type: str
+    data: dict[str, Any]
+
+
 WRITE_TOOLS = {
     "add_note": _tool("add_note", _AddNoteParams, mutating=True),
     "create_event": _tool("create_event", _EventParams, mutating=True),
     "create_invoice": _tool("create_invoice", _InvoiceParams, mutating=True),
     "qb_update": _tool("qb_update", _QbUpdateParams, mutating=True),
+    "qb_payload": _tool("qb_payload", _QbPayloadParams, mutating=True),
     "lookup": _tool("lookup", _LookupParams, mutating=False),
 }
 
@@ -822,6 +836,109 @@ def test_a_write_with_no_record_id_has_to_match_on_everything() -> None:
     reworded_writes = report.compare_writes(sample, reworded, TOOLS)
     assert [w.outcome for w in reworded_writes] == [WriteOutcome.SAME_TOOL_DIFFERENT_ARGS]
     assert reworded_writes[0].record_ids == {}
+
+
+def test_a_number_where_production_sent_a_string_is_the_same_write() -> None:
+    """The live loop repairs this before sending, so the report must too.
+
+    ``checks`` stayed silent on ``add_note(work_order_id=118600)`` because
+    ``_args_are_valid`` applies the same numeric-to-string repair the agent
+    does. The write comparison ran the bare params model, so the candidate
+    fell back to its raw arguments, missed the defaults production's side had
+    filled, and landed in ``SAME_RECORD_DIFFERENT_ARGS`` pointing at a field
+    that does not differ.
+    """
+    sample = _sample(_recorded_note("118601"))
+    numeric = _call(ToolCall(name="add_note", arguments={"work_order_id": 118601, "body": "done"}))
+    writes = report.compare_writes(sample, numeric, WRITE_TOOLS)
+    assert [w.outcome for w in writes] == [WriteOutcome.MATCHED]
+    assert writes[0].differing_arguments == ()
+    # And the two halves agree: checks says nothing about the same call.
+    assert (
+        _candidate(numeric, tools=WRITE_TOOLS, production=[_recorded_note("118601")], seen="118601")
+        == []
+    )
+
+
+def test_a_different_number_is_still_a_different_write() -> None:
+    """The repair settles a spelling, not a value."""
+    sample = _sample(_recorded_note("118601"))
+    other = _call(ToolCall(name="add_note", arguments={"work_order_id": 118600, "body": "done"}))
+    writes = report.compare_writes(sample, other, WRITE_TOOLS)
+    assert [w.outcome for w in writes] == [WriteOutcome.SAME_TOOL_DIFFERENT_ARGS]
+    assert writes[0].differing_arguments == ("work_order_id",)
+
+
+def test_a_number_nested_in_a_free_form_payload_is_the_same_write() -> None:
+    """``qb_update``'s ``data`` is a ``dict[str, Any]``.
+
+    The params model declares nothing about what is inside it, so the repair
+    has nothing to fire on and the two spellings reach the comparison as
+    emitted. ``collect_ids`` already reads ``118600`` and ``"118600"`` as one
+    record, so the comparison has to as well or one write reads as two.
+    """
+    sample = ReplaySample(
+        seq=1,
+        timestamp="2026-05-01T12:00:00+00:00",
+        message_context="update that invoice",
+        production_tool_calls=(
+            RecordedToolResult(
+                name="qb_payload",
+                arguments={"entity_type": "Invoice", "data": {"Id": "118600", "TotalAmt": 500}},
+                result="ok",
+            ),
+        ),
+    )
+    numeric = _call(
+        ToolCall(
+            name="qb_payload",
+            arguments={"entity_type": "Invoice", "data": {"Id": 118600, "TotalAmt": 500.0}},
+        )
+    )
+    assert [w.outcome for w in report.compare_writes(sample, numeric, WRITE_TOOLS)] == [
+        WriteOutcome.MATCHED
+    ]
+
+    amended = _call(
+        ToolCall(
+            name="qb_payload",
+            arguments={"entity_type": "Invoice", "data": {"Id": 118600, "TotalAmt": 5000}},
+        )
+    )
+    amended_writes = report.compare_writes(sample, amended, WRITE_TOOLS)
+    assert [w.outcome for w in amended_writes] == [WriteOutcome.SAME_RECORD_DIFFERENT_ARGS]
+    assert amended_writes[0].differing_arguments == ("data",)
+
+
+def test_a_field_genuinely_typed_as_a_number_is_unaffected() -> None:
+    """``create_event.customer`` is an ``int``. Nothing here changes it.
+
+    Both sides go through the params model, so both arrive as the same type,
+    and a real difference is still a difference.
+    """
+    booked = RecordedToolResult(
+        name="create_event",
+        arguments={"calendar_id": "primary", "customer": 118601, "title": "Visit"},
+        result="ok",
+    )
+    sample = ReplaySample(
+        seq=1,
+        timestamp="2026-05-01T12:00:00+00:00",
+        message_context="book the visit",
+        production_tool_calls=(booked,),
+    )
+    same = _call(ToolCall(name="create_event", arguments={"customer": 118601, "title": "Visit"}))
+    writes = report.compare_writes(sample, same, WRITE_TOOLS)
+    assert [w.outcome for w in writes] == [WriteOutcome.MATCHED]
+    # The default the candidate did not spell out is filled, not a difference.
+    assert writes[0].key_arguments["calendar_id"] == "primary"
+
+    elsewhere = _call(
+        ToolCall(name="create_event", arguments={"customer": 118600, "title": "Visit"})
+    )
+    differing = report.compare_writes(sample, elsewhere, WRITE_TOOLS)
+    assert [w.outcome for w in differing] == [WriteOutcome.SAME_TOOL_DIFFERENT_ARGS]
+    assert differing[0].differing_arguments == ("customer",)
 
 
 def test_a_recorded_lookup_is_not_a_write_to_compare() -> None:

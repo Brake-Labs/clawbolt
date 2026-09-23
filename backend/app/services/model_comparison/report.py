@@ -23,6 +23,7 @@ from backend.app.agent.tools.base import Tool
 from backend.app.services.llm_pricing import compute_cost, is_known_model
 from backend.app.services.llm_service import LLMTarget
 from backend.app.services.model_comparison.checks import (
+    accept_args,
     canonical_args,
     collect_ids,
     id_properties,
@@ -50,11 +51,63 @@ logger = logging.getLogger(__name__)
 
 
 def _validated(tool: Tool, args: dict[str, Any]) -> dict[str, Any]:
-    """*args* after the params model fills its defaults, or as given."""
+    """*args* after the params model fills its defaults, or as given.
+
+    Through ``checks.accept_args``, so the numeric-to-string repair the live
+    loop applies is applied here too. Running the bare params model instead
+    made the two halves of this package disagree about one call: ``checks``
+    said nothing about ``add_note(work_order_id=118600)`` against
+    production's ``"118600"``, because the agent repairs that before sending
+    it, while this reported ``SAME_RECORD_DIFFERENT_ARGS`` and named a field
+    that does not really differ. Worse, a call that only validates after the
+    repair fell back to the raw arguments, so it was compared against a
+    production side that *had* its defaults filled and differed on every
+    optional parameter.
+    """
     try:
-        return tool.params_model.model_validate(args).model_dump(mode="json")
+        _, model = accept_args(tool, args)
     except ValidationError:
         return dict(args)
+    return model.model_dump(mode="json")
+
+
+def _number_spellings(value: Any) -> Any:
+    """*value* with every integral number rendered as its decimal string.
+
+    The params model settles the spelling wherever it declares a type, and
+    ``_validated`` applies the same repair the live loop does. It declares
+    nothing inside a free-form payload: ``qb_update``'s ``data`` is a
+    ``dict[str, Any]``, so ``{"Id": 118600}`` and ``{"Id": "118600"}`` reach
+    the comparison as they were emitted and read as two different writes,
+    while ``checks`` treats them as one record (``collect_ids`` already
+    coerces an integral number to its digits for exactly this reason).
+
+    One spelling wins, unconditionally, so the rule is symmetric: 500 and
+    "500" agree, 500 and 600 do not, and "0118600" keeps its leading zero
+    rather than collapsing into 118600. Non-integral floats and booleans are
+    left alone.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return str(int(value)) if value.is_integer() else value
+    if isinstance(value, dict):
+        return {key: _number_spellings(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_number_spellings(item) for item in value]
+    return value
+
+
+def comparable(args: dict[str, Any]) -> str:
+    """The form two validated argument sets are compared in.
+
+    ``canonical_args`` with the number spellings settled. Kept apart from
+    ``canonical_args`` itself, which documents a parity with the agent's own
+    duplicate detection that this does not share.
+    """
+    return canonical_args(_number_spellings(args))
 
 
 def key_arguments(tool: Tool, args: dict[str, Any]) -> dict[str, Any]:
@@ -107,7 +160,7 @@ def _differing_arguments(expected: dict[str, Any], actual: dict[str, Any]) -> tu
         sorted(
             name
             for name in names
-            if canonical_args({"v": expected.get(name)}) != canonical_args({"v": actual.get(name)})
+            if comparable({"v": expected.get(name)}) != comparable({"v": actual.get(name)})
         )
     )
 
@@ -232,7 +285,7 @@ def _compare_one_write(
         if call.name != tool.name:
             continue
         actual = key_arguments(tool, call.arguments)
-        if canonical_args(actual) == canonical_args(expected):
+        if comparable(actual) == comparable(expected):
             outcome = WriteOutcome.MATCHED
             differing: tuple[str, ...] = ()
         else:

@@ -299,6 +299,18 @@ Invariants, each of which the feature is worthless without:
   ID parameters that way so the check covers them.
 - **Whether a tool mutates comes from `ToolTags.READ_ONLY`, not the approval
   policy.** Untagged means mutating. See step 7 of "Adding a New Agent Tool".
+- **One reading of a tool call, shared.** `checks.accept_args` is where the
+  params model is applied, with the same numeric-to-string repair the live
+  loop applies (`core_support._stringify_numbers_for_string_fields`). Running
+  the bare params model in one place and the repaired one in another made the
+  two halves disagree about a single call: `checks` said nothing about
+  `add_note(work_order_id=118600)` against production's `"118600"`, while
+  `report` reported the right record with different arguments and named a
+  field that does not really differ. Inside a free-form payload the params
+  model declares nothing (`qb_update`'s `data` is a `dict[str, Any]`), so the
+  write comparison settles the spelling itself: `report.comparable` renders
+  every integral number as its digits before comparing, the way `collect_ids`
+  already does for record IDs.
 - **`MATCHED` needs the whole validated argument set.** For every write the
   live turn made, `report.compare_writes` reports one of six outcomes.
   `MATCHED` is agreement on every argument after the params model fills its
