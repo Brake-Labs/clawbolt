@@ -13,7 +13,7 @@ QuickBooks Online stores customers, items, estimates, invoices, bills, and payme
 
 ## Query Guide (qb_query)
 
-### Queryable entities and useful fields
+### Fields returned by `SELECT *`
 - Invoice: Id, SyncToken, DocNumber, CustomerRef, TotalAmt, Balance, DueDate, TxnDate, EmailStatus, BillEmail, BillEmailCc, BillEmailBcc, Line, CustomerMemo, PrivateNote, BillAddr, ShipAddr, LinkedTxn, PrintStatus, EInvoiceStatus
 - Estimate: Id, SyncToken, DocNumber, CustomerRef, TotalAmt, TxnDate, ExpirationDate, TxnStatus, BillEmail, Line, CustomerMemo, PrivateNote, AcceptedDate, AcceptedBy, LinkedTxn
 - Customer: Id, SyncToken, DisplayName, CompanyName, PrimaryEmailAddr, PrimaryPhone, BillAddr, Balance, BalanceWithJobs, Active, Notes, ParentRef, Job
@@ -22,6 +22,8 @@ QuickBooks Online stores customers, items, estimates, invoices, bills, and payme
 - Bill: Id, VendorRef, DocNumber, TotalAmt, Balance, DueDate, TxnDate, Line, PrivateNote
 
 `BillEmail`, `BillEmailCc`, `BillEmailBcc` are shaped `{"Address": "..."}` (the recipient email recorded on the invoice or estimate). SyncToken is returned in query results; you need it when updating an entity with `qb_update`.
+
+For addresses, emails, and phones, use `SELECT *`. Naming them in the field list can fail: QuickBooks rejects `SELECT BillAddr FROM Customer` with code 4001, property not found.
 
 ### Syntax
 SELECT <fields> FROM <Entity> [WHERE <conditions>] [ORDERBY <field> DESC] [MAXRESULTS <n>]
@@ -32,7 +34,8 @@ SELECT <fields> FROM <Entity> [WHERE <conditions>] [ORDERBY <field> DESC] [MAXRE
 ### Tips
 - No subqueries. To filter by customer name, first query Customer to get the Id, then use CustomerRef = '<id>' in a second query.
 - Always use MAXRESULTS to keep results manageable.
-- Not all fields support all operators. For example, Estimate TxnStatus does not support IN or LIKE. If a query returns a 400 error, simplify the WHERE clause and filter results yourself.
+- Not all fields support all operators. For example, Estimate TxnStatus does not support IN or LIKE.
+- Code 4000 or 4001 means the query is invalid, not that QuickBooks is down. Fix it and retry: switch to `SELECT *`, or simplify the WHERE clause and filter results yourself.
 - String comparisons are case-sensitive in QBO queries.
 
 ## Finding a customer, invoice, or estimate
