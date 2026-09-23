@@ -15,9 +15,10 @@ Two things are keyed to epochs, each behind its own setting:
   (``system_prompt.render_workspace_updates``) and folds into the snapshot at
   the next cold start. See :func:`remember_workspace_snapshot`.
 - ``cold_start_compaction_enabled``: the history before the epoch's first
-  message is rebuilt to a budget, once, when the epoch opens. Old results of
-  calls that only read become stubs (a write's result stays, as it may be the
-  only record of an ID), and only if the rest is still over budget are the
+  message is rebuilt to a budget, once, when the epoch opens. Old results lose
+  any SKILL.md guidance delivered on them, old results of calls that only
+  read become stubs (a write's result stays, as it may be the only record of
+  an ID), and only if the rest is still over budget are the
   oldest turns dropped (and compacted into memory, as a trim would). The
   rebuild is a pure function of the stored rows, their timestamps and the
   turn's tool schema, so every later turn in the epoch renders the same bytes
@@ -52,6 +53,7 @@ from backend.app.agent.messages import (
     ToolResultMessage,
     UserMessage,
 )
+from backend.app.agent.skills.loader import strip_skill_guidance
 from backend.app.agent.system_prompt import WorkspaceSnapshot
 from backend.app.agent.tools.base import Tool, is_mutating_call
 from backend.app.config import settings
@@ -254,6 +256,13 @@ def _render(
     verbatim at any age and size, error or not (see :func:`_is_write`), and
     counts towards the tokens returned, so the budget steps see it.
 
+    Every result in those turns, read or write, first loses any SKILL.md block
+    delivered on it (``skills.loader.strip_skill_guidance``). Guidance on a
+    write would otherwise stay forever. Once stripped, no marker for the
+    category is left in the history, so the agent delivers the guidance again
+    on the category's next use, into a row appended during the epoch. Turns
+    inside the verbatim window keep theirs: it is recent and may be in use.
+
     Rendered in one pass so timestamp markers read the same as they would
     without the rebuild. *preceding* is the rows just before the first one
     rendered, including any turns the rebuild dropped, so the first kept row
@@ -281,14 +290,20 @@ def _render(
         if isinstance(m, AssistantMessage):
             for tc in m.tool_calls:
                 calls[tc.id] = (tc.name, tc.arguments)
-        if (
-            isinstance(m, ToolResultMessage)
-            and group is not None
-            and group < verbatim_from
-            and len(m.content) > _ELIDE_MIN_CHARS
-        ):
+        if isinstance(m, ToolResultMessage) and group is not None and group < verbatim_from:
+            # Guidance is not the result, and re-delivers on the category's
+            # next use, so it goes from reads and writes alike.
+            content = strip_skill_guidance(m.content)
+            if content != m.content:
+                m = ToolResultMessage(
+                    tool_call_id=m.tool_call_id, content=content, is_error=m.is_error
+                )
             name, args = calls.get(m.tool_call_id, (None, {}))
-            if name is not None and not _is_write(tools_by_name, name, args):
+            if (
+                len(m.content) > _ELIDE_MIN_CHARS
+                and name is not None
+                and not _is_write(tools_by_name, name, args)
+            ):
                 m = ToolResultMessage(
                     tool_call_id=m.tool_call_id,
                     content=elided_result_stub(name, len(m.content)),
@@ -323,8 +338,9 @@ def build_history_view(
     With *compact* False this is the plain rendering, and only the epoch is
     worked out. With it True the history the epoch inherited is rebuilt:
 
-    1. Results of read calls from turns older than the last
-       ``cold_start_verbatim_turns`` become stubs. Each stub keeps its
+    1. In turns older than the last ``cold_start_verbatim_turns``, every
+       tool result loses any SKILL.md guidance delivered on it, and results
+       of read calls become stubs. Each stub keeps its
        ``tool_use_id``, so every ``tool_use`` still has its result. Write
        results are never stubbed: they may be the only record of an ID.
     2. While the rebuilt history is over ``cold_start_history_budget_tokens``,

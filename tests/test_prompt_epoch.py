@@ -46,8 +46,15 @@ from backend.app.agent.prompt_epoch import (
 )
 from backend.app.agent.router import PipelineContext, load_history_step, run_agent_step
 from backend.app.agent.session_db import get_session_store
+from backend.app.agent.skills import loader
+from backend.app.agent.skills.loader import (
+    extract_delivered_skills,
+    skill_delivery_marker,
+    skill_guidance_block,
+)
 from backend.app.agent.system_prompt import WorkspaceSnapshot, render_workspace_updates
 from backend.app.agent.tools.base import Tool, ToolResult, ToolTags
+from backend.app.agent.tools.registry import SubToolInfo, ToolRegistry
 from backend.app.config import settings
 from backend.app.models import User
 from backend.app.services.model_comparison.sampling import ReplayFixture, assemble_for_sample
@@ -846,3 +853,192 @@ async def test_harness_replays_with_and_without_the_rebuild(
     # Same system block and same current turn: only the history differs.
     assert full.stable_system == compacted.stable_system
     assert full.messages[-1] == compacted.messages[-1]
+
+
+# -- SKILL.md guidance on old results ------------------------------------------
+
+QB_GUIDANCE = "## QuickBooks\nLook up the customer before creating an invoice.\n" + "g" * 2_000
+QB_WRITE = "ok | Id: 643"
+
+
+def _guided(result: str, *, legacy: bool = False) -> str:
+    """*result* as stored when first-use injection rode on it."""
+    if legacy:
+        return f"{result}\n\n{skill_delivery_marker('quickbooks')}\n{QB_GUIDANCE}"
+    return result + skill_guidance_block("quickbooks", QB_GUIDANCE)
+
+
+def _guided_history(*, legacy: bool = False) -> _Rows:
+    """An old turn whose write and read both carry guidance, then quiet turns."""
+    t = _Rows()
+    _calls_turn(
+        t,
+        0,
+        "invoice acme",
+        [
+            ("qb_create", {"query": "invoice"}, _guided(QB_WRITE, legacy=legacy), False),
+            ("web_search", {"query": "acme"}, _guided("short read", legacy=legacy), False),
+        ],
+    )
+    for i in range(4):
+        t.turn(5 + i * 5, f"ask {i}", f"reply {i}")
+    return t
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_old_write_keeps_its_result_and_loses_its_guidance(
+    one_hour_cache: None, legacy: bool
+) -> None:
+    t = _guided_history(legacy=legacy)
+    current = t.ask(500, "back")
+    with patch.object(settings, "cold_start_verbatim_turns", 1):
+        view = build_history_view(t.rows[:-1], current, "", compact=True, tools_by_name=TOOLS)
+    results = _results(view.messages)
+    assert results["call_1_0"].content == QB_WRITE
+    # A short read keeps its result too, once the guidance is gone.
+    assert results["call_1_1"].content == "short read"
+    assert not any(extract_delivered_skills(r.content) for r in results.values())
+    _assert_pairs_intact(view.messages)
+
+
+def test_old_read_with_guidance_is_stubbed_as_before(one_hour_cache: None) -> None:
+    t = _Rows()
+    _calls_turn(t, 0, "look up", [("web_search", {"query": "x"}, _guided(BIG), False)])
+    for i in range(4):
+        t.turn(5 + i * 5, f"ask {i}", f"reply {i}")
+    current = t.ask(500, "back")
+    with patch.object(settings, "cold_start_verbatim_turns", 1):
+        view = build_history_view(t.rows[:-1], current, "", compact=True, tools_by_name=TOOLS)
+    assert _results(view.messages)["call_1_0"].content == elided_result_stub("web_search", len(BIG))
+    assert view.elided_results == 1
+
+
+def test_guidance_inside_the_verbatim_window_stays(one_hour_cache: None) -> None:
+    """Recent guidance may be in use: the verbatim window is left as stored."""
+    t = _Rows()
+    for i in range(4):
+        t.turn(i * 5, f"ask {i}", f"reply {i}")
+    _calls_turn(t, 30, "invoice acme", [("qb_create", {"query": "i"}, _guided(QB_WRITE), False)])
+    current = t.ask(500, "back")
+    with patch.object(settings, "cold_start_verbatim_turns", 2):
+        view = build_history_view(t.rows[:-1], current, "", compact=True, tools_by_name=TOOLS)
+    assert _results(view.messages)["call_9_0"].content == _guided(QB_WRITE)
+
+
+def test_guidance_stripping_is_deterministic_and_a_warm_turn_only_appends(
+    one_hour_cache: None,
+) -> None:
+    t = _guided_history()
+    cold = t.ask(500, "back")
+    with patch.object(settings, "cold_start_verbatim_turns", 1):
+        first = build_history_view(t.rows[:-1], cold, "", compact=True, tools_by_name=TOOLS)
+        repeat = build_history_view(t.rows[:-1], cold, "", compact=True, tools_by_name=TOOLS)
+        assert _api(repeat.messages) == _api(first.messages)
+        # The cold turn writes again and the guidance is re-delivered on it.
+        t.rows.append(
+            StoredMessage(
+                direction="outbound",
+                body="sent",
+                llm_reply_text="sent",
+                tool_interactions_json=json.dumps(
+                    [
+                        {
+                            "tool_call_id": "c",
+                            "name": "qb_create",
+                            "args": {"query": "again"},
+                            "result": _guided(QB_WRITE),
+                        }
+                    ]
+                ),
+                timestamp=_at(502),
+                seq=cold.seq + 1,
+            )
+        )
+        warm = t.ask(510, "and the other one?")
+        second = build_history_view(t.rows[:-1], warm, "", compact=True, tools_by_name=TOOLS)
+    assert second.epoch == PromptEpoch(key=cold.seq, cold_start=False)
+    before, after = _api(first.messages), _api(second.messages)
+    assert after[: len(before)] == before
+    # The re-delivery was appended during the epoch, so it is not stripped.
+    assert _results(second.messages)["c"].content == _guided(QB_WRITE)
+    _assert_pairs_intact(second.messages)
+
+
+def _qb_registry() -> ToolRegistry:
+    reg = ToolRegistry()
+    reg.register(
+        "quickbooks",
+        lambda ctx: [TOOLS["qb_create"]],
+        core=False,
+        summary="QuickBooks",
+        sub_tools=[SubToolInfo("qb_create", "Create")],
+    )
+    return reg
+
+
+def _sent_results(messages: list[dict[str, Any]]) -> list[str]:
+    return [
+        block["content"]
+        for msg in messages
+        if isinstance(msg.get("content"), list)
+        for block in msg["content"]
+        if block.get("type") == "tool_result"
+    ]
+
+
+@patch("backend.app.agent.core.amessages")
+async def test_stripped_guidance_is_delivered_again_once(
+    mock_amessages: AsyncMock, test_user: User, one_hour_cache: None
+) -> None:
+    """The next use of the category after a cold start carries the guidance,
+    and a later turn in the same epoch does not get a second copy."""
+    t = _guided_history()
+    cold = t.ask(500, "invoice acme again")
+    with (
+        patch.object(settings, "cold_start_verbatim_turns", 1),
+        patch.dict(loader._skill_instructions, {"quickbooks": QB_GUIDANCE}),
+    ):
+        view = build_history_view(t.rows[:-1], cold, "", compact=True, tools_by_name=TOOLS)
+        mock_amessages.side_effect = [
+            make_tool_call_response([{"name": "qb_create", "arguments": {"query": "again"}}]),
+            make_text_response("sent"),
+        ]
+        agent = ClawboltAgent(user=test_user, registry=_qb_registry())
+        agent.register_tools([TOOLS["qb_create"]])
+        response = await agent.process_message(
+            "invoice acme again", view.messages, prompt_epoch=view.epoch
+        )
+        assert response.tool_calls[0].result == "ok" + skill_guidance_block(
+            "quickbooks", QB_GUIDANCE
+        )
+        # The follow-up call carries one copy: the old one is gone.
+        sent = _sent_results(mock_amessages.call_args_list[1].kwargs["messages"])
+        assert sum(skill_delivery_marker("quickbooks") in r for r in sent) == 1
+
+        # The next turn in the epoch finds the re-delivery in an appended row.
+        t.rows.append(
+            StoredMessage(
+                direction="outbound",
+                body="sent",
+                llm_reply_text="sent",
+                tool_interactions_json=json.dumps(
+                    [r.model_dump(mode="json") for r in response.tool_calls]
+                ),
+                timestamp=_at(502),
+                seq=cold.seq + 1,
+            )
+        )
+        warm = t.ask(510, "one more")
+        warm_view = build_history_view(t.rows[:-1], warm, "", compact=True, tools_by_name=TOOLS)
+        assert _api(warm_view.messages)[: len(_api(view.messages))] == _api(view.messages)
+        mock_amessages.reset_mock()
+        mock_amessages.side_effect = [
+            make_tool_call_response([{"name": "qb_create", "arguments": {"query": "more"}}]),
+            make_text_response("sent"),
+        ]
+        agent = ClawboltAgent(user=test_user, registry=_qb_registry())
+        agent.register_tools([TOOLS["qb_create"]])
+        again = await agent.process_message(
+            "one more", warm_view.messages, prompt_epoch=warm_view.epoch
+        )
+    assert again.tool_calls[0].result == "ok"
