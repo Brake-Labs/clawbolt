@@ -182,6 +182,7 @@ When you need realistic-looking data, use clearly synthetic values: `jane.doe@ex
 - **Message bus**: async inbound/outbound queues in `bus.py`. Channels publish inbound messages; the agent publishes outbound replies. The ``ChannelManager`` dispatches outbound messages to the correct channel.
 - **Agent loop**: channel webhook -> media pipeline -> tool-calling loop (any-llm `amessages`) -> tool execution -> reply
 - **Memory**: Freeform per-user MEMORY.md managed via workspace tools, backed by `memory_documents` table with automatic compaction
+- **Prompt-cache epochs**: `backend/app/agent/prompt_epoch.py` owns the one definition of a cold start (the first message after the cache idled out, read from message timestamps) and what keys off it: the per-epoch workspace snapshot in the system block, and the cold-start history rebuild. Anything that renders history or the system block for the agent goes through it, so the cached prefix stays byte-identical inside an epoch
 - **Services**: External services abstracted behind service classes in `backend/app/services/`
 
 ## Multi-user mode
@@ -246,6 +247,16 @@ Invariants, each of which the feature is worthless without:
   live loop calls. A second assembly implementation would report on prompts no
   user ever received. If you change how the agent assembles a turn, the replay
   follows automatically; keep it that way.
+- **History is rendered by `prompt_epoch.build_history_view`,** the function
+  the live loop's history renderer calls, with the cold-start rebuild on or
+  off per the run's `history_mode` (`types.HistoryMode`). To read what the
+  rebuild changes before enabling `COLD_START_COMPACTION_ENABLED`, start two
+  runs over the same turns with the *incumbent* model as the candidate, one
+  with `full` and one with `cold_start_compaction`. The `full` run is the
+  sampling-noise floor; what the compacted run adds beyond it (missed or
+  different writes, extra re-fetch lookups, `FABRICATED_ID` on the production
+  side, which counts writes whose IDs only an elided result carried) is the
+  rebuild's cost.
 - **The baseline is the record, not a second call.** Only the candidate is
   sent anywhere. A live incumbent replay would re-sample a model whose answer
   for that turn is already stored, doubling the spend to reintroduce the
