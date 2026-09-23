@@ -306,6 +306,90 @@ def test_delete_line_ids_accepts_numbers() -> None:
     assert parsed.delete_line_ids == ["2", "3"]
 
 
+async def test_resending_the_queried_record_adds_no_line(qbo: FakeQBO) -> None:
+    """A full payload copied from qb_query, one quantity edited. Its lines
+    carry Ids except QuickBooks' trailing subtotal, which must not come
+    back as a second subtotal row; unchanged fields and totals stay out."""
+    full = _stored_estimate()
+    full["Line"][0]["SalesItemLineDetail"]["Qty"] = 12
+    full["Line"][0]["Amount"] = 600.0
+
+    result = await _update(entity_type="Estimate", data=full)
+
+    assert result.is_error is False, result.content
+    body = qbo.posts[0]
+    assert set(body) == {"Id", "SyncToken", "sparse", "Line"}
+    assert [ln["DetailType"] for ln in body["Line"]].count("SubTotalLineDetail") == 1
+    assert [ln.get("Id") for ln in body["Line"]] == ["1", "2", None]
+    assert body["Line"][0]["Amount"] == 600.0
+
+
+async def test_line_list_resent_without_ids_is_rejected(qbo: FakeQBO) -> None:
+    """The old habit: the whole line list again, no Ids. Appending it would
+    double the estimate, so nothing is sent."""
+    result = await _update(
+        entity_type="Estimate",
+        data={
+            "Id": "2001",
+            "SyncToken": "4",
+            "Line": [
+                {
+                    "Amount": 600.0,
+                    "DetailType": "SalesItemLineDetail",
+                    "Description": "Labor - kitchen remodel",
+                    "SalesItemLineDetail": {"Qty": 12, "UnitPrice": 50},
+                },
+            ],
+        },
+    )
+    assert result.is_error is True
+    assert "repeats line 1" in result.content
+    assert qbo.posts == []
+
+
+async def test_a_deleted_line_may_be_added_back(qbo: FakeQBO) -> None:
+    result = await _update(
+        entity_type="Estimate",
+        data={
+            "Id": "2001",
+            "SyncToken": "4",
+            "Line": [
+                {
+                    "Amount": 400.0,
+                    "DetailType": "SalesItemLineDetail",
+                    "Description": "Labor - kitchen remodel",
+                    "SalesItemLineDetail": {"ItemRef": {"value": "7"}, "Qty": 8, "UnitPrice": 50},
+                },
+            ],
+        },
+        delete_line_ids=["1"],
+    )
+    assert result.is_error is False, result.content
+    assert [ln.get("Id") for ln in qbo.posts[0]["Line"]] == ["2", None, None]
+
+
+async def test_quantity_change_keeps_amount_consistent(qbo: FakeQBO) -> None:
+    result = await _update(
+        entity_type="Estimate",
+        data={
+            "Id": "2001",
+            "SyncToken": "4",
+            "Line": [{"Id": "1", "SalesItemLineDetail": {"Qty": 10}}],
+        },
+    )
+    assert result.is_error is False, result.content
+    assert _lines_by_id(qbo.posts[0])["1"]["Amount"] == 500.0
+
+
+async def test_partial_address_keeps_the_rest_of_the_address(qbo: FakeQBO) -> None:
+    result = await _update(
+        entity_type="Estimate",
+        data={"Id": "2001", "SyncToken": "4", "ShipAddr": {"Line1": "200 Elm St"}},
+    )
+    assert result.is_error is False, result.content
+    assert qbo.posts[0]["ShipAddr"] == {"Id": "9", "Line1": "200 Elm St", "City": "Springfield"}
+
+
 # -- Approval prompt ------------------------------------------------------------
 
 

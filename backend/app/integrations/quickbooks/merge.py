@@ -10,12 +10,17 @@ some of its detail loses the rest.
 The agent writes a change, not a record. ``build_update`` reads the record
 as QuickBooks holds it now and merges the change into it:
 
-* Top-level fields the agent sends replace the stored value. Everything else
-  is left out of a sparse body, so QuickBooks keeps it.
+* Top-level fields the agent sends replace the stored value, except that a
+  partial address (``BillAddr``, ``ShipAddr``) is merged onto the stored
+  one. Fields resent unchanged and computed totals are dropped. Everything
+  else is left out of a sparse body, so QuickBooks keeps it.
 * A line with an ``Id`` is merged onto the stored line of that ``Id``: its
   keys replace, and its ``*LineDetail`` object is merged key by key, so
-  changing ``Qty`` keeps ``ItemRef`` and ``TaxCodeRef``.
-* A line without an ``Id`` is appended.
+  changing ``Qty`` keeps ``ItemRef`` and ``TaxCodeRef``. ``Amount`` follows
+  a new ``Qty`` or ``UnitPrice`` unless the change sets it.
+* A line without an ``Id`` is appended, unless it is QuickBooks' subtotal
+  line (ignored) or repeats a stored line (rejected: a full line list
+  resent without Ids would otherwise double every line).
 * A line is removed only when its ``Id`` is in ``delete_line_ids``.
 
 Whenever lines are touched, the whole merged array is sent.
@@ -38,8 +43,15 @@ LINE_ENTITIES = frozenset({"Estimate", "Invoice"})
 # Keys of the agent's payload that never go to QuickBooks as changes.
 _CONTROL_KEYS = frozenset({"Id", "SyncToken", "sparse", "domain", "MetaData"})
 
+# Totals QuickBooks computes. Never sent: a value copied from an earlier
+# read would at best be ignored and at worst disagree with the lines.
+_COMPUTED_KEYS = frozenset(
+    {"TotalAmt", "Balance", "HomeBalance", "HomeTotalAmt", "BalanceWithJobs"}
+)
+
 # QuickBooks computes this line from the others; it is never a line item.
 _SUBTOTAL = "SubTotalLineDetail"
+_SALES_DETAIL = "SalesItemLineDetail"
 
 
 class UpdateRejected(ValueError):
@@ -92,7 +104,60 @@ def _merge_line(stored: dict[str, Any], change: dict[str, Any]) -> dict[str, Any
             merged[key] = {**existing, **copy.deepcopy(value)}
         else:
             merged[key] = copy.deepcopy(value)
+    _recompute_amount(merged, change)
     return merged
+
+
+def _recompute_amount(merged: dict[str, Any], change: dict[str, Any]) -> None:
+    """Keep ``Amount`` = ``Qty * UnitPrice`` when the change set one of them
+    but not ``Amount``.
+
+    QuickBooks rejects a sales line whose three disagree (error 6070), and
+    the approval prompt would otherwise show the new quantity beside the
+    old amount.
+    """
+    if "Amount" in change:
+        return
+    sent = change.get(_SALES_DETAIL)
+    if not isinstance(sent, dict) or not ({"Qty", "UnitPrice"} & sent.keys()):
+        return
+    detail = merged.get(_SALES_DETAIL)
+    if not isinstance(detail, dict):
+        return
+    try:
+        qty, price = float(detail["Qty"]), float(detail["UnitPrice"])
+    except (KeyError, TypeError, ValueError):
+        return
+    merged["Amount"] = round(qty * price, 2)
+
+
+def _same_line(new: dict[str, Any], stored: dict[str, Any]) -> bool:
+    """True when an Id-less *new* line repeats *stored*: same description,
+    or same amount, quantity and price with no conflicting item."""
+    desc = str(new.get("Description") or "").strip().casefold()
+    if desc and desc == str(stored.get("Description") or "").strip().casefold():
+        return True
+    new_detail = new.get(_SALES_DETAIL)
+    old_detail = stored.get(_SALES_DETAIL)
+    if not isinstance(new_detail, dict) or not isinstance(old_detail, dict):
+        return False
+    try:
+        same_numbers = (
+            float(new.get("Amount")) == float(stored.get("Amount"))  # type: ignore[arg-type]
+            and float(new_detail["Qty"]) == float(old_detail["Qty"])
+            and float(new_detail["UnitPrice"]) == float(old_detail["UnitPrice"])
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+    new_item = new_detail.get("ItemRef")
+    old_item = old_detail.get("ItemRef")
+    if (
+        isinstance(new_item, dict)
+        and isinstance(old_item, dict)
+        and str(new_item.get("value")) != str(old_item.get("value"))
+    ):
+        return False
+    return same_numbers
 
 
 def _merge_lines(
@@ -128,6 +193,26 @@ def _merge_lines(
     for line in requested:
         lid = _line_id(line)
         if lid is None:
+            if _is_subtotal(line):
+                # QuickBooks' own trailing subtotal, copied from a read. It
+                # has no Id, so adding it would insert a second subtotal row.
+                continue
+            # A line being deleted in this request may be re-added as is.
+            dup = next(
+                (
+                    s
+                    for s in stored_lines
+                    if not _is_subtotal(s) and _line_id(s) not in deletes and _same_line(line, s)
+                ),
+                None,
+            )
+            if dup is not None:
+                raise UpdateRejected(
+                    f"A line without Id repeats line {_line_id(dup)} "
+                    f"({describe_line(dup)}), so it would be added a second time. "
+                    "To change that line, send its Id. To add a separate line, "
+                    "give it its own Description."
+                )
             added.append(copy.deepcopy(line))
             continue
         if lid not in stored_by_id:
@@ -165,13 +250,10 @@ def _merge_lines(
             "QuickBooks needs at least one."
         )
 
-    changed_ids = [lid for lid, change in changes.items() if _line_changes(change)]
+    # A line resent exactly as stored is not a change.
+    merged_by_id = {_line_id(ln): ln for ln in merged if _line_id(ln) is not None}
+    changed_ids = [lid for lid in changes if merged_by_id.get(lid) != stored_by_id[lid]]
     return merged, changed_ids, added, removed
-
-
-def _line_changes(change: dict[str, Any]) -> bool:
-    """True when a line entry carries anything besides its Id."""
-    return any(key != "Id" for key in change)
 
 
 def build_update(
@@ -210,11 +292,20 @@ def build_update(
     if touches_lines and entity_type not in LINE_ENTITIES:
         raise UpdateRejected(f"{entity_type} has no line items to change.")
 
-    field_changes = {
-        key: copy.deepcopy(value)
-        for key, value in changes.items()
-        if key not in _CONTROL_KEYS and key != "Line"
-    }
+    field_changes: dict[str, Any] = {}
+    for key, value in changes.items():
+        if key in _CONTROL_KEYS or key in _COMPUTED_KEYS or key == "Line":
+            continue
+        new_value = copy.deepcopy(value)
+        stored_value = current.get(key)
+        if key.endswith("Addr") and isinstance(value, dict) and isinstance(stored_value, dict):
+            # A partial address changes the parts it names; the rest of the
+            # stored address, its Id included, is kept.
+            new_value = {**copy.deepcopy(stored_value), **new_value}
+        if new_value == stored_value:
+            # Resent unchanged, as a full payload copied from a query is.
+            continue
+        field_changes[key] = new_value
 
     after = copy.deepcopy(current)
     after.update(copy.deepcopy(field_changes))
@@ -268,6 +359,14 @@ def _short(text: str, limit: int = 80) -> str:
 
 def _field_text(value: Any) -> str:
     if isinstance(value, dict):
+        if value.get("name") and value.get("value") not in (None, ""):
+            # A reference: the name is what the user recognises.
+            return _short(f"{value['name']} ({value['value']})")
+        if "Line1" in value or "City" in value:
+            # An address: its parts in reading order, without its Id.
+            return ", ".join(
+                str(v) for k, v in value.items() if k not in ("Id", "Lat", "Long") and v
+            )
         for key in ("value", "Address", "FreeFormNumber", "name"):
             if key in value and value[key] not in (None, ""):
                 return _short(str(value[key]))
