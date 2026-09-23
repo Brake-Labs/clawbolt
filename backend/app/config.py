@@ -164,8 +164,9 @@ class Settings(BaseSettings):
     # Prompt-cache epochs (backend/app/agent/prompt_epoch.py). An epoch is the
     # run of turns between two cold starts, a cold start being the first turn
     # after the cache has idled out.
-    # Idle gap after which the cache counts as expired. None follows
-    # ``llm_cache_extended_ttl``: 3600 seconds when it is on, 300 when off.
+    # Idle gap after which the cache counts as expired. None follows the
+    # history breakpoint's lifetime (``llm_cache_history_ttl``, capped at the
+    # tools and system lifetime): 3600 seconds for 1h, 300 for 5m.
     prompt_cache_idle_seconds: int | None = Field(default=None, ge=1)
     # Carry memory and tool guidelines in the cached system block, with the
     # workspace documents snapshotted once per epoch and mid-epoch edits sent
@@ -734,7 +735,7 @@ def log_config_warnings(s: Settings | None = None) -> list[str]:
     # Anthropic requires a longer-lived breakpoint to precede a shorter one.
     # The request order is tools, system, history tail, in-turn, so a later
     # lifetime longer than an earlier one is clamped down (see
-    # ``llm_service._breakpoint_ttls``).
+    # ``llm_service.breakpoint_ttls``).
     prefix_ttl = "1h" if s.llm_cache_extended_ttl else "5m"
     if s.llm_cache_history_ttl == "1h" and prefix_ttl == "5m":
         warnings.append(

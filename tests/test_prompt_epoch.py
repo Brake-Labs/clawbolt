@@ -132,6 +132,7 @@ def one_hour_cache() -> Iterator[None]:
     with (
         patch.object(settings, "prompt_cache_idle_seconds", None),
         patch.object(settings, "llm_cache_extended_ttl", True),
+        patch.object(settings, "llm_cache_history_ttl", "1h"),
     ):
         yield
 
@@ -139,12 +140,22 @@ def one_hour_cache() -> Iterator[None]:
 # -- the definition of a cold start ------------------------------------------
 
 
-def test_cold_gap_follows_the_cache_ttl() -> None:
-    with patch.object(settings, "prompt_cache_idle_seconds", None):
-        with patch.object(settings, "llm_cache_extended_ttl", True):
+def test_cold_gap_follows_the_history_cache_ttl() -> None:
+    with (
+        patch.object(settings, "prompt_cache_idle_seconds", None),
+        patch.object(settings, "llm_cache_extended_ttl", True),
+    ):
+        with patch.object(settings, "llm_cache_history_ttl", "1h"):
             assert cache_idle_threshold() == _dt.timedelta(hours=1)
-        with patch.object(settings, "llm_cache_extended_ttl", False):
+        with patch.object(settings, "llm_cache_history_ttl", "5m"):
             assert cache_idle_threshold() == _dt.timedelta(minutes=5)
+    # A 1h history behind a 5m system block is sent as 5m, so it goes cold at 5m.
+    with (
+        patch.object(settings, "prompt_cache_idle_seconds", None),
+        patch.object(settings, "llm_cache_extended_ttl", False),
+        patch.object(settings, "llm_cache_history_ttl", "1h"),
+    ):
+        assert cache_idle_threshold() == _dt.timedelta(minutes=5)
     with patch.object(settings, "prompt_cache_idle_seconds", 90):
         assert cache_idle_threshold() == _dt.timedelta(seconds=90)
         assert is_cold_gap(T0, T0 + _dt.timedelta(seconds=91))

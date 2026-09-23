@@ -53,13 +53,13 @@ from backend.app.agent.messages import (
 from backend.app.agent.system_prompt import WorkspaceSnapshot
 from backend.app.config import settings
 from backend.app.enums import MessageDirection
+from backend.app.services.llm_service import breakpoint_ttls
 
 logger = logging.getLogger(__name__)
 
-# Anthropic's two cache lifetimes. The threshold follows whichever the
-# deployment asks for unless ``prompt_cache_idle_seconds`` pins it.
-_EXTENDED_TTL = datetime.timedelta(hours=1)
-_DEFAULT_TTL = datetime.timedelta(minutes=5)
+# Anthropic's two cache lifetimes. The threshold follows the history
+# breakpoint's unless ``prompt_cache_idle_seconds`` pins it.
+_CACHE_TTLS = {"1h": datetime.timedelta(hours=1), "5m": datetime.timedelta(minutes=5)}
 
 # Calibrated on production prompts rather than the trimmer's four: tool
 # results are JSON, IDs and URLs, and on the current Claude tokenizer a
@@ -82,10 +82,16 @@ _SNAPSHOT_STORE_MAX = 1024
 
 
 def cache_idle_threshold() -> datetime.timedelta:
-    """How long the prompt cache survives without a call touching it."""
+    """How long the history cache survives without a call touching it.
+
+    The lifetime of the history-tail breakpoint (``llm_cache_history_ttl``,
+    capped at the tools and system lifetime as the request caps it). Once it
+    lapses the next turn rewrites the history whatever it contains, so that
+    turn is where an epoch opens.
+    """
     if settings.prompt_cache_idle_seconds is not None:
         return datetime.timedelta(seconds=settings.prompt_cache_idle_seconds)
-    return _EXTENDED_TTL if settings.llm_cache_extended_ttl else _DEFAULT_TTL
+    return _CACHE_TTLS[breakpoint_ttls().history]
 
 
 def is_cold_gap(previous: datetime.datetime | None, current: datetime.datetime) -> bool:
