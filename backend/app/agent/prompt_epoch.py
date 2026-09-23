@@ -429,9 +429,17 @@ _SNAPSHOTS: OrderedDict[str, tuple[int, WorkspaceSnapshot]] = OrderedDict()
 def remember_workspace_snapshot(
     user_id: str, epoch: PromptEpoch, live: WorkspaceSnapshot
 ) -> WorkspaceSnapshot:
-    """The snapshot for *epoch*, taking *live* as it when the epoch is new."""
+    """The snapshot for *epoch*, taking *live* as it when the epoch is new.
+
+    Only a cold start takes a new snapshot. A warm turn whose key moved (a
+    trim or window overflow advanced the watermark past the row that opened
+    the epoch, so ``find_epoch`` keys on the first row left) is still inside
+    the same cached prefix: it keeps the stored snapshot, and any edit since
+    rides the current turn as a delta.
+    """
     stored = _SNAPSHOTS.get(user_id)
-    if stored is not None and stored[0] == epoch.key:
+    if stored is not None and (stored[0] == epoch.key or not epoch.cold_start):
+        _SNAPSHOTS[user_id] = (epoch.key, stored[1])
         _SNAPSHOTS.move_to_end(user_id)
         return stored[1]
     _SNAPSHOTS[user_id] = (epoch.key, live)

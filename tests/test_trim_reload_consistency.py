@@ -31,6 +31,7 @@ from backend.app.agent.context import (
     trigger_compaction_for_dropped,
 )
 from backend.app.agent.core import ClawboltAgent
+from backend.app.agent.memory_db import write_memory
 from backend.app.agent.messages import UserMessage, messages_to_messages_api
 from backend.app.agent.prompt_epoch import EpochHistoryRenderer
 from backend.app.config import settings
@@ -124,8 +125,15 @@ async def _assemble(
         )
 
 
-async def _trim_then_next_turn(user: User, *, epoch_renderer: bool = False) -> tuple[Any, Any]:
-    """Assemble a turn that trims, advance the watermark, assemble the next."""
+async def _trim_then_next_turn(
+    user: User, *, epoch_renderer: bool = False, memory_edit: str = ""
+) -> tuple[Any, Any]:
+    """Assemble a turn that trims, advance the watermark, assemble the next.
+
+    The trim turn is warm (nine minutes after the last reply) and the trim
+    drops turn 12, which opened the epoch. *memory_edit* is written to
+    MEMORY.md between the two turns, as the trim's compaction does.
+    """
     user.timezone = _TZ
     await get_or_create_conversation(user.id)
     rows: list[dict[str, Any]] = []
@@ -142,6 +150,8 @@ async def _trim_then_next_turn(user: User, *, epoch_renderer: bool = False) -> t
     with patch.object(context_module, "compact_session", AsyncMock(return_value=(False, None))):
         await trigger_compaction_for_dropped(user.id, trim_turn.dropped)
         await asyncio.gather(*context_module._background_tasks)
+    if memory_edit:
+        await write_memory(user.id, memory_edit)
 
     next_turn_at = trim_turn_at + datetime.timedelta(minutes=2)
     await _insert_rows(
@@ -199,6 +209,26 @@ async def test_trim_reload_matches_through_the_epoch_renderer(test_user: User) -
     assert all(
         "[Summary of earlier conversation:" not in (m.content or "") for m in next_turn.messages
     )
+
+
+async def test_warm_trim_keeps_the_system_block(test_user: User) -> None:
+    """A warm trim past the epoch's first row keeps the workspace snapshot.
+
+    The next turn keys its epoch on the first row left above the watermark.
+    Retaking the snapshot there put the compaction's MEMORY.md edit into the
+    system block, which rewrote the system block and the whole history after
+    it on the turn after the trim.
+    """
+    await write_memory(test_user.id, "- Customer prefers mornings")
+    with patch.object(settings, "prompt_stable_prefix_enabled", True):
+        trim_turn, next_turn = await _trim_then_next_turn(
+            test_user,
+            epoch_renderer=True,
+            memory_edit="- Customer prefers mornings\n- Roof job on Elm St",
+        )
+    _assert_history_prefix_kept(trim_turn, next_turn)
+    assert next_turn.stable_system == trim_turn.stable_system
+    assert "Roof job on Elm St" in next_turn.messages[-1].content
 
 
 async def test_trim_summary_rides_the_current_turn(test_user: User) -> None:
