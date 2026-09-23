@@ -11,6 +11,8 @@ from backend.app.agent.skills.loader import (
     load_all_skills,
     load_skill_instructions,
     skill_delivery_marker,
+    skill_guidance_block,
+    strip_skill_guidance,
 )
 from backend.app.agent.tools.base import ToolResult
 from backend.app.agent.tools.registry import create_list_capabilities_tool
@@ -150,3 +152,57 @@ def test_extract_delivered_skills_round_trip() -> None:
 def test_extract_delivered_skills_ignores_plain_text() -> None:
     """Text without markers yields an empty set."""
     assert extract_delivered_skills("no markers here, just [brackets] and words") == set()
+
+
+# ---------------------------------------------------------------------------
+# stripping a delivered block
+# ---------------------------------------------------------------------------
+
+_GUIDANCE = "## QuickBooks\nAlways look up the customer first.\n\n- [x] a checklist line"
+
+
+def test_guidance_block_is_delimited_on_both_sides() -> None:
+    block = skill_guidance_block("quickbooks", _GUIDANCE)
+    assert block == (
+        f"\n\n[skill-guidance: quickbooks]\n{_GUIDANCE}\n[/skill-guidance: quickbooks]"
+    )
+    # Only the opening line counts as a delivery.
+    assert extract_delivered_skills(block) == {"quickbooks"}
+
+
+def test_strip_removes_a_delimited_block_and_keeps_the_result() -> None:
+    result = "ok | Id: 643"
+    assert strip_skill_guidance(result + skill_guidance_block("quickbooks", _GUIDANCE)) == result
+
+
+def test_strip_keeps_text_after_a_delimited_block() -> None:
+    """A delimited block is cut out wherever it sits, not to the end."""
+    text = f"ok | Id: 643{skill_guidance_block('quickbooks', _GUIDANCE)}\ntrailing note"
+    assert strip_skill_guidance(text) == "ok | Id: 643\ntrailing note"
+
+
+def test_strip_removes_a_legacy_block_to_the_end() -> None:
+    """Rows stored before the closing marker end with the guidance."""
+    legacy = f"ok | Id: 643\n\n{skill_delivery_marker('quickbooks')}\n{_GUIDANCE}"
+    assert strip_skill_guidance(legacy) == "ok | Id: 643"
+
+
+def test_strip_leaves_results_without_guidance_alone() -> None:
+    for text in (
+        "ok | Id: 643",
+        "",
+        "mentions [skill-guidance: quickbooks] inline, not on its own line",
+    ):
+        assert strip_skill_guidance(text) == text
+    assert extract_delivered_skills(strip_skill_guidance(_GUIDANCE)) == set()
+
+
+async def test_list_capabilities_result_strips_to_its_own_text() -> None:
+    load_all_skills()
+    tool = create_list_capabilities_tool({"quickbooks": "QB tools"})
+    result: ToolResult = await tool.function(category="quickbooks")
+    stripped = strip_skill_guidance(result.content)
+    assert stripped.startswith('Tools for "quickbooks" are already loaded')
+    assert extract_delivered_skills(stripped) == set()
+    instructions = get_skill_instructions("quickbooks")
+    assert instructions is not None and instructions not in stripped

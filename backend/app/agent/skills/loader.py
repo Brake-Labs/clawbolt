@@ -19,8 +19,19 @@ logger = logging.getLogger(__name__)
 # Marker line prepended to SKILL.md content whenever it is delivered into a
 # tool result (via list_capabilities or first-use auto-injection). Scanning
 # reloaded history for these markers tells the agent which categories'
-# guidance is already in context, so trimming a delivery re-arms injection.
+# guidance is already in context, so trimming or stripping a delivery re-arms
+# injection. The closing marker (``[/skill-guidance: <name>]``) does not match
+# this pattern, so only the opening line counts as a delivery.
 _SKILL_MARKER_RE = re.compile(r"\[skill-guidance: ([A-Za-z0-9_-]+)\]")
+
+# A delivered block, as :func:`skill_guidance_block` writes it: a blank line,
+# the opening marker on its own line, the SKILL.md, and the closing marker.
+_DELIMITED_BLOCK_RE = re.compile(
+    r"\n\n\[skill-guidance: ([A-Za-z0-9_-]+)\]\n.*?\n\[/skill-guidance: \1\]", re.DOTALL
+)
+# Rows stored before the closing marker existed carry only the opening line.
+# Their block was always appended last, so it runs to the end of the result.
+_LEGACY_BLOCK_START_RE = re.compile(r"\n\n\[skill-guidance: [A-Za-z0-9_-]+\]\n")
 
 # Mapping of factory name -> SKILL.md content, populated by load_all_skills().
 _skill_instructions: dict[str, str] = {}
@@ -84,6 +95,33 @@ def get_skill_instructions(factory_name: str) -> str | None:
 def skill_delivery_marker(factory_name: str) -> str:
     """Return the marker line that tags delivered skill guidance in a tool result."""
     return f"[skill-guidance: {factory_name}]"
+
+
+def skill_guidance_block(factory_name: str, instructions: str) -> str:
+    """Return the text appended to a tool result to deliver a category's SKILL.md.
+
+    The block is delimited on both sides so :func:`strip_skill_guidance` can
+    remove it without touching the result it rides on.
+    """
+    return (
+        f"\n\n{skill_delivery_marker(factory_name)}\n{instructions}"
+        f"\n[/skill-guidance: {factory_name}]"
+    )
+
+
+def strip_skill_guidance(text: str) -> str:
+    """Return *text* with any delivered SKILL.md block removed.
+
+    Blocks written by :func:`skill_guidance_block` are removed wherever they
+    sit. A result with none of those may be a row stored before the closing
+    marker existed, whose block has only the opening line and is always the
+    tail of the result: it is cut from the last opening line to the end.
+    """
+    stripped, count = _DELIMITED_BLOCK_RE.subn("", text)
+    if count:
+        return stripped
+    starts = [m.start() for m in _LEGACY_BLOCK_START_RE.finditer(text)]
+    return text[: starts[-1]] if starts else text
 
 
 def extract_delivered_skills(text: str) -> set[str]:

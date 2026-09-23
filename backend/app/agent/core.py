@@ -79,7 +79,7 @@ from backend.app.agent.prompt_epoch import PromptEpoch, remember_workspace_snaps
 from backend.app.agent.skills.loader import (
     extract_delivered_skills,
     get_skill_instructions,
-    skill_delivery_marker,
+    skill_guidance_block,
 )
 from backend.app.agent.system_prompt import (
     build_agent_system_prompt_parts,
@@ -1346,7 +1346,7 @@ class ClawboltAgent:
             record.name,
             category,
         )
-        block = f"\n\n{skill_delivery_marker(category)}\n{instructions}"
+        block = skill_guidance_block(category, instructions)
         record.result = record.result + block
         return record, ToolResultMessage(
             tool_call_id=msg.tool_call_id,

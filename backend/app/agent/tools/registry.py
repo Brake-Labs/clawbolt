@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel, Field
 
 from backend.app.agent.approval import ApprovalPolicy, PermissionLevel
-from backend.app.agent.skills.loader import get_skill_instructions, skill_delivery_marker
+from backend.app.agent.skills.loader import get_skill_instructions, skill_guidance_block
 from backend.app.agent.tools.base import Tool, ToolErrorKind, ToolResult, ToolTags
 from backend.app.agent.tools.names import ToolName
 from backend.app.media.download import DownloadedMedia
@@ -227,7 +227,7 @@ def create_list_capabilities_tool(
             # The marker lets the agent loop detect from reloaded history
             # that this category's guidance is already in context, so
             # first-use auto-injection does not deliver a second copy.
-            guidance_msg += f"\n\n{skill_delivery_marker(category)}\n{skill_instructions}"
+            guidance_msg += skill_guidance_block(category, skill_instructions)
         return ToolResult(content=guidance_msg)
 
     summary_lines = [
