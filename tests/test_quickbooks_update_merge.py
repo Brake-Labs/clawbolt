@@ -390,6 +390,146 @@ async def test_partial_address_keeps_the_rest_of_the_address(qbo: FakeQBO) -> No
     assert qbo.posts[0]["ShipAddr"] == {"Id": "9", "Line1": "200 Elm St", "City": "Springfield"}
 
 
+async def test_new_street_address_does_not_keep_the_old_suite(qbo: FakeQBO) -> None:
+    qbo.stored["ShipAddr"] = {
+        "Id": "9",
+        "Line1": "100 Oak St",
+        "Line2": "Suite 5",
+        "City": "Springfield",
+        "Lat": "39.78",
+        "Long": "-89.65",
+    }
+    result = await _update(
+        entity_type="Estimate",
+        data={
+            "Id": "2001",
+            "SyncToken": "4",
+            "ShipAddr": {"Line1": "200 Elm St", "City": "Shelbyville"},
+        },
+    )
+    assert result.is_error is False, result.content
+    assert qbo.posts[0]["ShipAddr"] == {
+        "Id": "9",
+        "Line1": "200 Elm St",
+        "Line2": "",
+        "City": "Shelbyville",
+    }
+
+
+async def test_a_second_flat_fee_at_the_same_price_is_added(qbo: FakeQBO) -> None:
+    """Same item, qty and price as a stored line but its own description:
+    a separate charge, not a repeat."""
+    qbo.stored["Line"].insert(
+        2,
+        {
+            "Id": "3",
+            "Description": "Permit fee",
+            "Amount": 75.0,
+            "DetailType": "SalesItemLineDetail",
+            "SalesItemLineDetail": {"ItemRef": {"value": "1"}, "Qty": 1, "UnitPrice": 75},
+        },
+    )
+    result = await _update(
+        entity_type="Estimate",
+        data={
+            "Id": "2001",
+            "SyncToken": "4",
+            "Line": [
+                {
+                    "Amount": 75.0,
+                    "DetailType": "SalesItemLineDetail",
+                    "Description": "Disposal fee",
+                    "SalesItemLineDetail": {"ItemRef": {"value": "1"}, "Qty": 1, "UnitPrice": 75},
+                },
+            ],
+        },
+    )
+    assert result.is_error is False, result.content
+    assert [ln.get("Id") for ln in qbo.posts[0]["Line"]] == ["1", "2", "3", None, None]
+
+
+async def test_an_undescribed_line_with_the_same_numbers_is_a_repeat(qbo: FakeQBO) -> None:
+    result = await _update(
+        entity_type="Estimate",
+        data={
+            "Id": "2001",
+            "SyncToken": "4",
+            "Line": [
+                {
+                    "Amount": 212.5,
+                    "DetailType": "SalesItemLineDetail",
+                    "SalesItemLineDetail": {"Qty": 1, "UnitPrice": 212.5},
+                },
+            ],
+        },
+    )
+    assert result.is_error is True
+    assert "repeats line 2" in result.content
+    assert qbo.posts == []
+
+
+async def test_a_line_named_like_a_heading_is_not_a_repeat(qbo: FakeQBO) -> None:
+    qbo.stored["Line"].insert(
+        0,
+        {"Id": "4", "Description": "Kitchen", "DetailType": "DescriptionOnly"},
+    )
+    result = await _update(
+        entity_type="Estimate",
+        data={
+            "Id": "2001",
+            "SyncToken": "4",
+            "Line": [
+                {
+                    "Amount": 40.0,
+                    "DetailType": "SalesItemLineDetail",
+                    "Description": "Kitchen",
+                    "SalesItemLineDetail": {"Qty": 1, "UnitPrice": 40},
+                },
+            ],
+        },
+    )
+    assert result.is_error is False, result.content
+
+
+async def test_recomputed_amount_rounds_half_up(qbo: FakeQBO) -> None:
+    """2.5 x 19.99 is 49.975: QuickBooks has 49.98, float round() 49.97."""
+    result = await _update(
+        entity_type="Estimate",
+        data={
+            "Id": "2001",
+            "SyncToken": "4",
+            "Line": [{"Id": "2", "SalesItemLineDetail": {"Qty": 2.5, "UnitPrice": 19.99}}],
+        },
+    )
+    assert result.is_error is False, result.content
+    assert _lines_by_id(qbo.posts[0])["2"]["Amount"] == 49.98
+
+
+async def test_preview_lists_only_lines_that_change(qbo: FakeQBO) -> None:
+    """A line resent as stored is not a change; a ref shows its name."""
+    tool = _tool("qb_update")
+    assert tool.approval_policy is not None
+    assert tool.approval_policy.preview_builder is not None
+    text = await tool.approval_policy.preview_builder(
+        {
+            "entity_type": "Estimate",
+            "data": {
+                "Id": "2001",
+                "SyncToken": "4",
+                "SalesTermRef": {"value": "4", "name": "Net 15"},
+                "Line": [
+                    {"Id": "1", "Amount": 400.0},
+                    {"Id": "2", "SalesItemLineDetail": {"Qty": 2}},
+                ],
+            },
+        }
+    )
+    assert text is not None
+    assert "  SalesTermRef: Net 30 (3) -> Net 15 (4)" in text
+    assert "Change line 1" not in text
+    assert "Change line 2" in text
+
+
 # -- Approval prompt ------------------------------------------------------------
 
 

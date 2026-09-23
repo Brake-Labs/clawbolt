@@ -12,8 +12,9 @@ as QuickBooks holds it now and merges the change into it:
 
 * Top-level fields the agent sends replace the stored value, except that a
   partial address (``BillAddr``, ``ShipAddr``) is merged onto the stored
-  one. Fields resent unchanged and computed totals are dropped. Everything
-  else is left out of a sparse body, so QuickBooks keeps it.
+  one; an address naming ``Line1`` replaces the stored street lines. Fields
+  resent unchanged and computed totals are dropped. Everything else is left
+  out of a sparse body, so QuickBooks keeps it.
 * A line with an ``Id`` is merged onto the stored line of that ``Id``: its
   keys replace, and its ``*LineDetail`` object is merged key by key, so
   changing ``Qty`` keeps ``ItemRef`` and ``TaxCodeRef``. ``Amount`` follows
@@ -30,6 +31,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
 
 # Entities QuickBooks documents a sparse update for. Item has only a full
@@ -52,6 +54,13 @@ _COMPUTED_KEYS = frozenset(
 # QuickBooks computes this line from the others; it is never a line item.
 _SUBTOTAL = "SubTotalLineDetail"
 _SALES_DETAIL = "SalesItemLineDetail"
+_CENT = Decimal("0.01")
+
+# Street parts of an address. An address change that names Line1 is a new
+# street address, so the stored parts it leaves out are cleared rather than
+# kept beside it, and the stored geocode no longer applies.
+_STREET_KEYS = ("Line1", "Line2", "Line3", "Line4", "Line5")
+_GEOCODE_KEYS = ("Lat", "Long")
 
 
 class UpdateRejected(ValueError):
@@ -125,18 +134,26 @@ def _recompute_amount(merged: dict[str, Any], change: dict[str, Any]) -> None:
     if not isinstance(detail, dict):
         return
     try:
-        qty, price = float(detail["Qty"]), float(detail["UnitPrice"])
-    except (KeyError, TypeError, ValueError):
+        qty, price = Decimal(str(detail["Qty"])), Decimal(str(detail["UnitPrice"]))
+    except (KeyError, TypeError, InvalidOperation):
         return
-    merged["Amount"] = round(qty * price, 2)
+    # Half-up on the decimal product, as QuickBooks rounds. Float round()
+    # gives 49.97 for 2.5 x 19.99 where QuickBooks has 49.98.
+    merged["Amount"] = float((qty * price).quantize(_CENT, rounding=ROUND_HALF_UP))
 
 
 def _same_line(new: dict[str, Any], stored: dict[str, Any]) -> bool:
-    """True when an Id-less *new* line repeats *stored*: same description,
-    or same amount, quantity and price with no conflicting item."""
+    """True when an Id-less *new* line repeats *stored*: same description and
+    line type, or no distinct description and the same amount, quantity and
+    price with no conflicting item."""
     desc = str(new.get("Description") or "").strip().casefold()
-    if desc and desc == str(stored.get("Description") or "").strip().casefold():
-        return True
+    stored_desc = str(stored.get("Description") or "").strip().casefold()
+    if desc and stored_desc and desc != stored_desc:
+        # Two flat fees at one price under one generic item are two lines.
+        return False
+    if desc and desc == stored_desc:
+        new_type = new.get("DetailType")
+        return not new_type or new_type == stored.get("DetailType")
     new_detail = new.get(_SALES_DETAIL)
     old_detail = stored.get(_SALES_DETAIL)
     if not isinstance(new_detail, dict) or not isinstance(old_detail, dict):
@@ -158,6 +175,21 @@ def _same_line(new: dict[str, Any], stored: dict[str, Any]) -> bool:
     ):
         return False
     return same_numbers
+
+
+def _merge_address(stored: dict[str, Any], change: dict[str, Any]) -> dict[str, Any]:
+    """A partial address changes the parts it names and keeps the rest of the
+    stored one, its Id included. A change naming ``Line1`` is a new street
+    address: stored street lines it omits are blanked and the geocode dropped,
+    so "Suite 5" of the old address does not follow it."""
+    merged = {**copy.deepcopy(stored), **copy.deepcopy(change)}
+    if "Line1" in change:
+        for key in _STREET_KEYS:
+            if key not in change and stored.get(key):
+                merged[key] = ""
+        for key in _GEOCODE_KEYS:
+            merged.pop(key, None)
+    return merged
 
 
 def _merge_lines(
@@ -299,9 +331,7 @@ def build_update(
         new_value = copy.deepcopy(value)
         stored_value = current.get(key)
         if key.endswith("Addr") and isinstance(value, dict) and isinstance(stored_value, dict):
-            # A partial address changes the parts it names; the rest of the
-            # stored address, its Id included, is kept.
-            new_value = {**copy.deepcopy(stored_value), **new_value}
+            new_value = _merge_address(stored_value, new_value)
         if new_value == stored_value:
             # Resent unchanged, as a full payload copied from a query is.
             continue
