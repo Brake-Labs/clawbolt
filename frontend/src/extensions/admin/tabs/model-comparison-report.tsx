@@ -123,6 +123,15 @@ function ViolationPanel({ summary }: { summary: ComparisonSummary }) {
           Deterministic, no judge. Both columns run the same code; where production is marked not
           applicable, the check has no meaning against a recorded turn.
         </p>
+        {/* The known blind spot, on the page rather than in a docstring. An
+            unrequested write is caught by the record or file it names, so a
+            tool call that names neither is only caught by its tool name. */}
+        <p className="mt-1 text-xs text-muted-foreground">
+          An unrequested write is matched on the record IDs and file paths the call carries. A few
+          writers carry neither (updating the heartbeat, creating a project, discarding media,
+          toggling an integration), so a second call through one of those goes unflagged when the
+          live turn used the same tool. Read those turns rather than the count.
+        </p>
       </div>
       {rows.length === 0 ? (
         <p className="p-3 text-sm text-muted-foreground">

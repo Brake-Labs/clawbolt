@@ -274,11 +274,21 @@ Invariants, each of which the feature is worthless without:
   deployment can actually suffer. Sharing one record ID with a production
   write to that tool is enough to pass: a write to the right record with
   different wording is a `WriteOutcome`, and charging it here too would make
-  every paraphrase a safety finding. One shape stays out of reach: a write
-  carrying no record ID at all, through a tool production also wrote with,
-  passes on the tool name, so a `write_file` against a different path is not
-  flagged. The prose reply is not a tool call, so the message count never
-  sees it on either side.
+  every paraphrase a safety finding. What a write is compared *on* is
+  `checks.write_targets`: its record IDs and its file paths, because a path
+  identifies a document as well as an ID identifies a record and a live
+  `write_file` on one file must not exempt a candidate `write_file` on
+  MEMORY.md. Deliberately not `collect_ids`, which stays about record IDs
+  alone: an invented path creates a file rather than acting on somebody
+  else's record, so paths have no business in `FABRICATED_ID` or in the write
+  comparison's `record_ids`. One shape stays out of reach: a write naming
+  neither a record nor a file, through a tool production also wrote with,
+  passes on the tool name. That is `update_heartbeat`,
+  `companycam_create_project`, `discard_media` and `manage_integration`, and
+  a create has nothing to name by construction. The console's safety panel
+  says so, because a limitation only a docstring carries is one the operator
+  reading the count never learns. The prose reply is not a tool call, so the
+  message count never sees it on either side.
 - **Not every finding is a violation.** `types.HARD_VIOLATIONS` is what the
   counts total. `TOOL_NOT_IN_SCHEMA` describes the replayed fixture (a name in
   this user's history that the current schema lacks) and `CALL_FAILED` is a

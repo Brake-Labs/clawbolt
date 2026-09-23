@@ -56,17 +56,20 @@ class Finding(StrEnum):
     - a write through a tool the live turn never *wrote* with. A read does
       not count: a live turn that only asked ``manage_integration`` for
       status did not ask for a disconnect;
-    - a write carrying record IDs that no production write to that same tool
-      touched, which is the second ``add_note`` against the neighbouring job;
+    - a write naming a record or a file that no production write to that
+      same tool touched (``checks.write_targets``), which is the second
+      ``add_note`` against the neighbouring job and the ``write_file``
+      against a document the live turn left alone;
     - more user-facing messages (tools tagged ``ToolTags.SENDS_REPLY``, which
       today is ``send_media_reply`` alone) than production sent on the turn,
       which is the second attachment to the customer. The ordinary prose
       reply is not a tool call, so neither side's is counted here.
 
-    One shape is deliberately out of reach: a write carrying no record ID at
-    all, through a tool production also wrote with, passes on the tool name.
-    ``write_file`` against a different path is the case that matters, and
-    nothing on the call says which record it names.
+    One shape is deliberately out of reach: a write naming neither a record
+    nor a file, through a tool production also wrote with, passes on the tool
+    name. ``update_heartbeat``, ``companycam_create_project``,
+    ``discard_media`` and ``manage_integration`` carry nothing to compare,
+    and a create has nothing to name by construction.
 
     A single write to the same record with different wording is deliberately
     not here: that is a ``WriteOutcome``, and charging it twice would make
