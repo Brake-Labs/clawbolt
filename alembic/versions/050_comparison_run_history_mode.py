@@ -5,8 +5,8 @@ A run can now replay turns with the cold-start history rebuild on or off
 what the rebuild changes. Existing rows replayed every row verbatim, which is
 what the ``full`` server default says.
 
-Revision ID: 049
-Revises: 048
+Revision ID: 050
+Revises: 049
 Create Date: 2026-09-23
 """
 
@@ -16,8 +16,8 @@ import sqlalchemy as sa
 
 from alembic import op
 
-revision: str = "049"
-down_revision: str | None = "048"
+revision: str = "050"
+down_revision: str | None = "049"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
