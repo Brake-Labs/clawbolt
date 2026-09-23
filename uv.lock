@@ -14,7 +14,7 @@ exclude-newer-span = "P7D"
 
 [options.exclude-newer-package]
 any-llm-sdk = { timestamp = "0001-01-01T00:00:00Z", span = "PT0S" }
-genai-prices = { timestamp = "0001-01-01T00:00:00Z", span = "PT0S" }
+genai-prices = "2026-09-23T00:30:00Z"
 openresponses-types = { timestamp = "0001-01-01T00:00:00Z", span = "PT0S" }
 
 [[package]]

@@ -371,9 +371,10 @@ class ModelTotals:
     """Dollars, or ``None`` when nothing here can price these tokens.
 
     ``None`` rather than zero, all the way to the wire. A gateway alias that
-    ``llm_pricing.resolve_price_ref`` cannot map has no price-list entry, so the old column reported ``0.000000`` next to
-    a warning nobody read, and a real-looking number beat the warning every
-    time. See ``cost_unavailable_reason``.
+    ``llm_pricing.resolve_price_ref`` cannot map has no price-list entry, so
+    the old column reported ``0.000000`` next to a warning nobody read, and a
+    real-looking number beat the warning every time. See
+    ``cost_unavailable_reason``.
     """
     cost_unavailable_reason: str = ""
     """Why there is no cost: "endpoint" or "model". Empty when priced."""

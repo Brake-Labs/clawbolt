@@ -298,6 +298,20 @@ def test_an_alias_does_not_override_a_name_the_library_knows(
     assert resolve_price_ref("claude-sonnet-5", provider="anthropic") == "claude-sonnet-5"
 
 
+def test_an_alias_on_a_route_name_does_not_override_the_model_it_carries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A route alias set before genai-prices knew the model must not outlive
+    that gap once the model id after the ``:`` prices on its own."""
+    monkeypatch.setattr(
+        settings, "llm_pricing_aliases", "clawbolt-anthropic:claude-opus-5-5=claude-opus-5"
+    )
+    assert (
+        resolve_price_ref("clawbolt-anthropic:claude-opus-5-5", provider="anthropic")
+        == "claude-opus-5-5"
+    )
+
+
 def test_an_alias_to_an_unknown_target_stays_unpriced(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "llm_pricing_aliases", "clawbolt-prod=not-a-real-model-99")
     assert is_known_model("clawbolt-prod", provider="anthropic") is False

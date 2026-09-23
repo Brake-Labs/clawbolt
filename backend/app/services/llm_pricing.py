@@ -25,10 +25,15 @@ consumer (the usage logger, the model comparison report, the cost backfill)
 prices through it so they agree. In order, first hit wins:
 
 1. the name as sent (``claude-opus-5-5``);
-2. an operator alias for it (``LLM_PRICING_ALIASES``: ``clawbolt-prod=claude-opus-5``);
-3. the part after the last ``:``, for ``<route>:<model id>`` names
+2. the part after the last ``:``, for ``<route>:<model id>`` names
    (``clawbolt-anthropic:claude-opus-5-5``);
-4. an alias for that part.
+3. an operator alias for the name as sent (``LLM_PRICING_ALIASES``:
+   ``clawbolt-prod=claude-opus-5``);
+4. an alias for the part after the last ``:``.
+
+Every lookup is scoped to *provider*, the endpoint's dialect: a Claude id
+behind an ``openai``-dialect gateway does not price, and an alias helps only
+if its target is listed under that dialect.
 
 Only the lookup changes. Callers store the model string exactly as sent.
 """
@@ -73,10 +78,10 @@ def _library_knows(model_ref: str, provider: str) -> bool:
 def _candidates(model: str) -> list[str]:
     """Names to try for *model*, in order, without duplicates."""
     aliases = settings.llm_pricing_alias_map
-    names = [model, aliases.get(model, "")]
-    if ":" in model:
-        bare = model.rsplit(":", 1)[1]
-        names += [bare, aliases.get(bare, "")]
+    bare = model.rsplit(":", 1)[1] if ":" in model else ""
+    # Real names before any alias, so an alias keyed on a route name cannot
+    # shadow the vendor model id the route carries.
+    names = [model, bare, aliases.get(model, ""), aliases.get(bare, "")]
     return list(dict.fromkeys(name for name in names if name))
 
 

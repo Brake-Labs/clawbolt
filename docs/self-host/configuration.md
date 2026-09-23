@@ -86,14 +86,19 @@ and heartbeat roles.
 Every LLM call writes a row to `llm_usage_logs` priced by
 [genai-prices](https://github.com/pydantic/genai-prices) from the provider and
 model name. A gateway often names its routes rather than the vendor model, so
-the lookup tries, in order: the name as sent, an alias for it, the part after
-the last `:` (so `clawbolt-anthropic:claude-opus-5-5` prices as
-`claude-opus-5-5` with no configuration), and an alias for that part. The
-stored model name is never rewritten.
+the lookup tries, in order: the name as sent, the part after the last `:` (so
+`clawbolt-anthropic:claude-opus-5-5` prices as `claude-opus-5-5` with no
+configuration), an alias for the name as sent, and an alias for the part after
+the last `:`. The stored model name is never rewritten.
+
+Every step looks the name up under the endpoint's dialect. An endpoint with
+dialect `openai` that serves Claude models does not price them, and an alias to
+a Claude model does not help, because genai-prices lists no Claude models under
+`openai`.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LLM_PRICING_ALIASES` | (none) | Comma-separated `name=model` pairs mapping a gateway alias to a model genai-prices knows, e.g. `clawbolt-prod=claude-opus-5`. Only consulted when the name as sent does not price, so it cannot reprice a real model id |
+| `LLM_PRICING_ALIASES` | (none) | Comma-separated `name=model` pairs mapping a gateway alias to a model genai-prices knows, e.g. `clawbolt-prod=claude-opus-5`. Only consulted when neither the name as sent nor the part after its last `:` prices, so it cannot reprice a real model id |
 
 A name that still does not resolve is logged with `cost = 0` and
 `pricing_available = false`, and the log warns once per process naming the
