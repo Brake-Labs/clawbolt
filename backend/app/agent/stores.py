@@ -380,6 +380,8 @@ def _build_llm_usage_log(
     cache_read_input_tokens: int | None,
     endpoint: str = "",
     priced: bool = True,
+    cache_creation_5m_input_tokens: int | None = None,
+    cache_creation_1h_input_tokens: int | None = None,
 ) -> LLMUsageLog:
     """Compute cost, emit the unpriced-model warning, and build an LLMUsageLog row.
 
@@ -399,6 +401,7 @@ def _build_llm_usage_log(
             output_tokens=completion_tokens,
             cache_creation_input_tokens=cache_creation_input_tokens,
             cache_read_input_tokens=cache_read_input_tokens,
+            cache_creation_1h_input_tokens=cache_creation_1h_input_tokens,
         )
         if priced
         else Decimal("0.000000")
@@ -431,6 +434,8 @@ def _build_llm_usage_log(
         purpose=purpose,
         cache_creation_input_tokens=cache_creation_input_tokens,
         cache_read_input_tokens=cache_read_input_tokens,
+        cache_creation_5m_input_tokens=cache_creation_5m_input_tokens,
+        cache_creation_1h_input_tokens=cache_creation_1h_input_tokens,
     )
 
 
@@ -451,6 +456,8 @@ class LLMUsageStore:
         cache_read_input_tokens: int | None = None,
         endpoint: str = "",
         priced: bool = True,
+        cache_creation_5m_input_tokens: int | None = None,
+        cache_creation_1h_input_tokens: int | None = None,
     ) -> None:
         """Insert a LLMUsageLog row with computed cost.
 
@@ -475,6 +482,8 @@ class LLMUsageStore:
             cache_read_input_tokens=cache_read_input_tokens,
             endpoint=endpoint,
             priced=priced,
+            cache_creation_5m_input_tokens=cache_creation_5m_input_tokens,
+            cache_creation_1h_input_tokens=cache_creation_1h_input_tokens,
         )
         async with db_session_async() as db:
             db.add(entry)

@@ -8451,6 +8451,28 @@
               }
             ],
             "title": "Cache Read Input Tokens"
+          },
+          "cache_creation_5m_input_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Creation 5M Input Tokens"
+          },
+          "cache_creation_1h_input_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Creation 1H Input Tokens"
           }
         },
         "type": "object",

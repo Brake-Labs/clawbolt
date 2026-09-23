@@ -321,3 +321,101 @@ def test_an_alias_to_an_unknown_target_stays_unpriced(monkeypatch: pytest.Monkey
 def test_without_an_alias_the_gateway_alias_is_unpriced() -> None:
     assert is_known_model("clawbolt-prod", provider="anthropic") is False
     assert compute_cost("clawbolt-prod", 1000, 500, provider="anthropic") == Decimal("0.000000")
+
+
+# ---------------------------------------------------------------------------
+# Cache-write lifetime split
+# ---------------------------------------------------------------------------
+
+
+def _base_input_cost(model: str, tokens: int) -> Decimal:
+    return calc_price(
+        Usage(input_tokens=tokens, output_tokens=0), model_ref=model, provider_id="anthropic"
+    ).total_price
+
+
+def test_one_hour_cache_writes_bill_at_twice_base_input() -> None:
+    """Anthropic bills a 1h write at 2x base input and a 5m write at 1.25x."""
+    model, tokens = "claude-opus-4-5", 1_000_000
+    base = _base_input_cost(model, tokens)
+    five_min = compute_cost(model, 0, 0, provider="anthropic", cache_creation_input_tokens=tokens)
+    one_hour = compute_cost(
+        model,
+        0,
+        0,
+        provider="anthropic",
+        cache_creation_input_tokens=tokens,
+        cache_creation_1h_input_tokens=tokens,
+    )
+    assert five_min == (base * Decimal("1.25")).quantize(Decimal("0.000001"))
+    assert one_hour == (base * 2).quantize(Decimal("0.000001"))
+
+
+@pytest.mark.parametrize(
+    ("one_hour_tokens", "expected"),
+    [(0, Decimal("5.000000")), (400_000, Decimal("6.200000")), (1_000_000, Decimal("8.000000"))],
+)
+def test_opus_5_5_cache_write_cost_by_one_hour_share(
+    one_hour_tokens: int, expected: Decimal
+) -> None:
+    """1M written tokens on claude-opus-5-5 ($4/M base input): all 5m is 1.25x,
+    all 1h is 2x, and a 40% 1h split lands in between. Pins the 1h count as a
+    subset of the total, not an addition to it."""
+    cost = compute_cost(
+        "claude-opus-5-5",
+        0,
+        0,
+        provider="anthropic",
+        cache_creation_input_tokens=1_000_000,
+        cache_creation_1h_input_tokens=one_hour_tokens,
+    )
+    assert cost == expected
+
+
+def test_mixed_lifetimes_charge_only_the_one_hour_share_extra() -> None:
+    model = "claude-opus-4-5"
+    all_five_min = compute_cost(
+        model, 100, 10, provider="anthropic", cache_creation_input_tokens=4_000
+    )
+    mixed = compute_cost(
+        model,
+        100,
+        10,
+        provider="anthropic",
+        cache_creation_input_tokens=4_000,
+        cache_creation_1h_input_tokens=1_000,
+    )
+    extra = _base_input_cost(model, 1_000) * Decimal("0.75")
+    assert mixed == (all_five_min + extra).quantize(Decimal("0.000001"))
+
+
+def test_unreported_split_prices_like_before() -> None:
+    """``None`` (provider did not report the split) prices every write as 5m."""
+    plain = compute_cost(
+        "claude-opus-4-5", 10, 10, provider="anthropic", cache_creation_input_tokens=2_000
+    )
+    unreported = compute_cost(
+        "claude-opus-4-5",
+        10,
+        10,
+        provider="anthropic",
+        cache_creation_input_tokens=2_000,
+        cache_creation_1h_input_tokens=None,
+    )
+    assert plain == unreported
+
+
+def test_route_prefixed_name_gets_the_one_hour_rate() -> None:
+    """The 1h split prices through the resolved ref like everything else."""
+    costs = {
+        model: compute_cost(
+            model,
+            0,
+            0,
+            provider="anthropic",
+            cache_creation_input_tokens=1_000_000,
+            cache_creation_1h_input_tokens=400_000,
+        )
+        for model in ("clawbolt-anthropic:claude-opus-5-5", "claude-opus-5-5")
+    }
+    assert set(costs.values()) == {Decimal("6.200000")}

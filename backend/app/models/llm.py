@@ -59,6 +59,16 @@ class LLMUsageLog(Base):
     cache_read_input_tokens: Mapped[int | None] = mapped_column(
         Integer, nullable=True, default=None
     )
+    # Anthropic's split of ``cache_creation_input_tokens`` by cache lifetime
+    # (``usage.cache_creation.ephemeral_5m_input_tokens`` / ``_1h_``). A 1h
+    # write bills 2x base input and a 5m write 1.25x. NULL when the provider
+    # does not report the split, which is not the same as zero.
+    cache_creation_5m_input_tokens: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, default=None
+    )
+    cache_creation_1h_input_tokens: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, default=None
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
