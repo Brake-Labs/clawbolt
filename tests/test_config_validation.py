@@ -271,3 +271,27 @@ class TestIMessageAddressWarning:
         assert not any(
             "LINQ_FROM_NUMBER" in w or "BLUEBUBBLES_IMESSAGE_ADDRESS" in w for w in warnings
         )
+
+
+class TestLLMPricingAliases:
+    """``LLM_PRICING_ALIASES`` is ``name=model`` pairs, comma-separated."""
+
+    def test_empty_means_no_aliases(self) -> None:
+        assert Settings(llm_pricing_aliases="").llm_pricing_alias_map == {}
+
+    def test_parses_pairs_and_trims_whitespace(self) -> None:
+        s = Settings(
+            llm_pricing_aliases=" clawbolt-prod = claude-opus-5 , gw-fast=claude-sonnet-5,"
+        )
+        assert s.llm_pricing_alias_map == {
+            "clawbolt-prod": "claude-opus-5",
+            "gw-fast": "claude-sonnet-5",
+        }
+
+    @pytest.mark.parametrize(
+        "raw",
+        ["clawbolt-prod", "clawbolt-prod=", "=claude-opus-5", "a=claude-opus-5,a=claude-sonnet-5"],
+    )
+    def test_rejects_malformed_entries(self, raw: str) -> None:
+        with pytest.raises(ValidationError, match="LLM_PRICING_ALIASES"):
+            Settings(llm_pricing_aliases=raw)

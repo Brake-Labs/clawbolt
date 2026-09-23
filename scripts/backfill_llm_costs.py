@@ -9,10 +9,17 @@ the token counts are recorded correctly. This happened in production for
 model, so every usage row for it showed $0 in the admin panel (see the
 regression added to ``tests/test_llm_pricing.py``).
 
-Bumping ``genai-prices`` fixes rows written *after* the deploy. This
-script repairs the historical rows: it recomputes ``cost`` from the
-token counts already stored on each row using the current (bumped)
-pricing data and updates the rows in place.
+The same happened to every row a gateway served: the model string was a
+route name (``clawbolt-anthropic:claude-opus-5-5``) or a bare alias
+(``clawbolt-prod``) that no price list carries. ``llm_pricing`` now
+strips the route prefix and applies ``LLM_PRICING_ALIASES``.
+
+Bumping ``genai-prices`` or setting an alias fixes rows written *after*
+the deploy. This script repairs the historical rows: it recomputes
+``cost`` from the token counts already stored on each row, through the
+same resolution the logger uses, and updates ``cost`` and
+``pricing_available`` in place. Run it with the same
+``LLM_PRICING_ALIASES`` the app has, or aliased rows stay at $0.
 
 Safety model:
 
@@ -23,8 +30,13 @@ Safety model:
   library rate change since the original write cannot retroactively
   rewrite settled costs.
 - **Only writes when the recomputed cost is > 0.** A row whose model is
-  still unknown to ``genai-prices`` stays at 0, so the run is a safe
-  no-op against stale pricing data.
+  still unknown to ``genai-prices`` stays at 0 with
+  ``pricing_available = false``, so the run is a safe no-op against stale
+  pricing data.
+- **Respects endpoints.** A row served through an endpoint marked
+  ``unpriced``, or one that no longer exists (so whether it was priced is
+  unknowable), is skipped: the endpoint said the (provider, model) pair
+  does not name who billed the tokens.
 - **Idempotent.** Re-running finds nothing to do once applied.
 
 Usage::
@@ -53,7 +65,7 @@ from decimal import Decimal
 from sqlalchemy import or_, select
 
 from backend.app.database import db_session_async
-from backend.app.models import LLMUsageLog
+from backend.app.models import LLMEndpoint, LLMUsageLog
 from backend.app.services.llm_pricing import compute_cost, is_known_model
 
 
@@ -65,6 +77,7 @@ class BackfillResult:
     updated: int
     total_added: Decimal
     applied: bool
+    skipped_endpoint: int = 0
 
 
 async def backfill_costs(
@@ -87,8 +100,17 @@ async def backfill_costs(
     """
     scanned = 0
     updated = 0
+    skipped_endpoint = 0
     total_added = Decimal("0.000000")
     after_id = 0
+
+    async with db_session_async() as session:
+        endpoint_pricing = {
+            name: pricing
+            for name, pricing in (
+                await session.execute(select(LLMEndpoint.name, LLMEndpoint.pricing))
+            ).all()
+        }
 
     while True:
         async with db_session_async() as session:
@@ -115,6 +137,9 @@ async def backfill_costs(
             batch_dirty = False
             for row in rows:
                 scanned += 1
+                if row.endpoint and endpoint_pricing.get(row.endpoint, "unpriced") == "unpriced":
+                    skipped_endpoint += 1
+                    continue
                 new_cost = compute_cost(
                     row.model,
                     input_tokens=row.input_tokens,
@@ -129,6 +154,7 @@ async def backfill_costs(
                 total_added += new_cost
                 if apply:
                     row.cost = new_cost
+                    row.pricing_available = True
                     batch_dirty = True
 
             if apply and batch_dirty:
@@ -139,6 +165,7 @@ async def backfill_costs(
         updated=updated,
         total_added=total_added,
         applied=apply,
+        skipped_endpoint=skipped_endpoint,
     )
 
 
@@ -177,7 +204,8 @@ async def _amain(args: argparse.Namespace) -> int:
     if args.model is not None and not is_known_model(args.model, provider=args.provider or ""):
         print(
             f"error: genai-prices does not know model={args.model!r} "
-            f"(provider={args.provider or 'auto'!r}). Bump genai-prices before backfilling.",
+            f"(provider={args.provider or 'auto'!r}), even after stripping a route prefix "
+            "and applying LLM_PRICING_ALIASES. Bump genai-prices or set the alias first.",
             file=sys.stderr,
         )
         return 1
@@ -195,6 +223,7 @@ async def _amain(args: argparse.Namespace) -> int:
 
     print(f"  scanned (priceable-candidate rows): {result.scanned}")
     print(f"  rows {'updated' if result.applied else 'that would update'}: {result.updated}")
+    print(f"  skipped (unpriced or deleted endpoint): {result.skipped_endpoint}")
     print(
         f"  total cost {'added' if result.applied else 'that would be added'}: ${result.total_added}"
     )

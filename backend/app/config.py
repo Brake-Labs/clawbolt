@@ -1,3 +1,4 @@
+import functools
 import hashlib
 import hmac
 import logging
@@ -30,6 +31,26 @@ def _derive_webhook_secret(bot_token: str) -> str:
         msg=bot_token.encode(),
         digestmod=hashlib.sha256,
     ).hexdigest()
+
+
+@functools.cache
+def parse_llm_pricing_aliases(raw: str) -> tuple[tuple[str, str], ...]:
+    """Parse ``name=model,name=model``, raising ``ValueError`` on a bad entry.
+
+    Cached on the raw string because pricing reads it on every usage row.
+    Returns pairs rather than a dict so the cached value cannot be mutated.
+    """
+    aliases: dict[str, str] = {}
+    for entry in raw.split(","):
+        if not entry.strip():
+            continue
+        name, sep, target = (part.strip() for part in entry.partition("="))
+        if not sep or not name or not target:
+            raise ValueError(f"LLM_PRICING_ALIASES entry {entry.strip()!r} is not name=model")
+        if aliases.get(name, target) != target:
+            raise ValueError(f"LLM_PRICING_ALIASES maps {name!r} twice")
+        aliases[name] = target
+    return tuple(aliases.items())
 
 
 def get_effective_webhook_secret(s: "Settings") -> str:
@@ -123,6 +144,14 @@ class Settings(BaseSettings):
     llm_cache_extended_ttl: bool = True
     # "auto" stamps supported Anthropic cache breakpoints; "never" disables them.
     llm_prompt_cache: Literal["auto", "never"] = "auto"
+    # Model names genai-prices cannot price, mapped to one it can, as
+    # comma-separated ``name=model`` pairs: ``clawbolt-prod=claude-opus-5``.
+    # For gateway aliases that carry no vendor model id. A ``<route>:<model>``
+    # name needs no entry; ``services.llm_pricing`` strips the route itself.
+    # Environment only, deliberately not in ``PERSISTABLE_SETTINGS``: it
+    # describes the gateway's route table, which lives in the deployment, and
+    # there is no admin form for it. See docs/self-host/configuration.md.
+    llm_pricing_aliases: str = ""
 
     # Model comparison (admin console, multi_user only). A run replays a
     # user's recent turns through a candidate model, one LLM call per turn
@@ -455,6 +484,13 @@ class Settings(BaseSettings):
             return value.strip()
         return value
 
+    @field_validator("llm_pricing_aliases")
+    @classmethod
+    def _validate_llm_pricing_aliases(cls, value: str) -> str:
+        """Fail at startup on a malformed entry rather than pricing it at $0."""
+        parse_llm_pricing_aliases(value)
+        return value
+
     @model_validator(mode="after")
     def _validate_smtp_pair(self) -> "Settings":
         """Reject partial SMTP config so a typo'd env var fails loudly.
@@ -480,6 +516,11 @@ class Settings(BaseSettings):
         if not self.admin_user_ids_raw:
             return set()
         return {uid.strip() for uid in self.admin_user_ids_raw.split(",") if uid.strip()}
+
+    @property
+    def llm_pricing_alias_map(self) -> dict[str, str]:
+        """``llm_pricing_aliases`` as ``{name: model}``."""
+        return dict(parse_llm_pricing_aliases(self.llm_pricing_aliases))
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 

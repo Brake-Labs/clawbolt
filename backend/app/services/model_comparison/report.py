@@ -20,7 +20,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from backend.app.agent.tools.base import Tool
-from backend.app.services.llm_pricing import compute_cost, is_known_model
+from backend.app.services.llm_pricing import UNPRICED_HINT, compute_cost, is_known_model
 from backend.app.services.llm_service import LLMTarget
 from backend.app.services.model_comparison.checks import (
     accept_args,
@@ -370,10 +370,11 @@ class ModelTotals:
     total_cost: Decimal | None = None
     """Dollars, or ``None`` when nothing here can price these tokens.
 
-    ``None`` rather than zero, all the way to the wire. A gateway model name
-    has no price-list entry, so the old column reported ``0.000000`` next to
-    a warning nobody read, and a real-looking number beat the warning every
-    time. See ``cost_unavailable_reason``.
+    ``None`` rather than zero, all the way to the wire. A gateway alias that
+    ``llm_pricing.resolve_price_ref`` cannot map has no price-list entry, so
+    the old column reported ``0.000000`` next to a warning nobody read, and a
+    real-looking number beat the warning every time. See
+    ``cost_unavailable_reason``.
     """
     cost_unavailable_reason: str = ""
     """Why there is no cost: "endpoint" or "model". Empty when priced."""
@@ -548,7 +549,8 @@ def _cost_note(summary: RunSummary, endpoint: str) -> str:
     named = totals.model or "this model"
     return (
         f"Cost is not available: no pricing entry for {named}. The token counts "
-        f"below are real; the dollar figure is not shown rather than shown as zero."
+        f"below are real; the dollar figure is not shown rather than shown as zero. "
+        f"{UNPRICED_HINT}"
     )
 
 
