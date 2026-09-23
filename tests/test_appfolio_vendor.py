@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+import sqlalchemy as sa
 
 from backend.app.integrations.appfolio_vendor.auth import (
     AppFolioCredential,
@@ -25,7 +26,6 @@ from backend.app.integrations.appfolio_vendor.params import (
     AppFolioListWorkOrdersParams,
 )
 from backend.app.integrations.appfolio_vendor.service import (
-    AccessExchangeResult,
     AppFolioError,
     AppFolioVendorService,
     AuthExpiredError,
@@ -40,6 +40,7 @@ from backend.app.integrations.appfolio_vendor.work_orders import (
     _normalize_search_hit,
     build_work_order_tools,
 )
+from backend.app.services.oauth import ReconnectRequired
 
 
 async def _record(sink: list[list[str]], ids: list[str]) -> None:
@@ -236,6 +237,45 @@ async def test_load_credential_falls_back_to_legacy_extra_refresh_token(
     assert cred is not None
     assert cred.refresh_token == "legacy-refresh"
 
+    # Moved into the encrypted column, where the shared OAuth refresh reads it.
+    async with db_session_async() as session:
+        row = (
+            await session.execute(
+                sa.select(OAuthToken).where(
+                    OAuthToken.user_id == user_id, OAuthToken.integration == INTEGRATION_NAME
+                )
+            )
+        ).scalar_one()
+        assert row.refresh_token == "legacy-refresh"
+        assert "refresh_token" not in _json.loads(row.extra_json)
+
+
+async def test_save_customer_ids_leaves_the_tokens_alone(async_test_user: Any) -> None:
+    """Persisting discovered customer IDs must not rewrite the JWT or refresh token.
+
+    Regression: the factory saved the whole credential from the copy it
+    loaded at the start of the turn, which could put back a refresh token a
+    peer worker had already rotated.
+    """
+    from backend.app.integrations.appfolio_vendor.auth import save_customer_ids
+
+    user_id = async_test_user.id
+    await save_credential(
+        user_id=user_id,
+        jwt="jwt-rotated",
+        fingerprint="fp-1",
+        customer_ids=[],
+        refresh_token="rt-rotated",
+    )
+
+    await save_customer_ids(user_id, ["cust-9001"])
+
+    cred = await load_credential(user_id)
+    assert cred is not None
+    assert (cred.jwt, cred.refresh_token) == ("jwt-rotated", "rt-rotated")
+    assert cred.customer_ids == ["cust-9001"]
+    assert cred.fingerprint == "fp-1"
+
 
 async def test_save_credential_strips_legacy_refresh_token_from_extra(
     async_test_user: Any,
@@ -404,13 +444,10 @@ async def test_service_scope_401_does_not_spend_the_one_shot_refresh() -> None:
     """
     cred = _credential()
     cred.refresh_token = "refresh-1"
-    service = AppFolioVendorService(cred, api_base="https://api.test")
+    refresh = AsyncMock(side_effect=ReconnectRequired("appfolio_vendor", "dead"))
+    service = AppFolioVendorService(cred, api_base="https://api.test", refresh_rejected_jwt=refresh)
     response = _mock_response(json_data={}, status_code=401)
-    refresh = AsyncMock(side_effect=AuthExpiredError())
-    with (
-        patch("backend.app.integrations.appfolio_vendor.service.httpx.AsyncClient") as cls,
-        patch("backend.app.integrations.appfolio_vendor.service.refresh_access_token", refresh),
-    ):
+    with patch("backend.app.integrations.appfolio_vendor.service.httpx.AsyncClient") as cls:
         cls.return_value = _patch_async_client("request", response)
         with pytest.raises(AuthScopeError):
             await service.get("/anything")
@@ -484,36 +521,32 @@ async def test_service_401_after_successful_refresh_raises_auth_scope() -> None:
     """A refresh the OAuth endpoint honoured also proves the credential is live."""
     cred = _credential()
     cred.refresh_token = "refresh-1"
-    service = AppFolioVendorService(cred, api_base="https://api.test")
+    refresh = AsyncMock(return_value="jwt-2")
+    service = AppFolioVendorService(cred, api_base="https://api.test", refresh_rejected_jwt=refresh)
     denied = _mock_response(json_data={"login_url": "https://login/here"}, status_code=401)
-    with (
-        patch("backend.app.integrations.appfolio_vendor.service.httpx.AsyncClient") as cls,
-        patch(
-            "backend.app.integrations.appfolio_vendor.service.refresh_access_token",
-            AsyncMock(return_value=AccessExchangeResult(jwt="jwt-2", customer_ids=[], raw={})),
-        ),
-    ):
+    with patch("backend.app.integrations.appfolio_vendor.service.httpx.AsyncClient") as cls:
         cls.return_value = _patch_async_client("request", denied)
         with pytest.raises(AuthScopeError):
             await service.get("/denied")
+        # The fresh JWT is itself refused on a later call: still the route,
+        # and no second refresh rotates the tokens again.
+        with pytest.raises(AuthScopeError):
+            await service.get("/denied")
+    refresh.assert_awaited_once_with("jwt-1")
 
 
 async def test_service_401_with_rejected_refresh_grant_raises_auth_expired() -> None:
     """The OAuth endpoint refusing the refresh grant is the one true expiry signal."""
     cred = _credential()
     cred.refresh_token = "refresh-dead"
-    service = AppFolioVendorService(cred, api_base="https://api.test")
+    refresh = AsyncMock(side_effect=ReconnectRequired("appfolio_vendor", "dead"))
+    service = AppFolioVendorService(cred, api_base="https://api.test", refresh_rejected_jwt=refresh)
     denied = _mock_response(json_data={"login_url": "https://login/here"}, status_code=401)
-    with (
-        patch("backend.app.integrations.appfolio_vendor.service.httpx.AsyncClient") as cls,
-        patch(
-            "backend.app.integrations.appfolio_vendor.service.refresh_access_token",
-            AsyncMock(side_effect=AuthExpiredError()),
-        ),
-    ):
+    with patch("backend.app.integrations.appfolio_vendor.service.httpx.AsyncClient") as cls:
         cls.return_value = _patch_async_client("request", denied)
         with pytest.raises(AuthExpiredError):
             await service.get("/anything")
+    refresh.assert_awaited_once_with("jwt-1")
 
 
 async def test_service_error_to_tool_result_distinguishes_scope_from_expired() -> None:
@@ -1110,9 +1143,6 @@ async def test_service_request_refreshes_on_401_and_retries() -> None:
         extra={},
         refresh_token="rt-1",
     )
-    refreshed_resp = _mock_response(
-        json_data={"access_token": "new-jwt", "refresh_token": "rt-2", "expires_in": 7200}
-    )
     # A rejected-credential 401 always carries a real login_url in prod; a
     # 401 with none means the credential was accepted and the customer
     # scope was refused (#1288), which deliberately skips the refresh.
@@ -1120,35 +1150,26 @@ async def test_service_request_refreshes_on_401_and_retries() -> None:
         json_data={"login_url": "https://passport.appf.io/authorize"}, status_code=401
     )
     api_resp_ok = _mock_response(json_data={"ok": True})
+    refresh = AsyncMock(return_value="new-jwt")
 
-    persisted: list[tuple[str, str]] = []
-
-    async def on_refresh(jwt: str, refresh: str) -> None:
-        persisted.append((jwt, refresh))
-
-    svc = AppFolioVendorService(cred, api_base="https://api.test", on_token_refresh=on_refresh)
+    svc = AppFolioVendorService(cred, api_base="https://api.test", refresh_rejected_jwt=refresh)
     with patch("backend.app.integrations.appfolio_vendor.service.httpx.AsyncClient") as cls:
-        # Three sequential client uses: API 401, OAuth refresh 200, API retry 200.
-        clients = [AsyncMock(), AsyncMock(), AsyncMock()]
-        clients[0].request = AsyncMock(return_value=api_resp_401)
-        clients[1].post = AsyncMock(return_value=refreshed_resp)
-        clients[2].request = AsyncMock(return_value=api_resp_ok)
-        cms = []
-        for c in clients:
-            cm = MagicMock()
-            cm.__aenter__ = AsyncMock(return_value=c)
-            cm.__aexit__ = AsyncMock(return_value=False)
-            cms.append(cm)
-        cls.side_effect = cms
+        client = AsyncMock()
+        client.request = AsyncMock(side_effect=[api_resp_401, api_resp_ok])
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=client)
+        cm.__aexit__ = AsyncMock(return_value=False)
+        cls.return_value = cm
         out = await svc.get("/profiles/me")
     assert out == {"ok": True}
+    refresh.assert_awaited_once_with("old-jwt")
     assert cred.jwt == "new-jwt"
-    assert cred.refresh_token == "rt-2"
-    assert persisted == [("new-jwt", "rt-2")]
+    bearers = [c.kwargs["headers"]["Authorization"] for c in client.request.await_args_list]
+    assert bearers == ["Bearer old-jwt", "Bearer new-jwt"]
 
 
-def test_build_service_passes_on_token_refresh_callback() -> None:
-    """build_service must thread the persistence callback into the service."""
+def test_build_service_passes_the_refresh_hook() -> None:
+    """build_service must thread the 401 refresh hook into the service."""
     cred = AppFolioCredential(
         user_id="u",
         jwt="j",
@@ -1157,11 +1178,11 @@ def test_build_service_passes_on_token_refresh_callback() -> None:
         extra={},
     )
 
-    async def cb(_jwt: str, _refresh: str) -> None:
-        pass
+    async def refresh(_jwt: str) -> str | None:
+        return None
 
-    svc = build_service(cred, api_base="https://api.test", on_token_refresh=cb)
-    assert svc._on_token_refresh is cb
+    svc = build_service(cred, api_base="https://api.test", refresh_rejected_jwt=refresh)
+    assert svc._refresh_rejected_jwt is refresh
 
 
 # ---------------------------------------------------------------------------
@@ -2253,7 +2274,7 @@ async def test_factory_persists_discovered_customer_ids() -> None:
             "backend.app.integrations.appfolio_vendor.factory.load_credential",
             new=AsyncMock(return_value=cred),
         ),
-        patch("backend.app.integrations.appfolio_vendor.factory.save_credential", new=saved),
+        patch("backend.app.integrations.appfolio_vendor.factory.save_customer_ids", new=saved),
         patch(
             "backend.app.integrations.appfolio_vendor.factory.build_service",
             side_effect=_capture,
@@ -2262,16 +2283,10 @@ async def test_factory_persists_discovered_customer_ids() -> None:
         await _appfolio_vendor_factory(ctx)
         await captured["on_customer_ids_resolved"](["cust-9001"])
 
-    saved.assert_awaited_once()
-    assert saved.await_args is not None
-    kwargs = saved.await_args.kwargs
-    assert kwargs["customer_ids"] == ["cust-9001"]
-    assert kwargs["user_id"] == "u1"
-    # The JWT and refresh token come off the live credential, so a token
-    # refresh earlier in the same turn is not overwritten with stale values.
-    assert kwargs["jwt"] == "jwt-1"
-    assert kwargs["refresh_token"] == "refresh-1"
-    assert kwargs["fingerprint"] == "fp-1"
+    # Only the IDs are written: the tokens belong to the shared refresh, and
+    # rewriting them from this turn's copy could undo a peer's rotation.
+    saved.assert_awaited_once_with("u1", ["cust-9001"])
+    assert captured["refresh_rejected_jwt"] is not None
 
 
 async def test_unconnected_user_sees_appfolio_in_unauthenticated_list() -> None:

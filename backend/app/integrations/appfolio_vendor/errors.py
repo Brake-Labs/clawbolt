@@ -21,11 +21,13 @@ import logging
 from typing import Any
 
 from backend.app.agent.tools.base import ToolErrorKind, ToolResult
+from backend.app.integrations.appfolio_vendor.auth import INTEGRATION_NAME
 from backend.app.integrations.appfolio_vendor.service import (
     AppFolioError,
     AuthExpiredError,
     AuthScopeError,
 )
+from backend.app.services.oauth import reconnect_instruction
 
 logger = logging.getLogger(__name__)
 
@@ -85,10 +87,7 @@ def log_unexpected_response_shape(
     )
 
 
-_AUTH_EXPIRED_HINT = (
-    "Have the user reconnect AppFolio on the Integrations page of the Clawbolt"
-    " web app with a fresh magic link. Do not ask them to paste the link into chat."
-)
+_AUTH_EXPIRED_HINT = reconnect_instruction(INTEGRATION_NAME)
 
 # Distinct hint for scope failures: reconnecting does not help, the
 # request just used the wrong customer_id. Steers the agent toward
