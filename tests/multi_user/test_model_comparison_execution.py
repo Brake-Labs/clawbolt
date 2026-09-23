@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from backend.app.agent.core import AssembledPrompt
 from backend.app.agent.messages import SystemMessage, UserMessage
 from backend.app.agent.tools.base import Tool, ToolResult, ToolTags
+from backend.app.config import settings
 from backend.app.services.llm_service import LLMTarget
 from backend.app.services.model_comparison.execution import MAX_REPLAY_READ_ROUNDS, call_model
 from backend.app.services.model_comparison.types import RecordedToolResult
@@ -222,12 +223,48 @@ async def test_a_write_is_never_answered_even_when_the_live_turn_made_it() -> No
     assert [c.name for c in result.tool_calls] == ["add_note"]
 
 
-async def test_the_replay_gives_up_after_its_round_budget() -> None:
+async def test_the_replay_gives_up_after_its_round_budget_and_says_so() -> None:
+    """The cap is the measurement's limit, so the result carries that it hit.
+
+    Without the flag the decision on record is a read, ``compare_writes``
+    finds no matching write, and the card renders the red "Did not make the
+    write" for a candidate that was cut off mid-lookup.
+    """
     mock = AsyncMock(return_value=_response(tool=SEARCH))
     result = await _replay(mock)
     assert mock.await_count == MAX_REPLAY_READ_ROUNDS + 1
     assert [c.name for c in result.tool_calls] == ["search"]
     assert len(result.replayed_lookups) == MAX_REPLAY_READ_ROUNDS
+    assert result.hit_read_round_cap is True
+
+
+async def test_a_replay_that_decided_within_the_budget_is_not_marked_capped() -> None:
+    """The flag means "was still asking", not "used every round". A model
+    that answers on its last allowed round decided; it was not cut off."""
+    rounds = [_response(tool=SEARCH)] * MAX_REPLAY_READ_ROUNDS + [_response(text="Found it.")]
+    mock = AsyncMock(side_effect=rounds)
+    result = await _replay(mock)
+    assert mock.await_count == MAX_REPLAY_READ_ROUNDS + 1
+    assert result.hit_read_round_cap is False
+    assert result.text == "Found it."
+
+
+async def test_a_single_round_decision_is_not_marked_capped() -> None:
+    mock = AsyncMock(return_value=_response(tool=NOTE))
+    result = await _replay(mock)
+    assert result.hit_read_round_cap is False
+
+
+async def test_the_round_cap_leaves_headroom_over_a_lookup_chain() -> None:
+    """Six rather than three, and far under production's fifteen.
+
+    Disambiguate the customer, find their job, pull the invoice, then write
+    is four rounds. Three cut those turns off and reported them as missed
+    writes; production's own ``max_tool_rounds`` is the other bound, and a
+    replay must not be allowed to spend a whole agent loop per turn.
+    """
+    assert MAX_REPLAY_READ_ROUNDS == 6
+    assert settings.max_tool_rounds > MAX_REPLAY_READ_ROUNDS
 
 
 async def test_without_a_tool_set_the_replay_is_single_round() -> None:

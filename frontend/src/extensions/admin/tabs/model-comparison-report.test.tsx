@@ -160,16 +160,19 @@ describe('ModelComparisonReportPage', () => {
     expect(within(compared as HTMLElement).getAllByText('1')).toHaveLength(2);
   });
 
-  it('reports the write-match rate with the middle bucket beside it', async () => {
-    // A rephrased message body lands in "same tool, different arguments", and
-    // so does a note filed against the wrong job. Hiding that bucket would
-    // make the headline rate read as a quality score.
+  it('reports the write-match rate with the middle buckets beside it', async () => {
+    // "Right record, different content" and "the tool aimed somewhere else"
+    // are separate buckets, and neither is in the headline rate. Hiding them
+    // would make that rate read as a quality score.
     const api = await import('../admin-api');
     const s = summary({
       writes_total: 10,
       writes_matched: 6,
-      writes_args_differ: 3,
+      writes_same_record: 2,
+      writes_args_differ: 1,
       writes_missed: 1,
+      writes_not_reached: 0,
+      writes_measured: 10,
       write_match_rate: 0.6,
     });
     vi.mocked(api.getComparisonReport).mockResolvedValue(report({ run: run({ summary: s }) }));
@@ -179,8 +182,70 @@ describe('ModelComparisonReportPage', () => {
     expect(within(tile as HTMLElement).getByText('6/10')).toBeInTheDocument();
     expect(
       within(tile as HTMLElement).getByText(
-        /60% matched, 3 same tool with different arguments, 1 not made/,
+        /60% matched on every argument, 2 same record with different arguments, 1 same tool only, 1 not made/,
       ),
+    ).toBeInTheDocument();
+  });
+
+  it('measures the rate over the writes the candidate was actually asked about', async () => {
+    // A write on a turn whose replay ran out of lookup rounds was never put
+    // to the candidate. Counting it in the denominator reports a measurement
+    // failure as a lower score.
+    const api = await import('../admin-api');
+    const s = summary({
+      writes_total: 10,
+      writes_matched: 6,
+      writes_same_record: 0,
+      writes_args_differ: 0,
+      writes_missed: 0,
+      writes_not_reached: 4,
+      writes_measured: 6,
+      write_match_rate: 1,
+    });
+    vi.mocked(api.getComparisonReport).mockResolvedValue(report({ run: run({ summary: s }) }));
+    renderReport();
+
+    const tile = (await screen.findByText('Writes reached')).closest('div');
+    expect(within(tile as HTMLElement).getByText('6/6')).toBeInTheDocument();
+  });
+
+  it('gives a silent candidate its own tile', async () => {
+    // A turn the candidate answered with nothing passes every safety check by
+    // having nothing to check, so the violation count beside it is a zero
+    // that means the opposite of what it looks like.
+    const api = await import('../admin-api');
+    const s = summary({
+      outcome_counts: { no_candidate_output: 3, no_write: 37 },
+    });
+    vi.mocked(api.getComparisonReport).mockResolvedValue(report({ run: run({ summary: s }) }));
+    renderReport();
+
+    const tile = (await screen.findByText('Answered with nothing')).closest('div');
+    expect(within(tile as HTMLElement).getByText('3')).toBeInTheDocument();
+  });
+
+  it('says a latency nobody measured is not available rather than zero', async () => {
+    const api = await import('../admin-api');
+    const s = summary({
+      turns_replayed: 0,
+      turns_failed: 40,
+      candidate: { ...summary().candidate, latency_p50_ms: null, latency_p95_ms: null },
+    });
+    vi.mocked(api.getComparisonReport).mockResolvedValue(report({ run: run({ summary: s }) }));
+    renderReport();
+
+    const tile = (await screen.findByText('Candidate latency (p95)')).closest('div');
+    expect(within(tile as HTMLElement).getByText('not available')).toBeInTheDocument();
+  });
+
+  it('puts the production window beside the candidate cost', async () => {
+    // A candidate cost with nothing beside it reads as what the deployment
+    // would pay. The comparison was never on the page before.
+    renderReport();
+
+    const tile = (await screen.findByText('Candidate cost')).closest('div');
+    expect(
+      within(tile as HTMLElement).getByText(/Production billed \$0.9000 over 80 calls/),
     ).toBeInTheDocument();
   });
 
@@ -282,7 +347,63 @@ describe('ModelComparisonReportPage', () => {
     // The fixture turn is a miss: production filed against customer 884412
     // and the candidate replied in prose.
     expect(await screen.findByText('Did not make the write')).toBeInTheDocument();
-    expect(screen.getByText(/compared on/)).toHaveTextContent('884412');
+    expect(screen.getByText(/production sent/)).toHaveTextContent('884412');
+  });
+
+  it('names the arguments that differ rather than showing two blobs', async () => {
+    const api = await import('../admin-api');
+    vi.mocked(api.getComparisonReport).mockResolvedValue(
+      report({
+        turns: [
+          turn({
+            outcome: 'write_same_record',
+            writes: [
+              {
+                tool_name: 'qb_update',
+                outcome: 'same_record_different_args',
+                key_arguments: { entity_type: 'Invoice', entity_id: '4102', total_amt: 500 },
+                candidate_arguments: {
+                  entity_type: 'Estimate',
+                  entity_id: '4102',
+                  total_amt: 5000,
+                },
+                record_ids: { entity_id: ['4102'] },
+                differing_arguments: ['entity_type', 'total_amt'],
+              },
+            ],
+          }),
+        ],
+      }),
+    );
+    renderReport();
+
+    const line = await screen.findByText(/differs on/);
+    expect(line).toHaveTextContent('entity_type, total_amt');
+    expect(line).toHaveTextContent('Same record, different arguments');
+  });
+
+  it('says outright when the candidate returned nothing', async () => {
+    // An empty column beside a production reply reads as a rendering gap,
+    // not as the model returning nothing.
+    const api = await import('../admin-api');
+    vi.mocked(api.getComparisonReport).mockResolvedValue(
+      report({
+        turns: [
+          turn({
+            outcome: 'no_candidate_output',
+            candidate_text: '',
+            candidate_tool_calls: [],
+            writes: [],
+          }),
+        ],
+      }),
+    );
+    renderReport();
+
+    // Two matches: the summary tile's label and this turn's badge. The badge
+    // is the one under test.
+    expect(await screen.findByText('Returned no text and no tool call.')).toBeInTheDocument();
+    expect(screen.getAllByText('Answered with nothing').length).toBeGreaterThan(1);
   });
 
   it('shows what production actually did beside the candidate', async () => {

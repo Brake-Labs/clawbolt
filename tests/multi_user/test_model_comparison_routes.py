@@ -599,6 +599,78 @@ def test_report_orders_before_paging(
     assert page["turns"][0]["message_seq"] == 99
 
 
+def test_a_silent_candidate_sorts_above_a_missed_write(
+    admin_client: TestClient, consenting_user: User, db_session: Session
+) -> None:
+    """It is the hardest failure on the page and the one that reads cleanest
+    everywhere else: no call, so no finding, so nothing else surfaces it."""
+    run = _make_run(db_session, consenting_user.id)
+    db_session.add_all(
+        [
+            ComparisonTurn(
+                run_id=run.id,
+                message_seq=1,
+                user_message="missed the write",
+                outcome=str(TurnOutcome.WRITE_MISSED),
+            ),
+            ComparisonTurn(
+                run_id=run.id,
+                message_seq=2,
+                user_message="got nothing back",
+                outcome=str(TurnOutcome.NO_CANDIDATE_OUTPUT),
+            ),
+            ComparisonTurn(
+                run_id=run.id,
+                message_seq=3,
+                user_message="ran out of rounds",
+                outcome=str(TurnOutcome.REPLAY_INCOMPLETE),
+            ),
+        ]
+    )
+    db_session.commit()
+
+    turns = admin_client.get(f"{BASE}/runs/{run.public_id}").json()["turns"]
+    assert [t["outcome"] for t in turns] == [
+        str(TurnOutcome.NO_CANDIDATE_OUTPUT),
+        str(TurnOutcome.WRITE_MISSED),
+        str(TurnOutcome.REPLAY_INCOMPLETE),
+    ]
+
+
+def test_a_writes_record_ids_and_differences_reach_the_card(
+    admin_client: TestClient, consenting_user: User, db_session: Session
+) -> None:
+    """The card has to name what differed. Without it the reader diffs two
+    JSON blobs to find the one field that moved."""
+    run = _make_run(db_session, consenting_user.id)
+    db_session.add(
+        ComparisonTurn(
+            run_id=run.id,
+            message_seq=1,
+            user_message="update that invoice",
+            outcome=str(TurnOutcome.WRITE_SAME_RECORD),
+            write_results=json.dumps(
+                [
+                    {
+                        "tool_name": "qb_update",
+                        "outcome": "same_record_different_args",
+                        "key_arguments": {"entity_type": "Invoice", "entity_id": "4102"},
+                        "candidate_arguments": {"entity_type": "Estimate", "entity_id": "4102"},
+                        "record_ids": {"entity_id": ["4102"]},
+                        "differing_arguments": ["entity_type"],
+                    }
+                ]
+            ),
+        )
+    )
+    db_session.commit()
+
+    write = admin_client.get(f"{BASE}/runs/{run.public_id}").json()["turns"][0]["writes"][0]
+    assert write["outcome"] == "same_record_different_args"
+    assert write["record_ids"] == {"entity_id": ["4102"]}
+    assert write["differing_arguments"] == ["entity_type"]
+
+
 def test_report_redacts_pii_in_message_bodies(
     admin_client: TestClient, consenting_user: User, db_session: Session
 ) -> None:
@@ -870,6 +942,8 @@ def test_report_shows_what_production_did_beside_the_candidate(
                         "outcome": "matched",
                         "key_arguments": {"work_order_id": ["71002"]},
                         "candidate_arguments": {"work_order_id": "71002"},
+                        "record_ids": {"work_order_id": ["71002"]},
+                        "differing_arguments": [],
                     }
                 ]
             ),
@@ -905,8 +979,11 @@ def test_a_summary_without_a_cost_serves_null_not_zero(
             "production_checked_findings": ["fabricated_id"],
             "writes_total": 0,
             "writes_matched": 0,
+            "writes_same_record": 0,
             "writes_args_differ": 0,
             "writes_missed": 0,
+            "writes_not_reached": 0,
+            "writes_measured": 0,
             "write_match_rate": 0.0,
             "candidate": {
                 "provider": "anthropic",
@@ -920,6 +997,18 @@ def test_a_summary_without_a_cost_serves_null_not_zero(
                 "cost_unavailable_reason": "endpoint",
                 "latency_p50_ms": 1.0,
                 "latency_p95_ms": 2.0,
+            },
+            "production": {
+                "calls": 4,
+                "input_tokens": 40,
+                "output_tokens": 8,
+                "cache_read_tokens": 0,
+                "cache_creation_tokens": 0,
+                "billed_prompt_tokens": 40,
+                "total_cost_usd": None,
+                "unpriced_calls": 4,
+                "window_start": "2026-04-30T09:00:00+00:00",
+                "window_end": "2026-05-01T12:00:00+00:00",
             },
             "notes": ["Cost is not available: endpoint otari is marked unpriced."],
         },

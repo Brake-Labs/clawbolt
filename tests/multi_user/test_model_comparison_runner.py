@@ -11,6 +11,7 @@ import asyncio
 import json
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -22,8 +23,10 @@ from sqlalchemy.orm import Session
 from backend.app.agent.core import AssembledPrompt
 from backend.app.agent.messages import SystemMessage, UserMessage
 from backend.app.agent.tools.base import Tool, ToolResult, ToolTags
-from backend.app.models import ComparisonRun, ComparisonTurn, User
+from backend.app.database import AsyncSessionLocal
+from backend.app.models import ComparisonRun, ComparisonTurn, LLMUsageLog, User
 from backend.app.services.llm_service import LLMTarget
+from backend.app.services.model_comparison.production_usage import read_production_usage
 from backend.app.services.model_comparison.runner import (
     MAX_CONSECUTIVE_CALL_FAILURES,
     execute_run,
@@ -275,15 +278,20 @@ async def test_the_write_comparison_reaches_the_turn_row(
 
     db_session.expire_all()
     (row,) = _turns(db_session, run_id)
-    assert row.outcome == str(TurnOutcome.WRITE_MATCHED)
+    # Same record, different note body. ``MATCHED`` needs the whole argument
+    # set, so this is the middle bucket and not the headline rate.
+    assert row.outcome == str(TurnOutcome.WRITE_SAME_RECORD)
     writes = json.loads(row.write_results)
     assert writes[0]["tool_name"] == "add_note"
-    assert writes[0]["key_arguments"] == {"work_order_id": ["118601"]}
+    assert writes[0]["key_arguments"] == {"work_order_id": "118601", "body": "done"}
+    assert writes[0]["record_ids"] == {"work_order_id": ["118601"]}
+    assert writes[0]["differing_arguments"] == ["body"]
 
     run = db_session.get(ComparisonRun, run_id)
     assert run is not None and run.summary_json is not None
-    assert run.summary_json["writes_matched"] == 1
-    assert run.summary_json["write_match_rate"] == 1.0
+    assert run.summary_json["writes_matched"] == 0
+    assert run.summary_json["writes_same_record"] == 1
+    assert run.summary_json["write_match_rate"] == 0.0
 
 
 async def test_production_is_checked_alongside_the_candidate(
@@ -727,3 +735,95 @@ async def test_an_intermittent_failure_does_not_stop_the_run(
     assert run.status == str(RunStatus.COMPLETED)
     assert run.error == ""
     assert len(_turns(db_session, run_id)) == 6
+
+
+# ---------------------------------------------------------------------------
+# The production side of the cost tile
+# ---------------------------------------------------------------------------
+
+
+def _usage(
+    db: Session,
+    user_id: str,
+    *,
+    when: datetime,
+    priced: bool = True,
+    cost: str = "0.010000",
+) -> None:
+    db.add(
+        LLMUsageLog(
+            user_id=user_id,
+            provider="anthropic",
+            model="incumbent",
+            input_tokens=100,
+            output_tokens=20,
+            total_tokens=120,
+            cache_read_input_tokens=10,
+            cache_creation_input_tokens=5,
+            cost=Decimal(cost),
+            pricing_available=priced,
+            created_at=when,
+        )
+    )
+    db.commit()
+
+
+async def test_the_production_window_is_summed_from_the_usage_log(
+    db_session: Session, test_user: User
+) -> None:
+    """The other half of the cost tile: what this user bills today, over the
+    days the run sampled, so the candidate's figure is not read as a quote."""
+    inside = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    outside = datetime(2026, 4, 1, 12, 0, tzinfo=UTC)
+    _usage(db_session, test_user.id, when=inside)
+    _usage(db_session, test_user.id, when=inside)
+    _usage(db_session, test_user.id, when=outside)
+
+    async with AsyncSessionLocal() as db:
+        usage = await read_production_usage(
+            db,
+            test_user.id,
+            start=datetime(2026, 4, 30, tzinfo=UTC),
+            end=datetime(2026, 5, 2, tzinfo=UTC),
+        )
+    assert usage.calls == 2
+    assert usage.input_tokens == 200
+    assert usage.billed_prompt_tokens == 230
+    assert usage.total_cost == Decimal("0.020000")
+    assert usage.unpriced_calls == 0
+
+
+async def test_an_unpriced_gateway_row_is_not_summed_as_free(
+    db_session: Session, test_user: User
+) -> None:
+    """``cost`` is recorded as zero behind an unpriced gateway, so a plain
+    SUM would report the window as cheaper than it was."""
+    when = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    _usage(db_session, test_user.id, when=when, priced=False, cost="0.000000")
+    _usage(db_session, test_user.id, when=when, cost="0.030000")
+
+    async with AsyncSessionLocal() as db:
+        usage = await read_production_usage(
+            db,
+            test_user.id,
+            start=datetime(2026, 4, 30, tzinfo=UTC),
+            end=datetime(2026, 5, 2, tzinfo=UTC),
+        )
+    assert usage.calls == 2
+    assert usage.unpriced_calls == 1
+    # The priced row only. The count says the figure covers part of the window.
+    assert usage.total_cost == Decimal("0.030000")
+
+
+async def test_no_usage_in_the_window_reports_nothing_rather_than_zero_dollars(
+    db_session: Session, test_user: User
+) -> None:
+    async with AsyncSessionLocal() as db:
+        usage = await read_production_usage(
+            db,
+            test_user.id,
+            start=datetime(2026, 4, 30, tzinfo=UTC),
+            end=datetime(2026, 5, 2, tzinfo=UTC),
+        )
+    assert usage.calls == 0
+    assert usage.total_cost is None
