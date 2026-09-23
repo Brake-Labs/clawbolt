@@ -280,69 +280,146 @@ class QBSendParams(BaseModel):
     )
 
 
+# Results with more rows than this render compact (see ``_format_results``).
+# One to three rows are what a lookup by Id, DocNumber or name returns, and
+# qb_update needs that record whole, SyncToken included.
+_COMPACT_ABOVE_ROWS = 3
+
+# Compact rows cut these free-text fields to this many characters. They are
+# the bulk of a SELECT * list row and none of them identifies anything.
+_COMPACT_TEXT_CHARS = 90
+_COMPACT_SHORTENED_FIELDS = frozenset(
+    {"Line", "CustomerMemo", "PrivateNote", "Notes", "Description", "PurchaseDesc"}
+)
+
+# Compact rows omit these. Each is company-wide configuration or delivery
+# plumbing that repeats on every row of a SELECT * and answers no question the
+# agent is asked about a list. Ids, SyncToken, DocNumber, refs, amounts,
+# dates, statuses and emails are never named here.
+_COMPACT_DROPPED_FIELDS = frozenset(
+    {
+        "DeliveryInfo",
+        "ShipFromAddr",
+        "CurrencyRef",
+        "ApplyTaxAfterDiscount",
+        "FreeFormAddress",
+        "GlobalTaxCalculation",
+        "V4IDPseudonym",
+        "PrintOnCheckName",
+        "ClientEntityId",
+        "IsProject",
+        "BillWithParent",
+        "PreferredDeliveryMethod",
+        "AllowIPNPayment",
+        "AllowOnlinePayment",
+        "AllowOnlineCreditCardPayment",
+        "AllowOnlineACHPayment",
+    }
+)
+
+_COMPACT_NOTE = (
+    f"(More than {_COMPACT_ABOVE_ROWS} rows, so each is compact: filler fields "
+    f"dropped, long text cut at {_COMPACT_TEXT_CHARS} chars and marked [+N chars]. "
+    "Before quoting cut text or calling qb_update, query the record alone: "
+    "WHERE Id = '<Id>'.)"
+)
+
+
+def _render_value(key: str, val: Any) -> str | None:
+    """Render one QBO field value, or None when it has nothing to show."""
+    if isinstance(val, dict):
+        if "name" in val or "value" in val:
+            name = val.get("name", "")
+            ref_val = val.get("value", "")
+            if name and ref_val:
+                return f"{name} ({ref_val})"
+            return str(name or ref_val) if name or ref_val else None
+        if "Address" in val:
+            return str(val["Address"])
+        if "FreeFormNumber" in val:
+            return str(val["FreeFormNumber"])
+        if "URI" in val:
+            return str(val["URI"])
+        if any(k in val for k in ("Line1", "City", "PostalCode")):
+            addr_bits = [
+                str(val[k])
+                for k in ("Line1", "Line2", "City", "CountrySubDivisionCode", "PostalCode")
+                if val.get(k)
+            ]
+            return ", ".join(addr_bits) if addr_bits else None
+        # Fail loud on unknown dict shapes so future QBO fields surface
+        # (verbose but visible) rather than disappearing.
+        return json.dumps(val)
+    if isinstance(val, list):
+        if key == "Line" and val:
+            items = []
+            for item in val:
+                if not isinstance(item, dict):
+                    continue
+                desc = item.get("Description", "")
+                amt = item.get("Amount")
+                items.append(f"{desc} ${amt:,.2f}" if amt is not None and desc else str(amt))
+            return f"[{'; '.join(items)}]"
+        return json.dumps(val)
+    return str(val)
+
+
+def _is_empty(key: str, val: Any) -> bool:
+    """True for values that say nothing: null, blank, empty containers, and a
+    CustomField list whose definitions carry no value."""
+    if val is None or val == "" or val == [] or val == {}:
+        return True
+    return (
+        key == "CustomField"
+        and isinstance(val, list)
+        and all(
+            isinstance(item, dict) and not any(k.endswith("Value") for k in item) for item in val
+        )
+    )
+
+
+def _format_row(row: dict[str, Any], *, compact: bool) -> str:
+    parts: list[str] = []
+    for key, val in row.items():
+        if key in ("domain", "sparse", "MetaData"):
+            continue
+        if compact:
+            if key in _COMPACT_DROPPED_FIELDS or _is_empty(key, val):
+                continue
+            if key == "TxnTaxDetail" and isinstance(val, dict):
+                # Keep the total; the per-rate breakdown is for the full record.
+                if "TotalTax" in val:
+                    parts.append(f"TotalTax: {val['TotalTax']}")
+                continue
+        text = _render_value(key, val)
+        if text is None:
+            continue
+        if compact and key in _COMPACT_SHORTENED_FIELDS and len(text) > _COMPACT_TEXT_CHARS:
+            cut = len(text) - _COMPACT_TEXT_CHARS
+            text = f"{text[:_COMPACT_TEXT_CHARS]}... [+{cut} chars]"
+        parts.append(f"{key}: {text}")
+    return "- " + " | ".join(parts)
+
+
 def _format_results(rows: list[dict[str, Any]]) -> str:
-    """Format QBO query results into a readable string for the LLM."""
+    """Format QBO query results into a readable string for the LLM.
+
+    Up to ``_COMPACT_ABOVE_ROWS`` rows render every field. Larger results are
+    lists the agent scans, so each row drops ``_COMPACT_DROPPED_FIELDS`` and
+    empty values and cuts long free text, with a note on how to get a record
+    whole. Everything that identifies or prices a record stays on every row.
+    """
     if not rows:
         return "Query returned 0 results."
 
-    truncated = rows[:_MAX_ROWS]
+    compact = len(rows) > _COMPACT_ABOVE_ROWS
     lines = [f"Query returned {len(rows)} result(s):"]
-    for row in truncated:
-        parts: list[str] = []
-        for key, val in row.items():
-            if key in ("domain", "sparse", "MetaData"):
-                continue
-            if isinstance(val, dict):
-                if "name" in val or "value" in val:
-                    name = val.get("name", "")
-                    ref_val = val.get("value", "")
-                    if name and ref_val:
-                        parts.append(f"{key}: {name} ({ref_val})")
-                    elif name or ref_val:
-                        parts.append(f"{key}: {name or ref_val}")
-                elif "Address" in val:
-                    parts.append(f"{key}: {val['Address']}")
-                elif "FreeFormNumber" in val:
-                    parts.append(f"{key}: {val['FreeFormNumber']}")
-                elif "URI" in val:
-                    parts.append(f"{key}: {val['URI']}")
-                elif any(k in val for k in ("Line1", "City", "PostalCode")):
-                    addr_bits = [
-                        val[k]
-                        for k in (
-                            "Line1",
-                            "Line2",
-                            "City",
-                            "CountrySubDivisionCode",
-                            "PostalCode",
-                        )
-                        if val.get(k)
-                    ]
-                    if addr_bits:
-                        parts.append(f"{key}: {', '.join(addr_bits)}")
-                else:
-                    # Fail loud on unknown dict shapes so future QBO fields
-                    # surface (verbose but visible) rather than disappearing.
-                    parts.append(f"{key}: {json.dumps(val)}")
-            elif isinstance(val, list):
-                if key == "Line" and val:
-                    items = []
-                    for item in val:
-                        if not isinstance(item, dict):
-                            continue
-                        desc = item.get("Description", "")
-                        amt = item.get("Amount")
-                        entry = f"{desc} ${amt:,.2f}" if amt is not None and desc else str(amt)
-                        items.append(entry)
-                    parts.append(f"Line: [{'; '.join(items)}]")
-                else:
-                    parts.append(f"{key}: {json.dumps(val)}")
-            else:
-                parts.append(f"{key}: {val}")
-        lines.append("- " + " | ".join(parts))
+    lines.extend(_format_row(row, compact=compact) for row in rows[:_MAX_ROWS])
 
     if len(rows) > _MAX_ROWS:
         lines.append(f"... and {len(rows) - _MAX_ROWS} more (add MAXRESULTS to narrow)")
+    if compact:
+        lines.append(_COMPACT_NOTE)
 
     return "\n".join(lines)
 
@@ -782,7 +859,9 @@ def create_quickbooks_tools(
             params_model=QBQueryParams,
             usage_hint=(
                 "Query QuickBooks for invoices, estimates, customers, items, and more. "
-                "Use SELECT ... FROM <Entity> syntax."
+                "Use SELECT ... FROM <Entity> syntax. Results over "
+                f"{_COMPACT_ABOVE_ROWS} rows are compact (filler dropped, long text "
+                "cut); query WHERE Id = '<Id>' for a whole record."
             ),
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
