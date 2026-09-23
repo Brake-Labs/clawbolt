@@ -301,6 +301,20 @@ def _turn_sort_key(turn: ComparisonTurn) -> tuple[int, int, int, int]:
     The candidate's violations first, then how the turn's writes came out,
     then any other finding (production's included, which is the "it does this
     too" evidence), then the newest turn.
+
+    Sorting the whole run costs nothing the page did not already cost.
+    ``findings`` is an ``EncryptedString`` and this reads it for every turn,
+    but ``EncryptedString`` decrypts in ``process_result_value``, which runs
+    while the rows are fetched: the caller's select has already decrypted all
+    eight text columns of every turn before this sees one of them. A 200-turn
+    run is sixteen hundred decrypts whatever the page size, and each envelope
+    carries its own per-row DEK, so behind KMS that is a round trip apiece.
+
+    Making it cheaper is a schema change rather than a query change: a
+    plaintext "has a candidate violation" flag on the row, so the sort can
+    run on a ``load_only`` projection and only the page is fetched whole.
+    Worth doing when a run is routinely a few hundred turns; this
+    deployment's are tens.
     """
     has_violation = 0 if _candidate_violation(turn) else 1
     has_other_finding = 0 if _entries(turn.findings) else 1
@@ -500,12 +514,11 @@ async def get_report(
     """Return a run and a page of its turns, the ones worth reading first.
 
     The default page is ten because that is the part of the report anyone
-    acts on. The rest is available on request rather than shipped by default:
-    every text column on a turn is envelope-encrypted and then PII-redacted,
-    so serializing a 200-turn run whole is over a thousand decrypts for a
-    single page view. The ordering is what makes a page worth reading, so the
-    sort runs across the whole run and the page is taken from the result, not
-    the other way round.
+    acts on, and the ordering is what makes that page worth reading, so the
+    sort runs across the whole run and the page is taken from the result
+    rather than the other way round. What the page size saves is the PII
+    redaction and the serialization of a turn, not reading it: see the note
+    on ``_turn_sort_key``.
     """
     run = (
         await db.execute(select(ComparisonRun).where(ComparisonRun.public_id == run_id))

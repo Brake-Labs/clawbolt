@@ -2373,12 +2373,11 @@ export interface paths {
          * @description Return a run and a page of its turns, the ones worth reading first.
          *
          *     The default page is ten because that is the part of the report anyone
-         *     acts on. The rest is available on request rather than shipped by default:
-         *     every text column on a turn is envelope-encrypted and then PII-redacted,
-         *     so serializing a 200-turn run whole is over a thousand decrypts for a
-         *     single page view. The ordering is what makes a page worth reading, so the
-         *     sort runs across the whole run and the page is taken from the result, not
-         *     the other way round.
+         *     acts on, and the ordering is what makes that page worth reading, so the
+         *     sort runs across the whole run and the page is taken from the result
+         *     rather than the other way round. What the page size saves is the PII
+         *     redaction and the serialization of a turn, not reading it: see the note
+         *     on ``_turn_sort_key``.
          */
         get: operations["get_report_api_admin_model_comparison_runs__run_id__get"];
         put?: never;

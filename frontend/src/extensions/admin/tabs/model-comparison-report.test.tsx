@@ -251,6 +251,39 @@ describe('ModelComparisonReportPage', () => {
     ).toBeInTheDocument();
   });
 
+  it('keeps the production window when the candidate cost is unavailable', async () => {
+    // The two halves of the tile are independent. Blanking the production
+    // figure because the candidate has none threw away the one real number
+    // left on the tile.
+    const api = await import('../admin-api');
+    const s = summary({ notes: ['Cost is not available: no pricing entry for candidate.'] });
+    s.candidate = { ...s.candidate, total_cost_usd: null, cost_unavailable_reason: 'model' };
+    vi.mocked(api.getComparisonReport).mockResolvedValue(report({ run: run({ summary: s }) }));
+    renderReport();
+
+    const tile = (await screen.findByText('Candidate cost')).closest('div');
+    expect(
+      within(tile as HTMLElement).getByText(/Production billed \$0.9000 over 80 calls/),
+    ).toBeInTheDocument();
+  });
+
+  it('does not attribute the priced sum to the unpriced calls too', async () => {
+    // "billed $X over 80 calls, 20 of them unpriced" reads as $X buying all
+    // 80. The sum covers the priced rows only.
+    const api = await import('../admin-api');
+    const s = summary();
+    s.production = { ...s.production, unpriced_calls: 20 };
+    vi.mocked(api.getComparisonReport).mockResolvedValue(report({ run: run({ summary: s }) }));
+    renderReport();
+
+    const tile = (await screen.findByText('Candidate cost')).closest('div');
+    expect(
+      within(tile as HTMLElement).getByText(
+        /Production billed \$0.9000 over 60 priced calls of 80 in the same window; the other 20 are unpriced/,
+      ),
+    ).toBeInTheDocument();
+  });
+
   it('counts a turn the provider never answered out of the write rate', async () => {
     // Its writes are unmeasured, not missed, and the tile has to say how
     // many dropped out or the rate reads as the whole sample.

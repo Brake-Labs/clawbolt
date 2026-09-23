@@ -4143,7 +4143,7 @@
           "admin"
         ],
         "summary": "Get Report",
-        "description": "Return a run and a page of its turns, the ones worth reading first.\n\nThe default page is ten because that is the part of the report anyone\nacts on. The rest is available on request rather than shipped by default:\nevery text column on a turn is envelope-encrypted and then PII-redacted,\nso serializing a 200-turn run whole is over a thousand decrypts for a\nsingle page view. The ordering is what makes a page worth reading, so the\nsort runs across the whole run and the page is taken from the result, not\nthe other way round.",
+        "description": "Return a run and a page of its turns, the ones worth reading first.\n\nThe default page is ten because that is the part of the report anyone\nacts on, and the ordering is what makes that page worth reading, so the\nsort runs across the whole run and the page is taken from the result\nrather than the other way round. What the page size saves is the PII\nredaction and the serialization of a turn, not reading it: see the note\non ``_turn_sort_key``.",
         "operationId": "get_report_api_admin_model_comparison_runs__run_id__get",
         "parameters": [
           {

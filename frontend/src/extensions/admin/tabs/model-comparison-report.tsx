@@ -82,12 +82,19 @@ function money(totals: { total_cost_usd: string | null }): string {
 function productionCostHint(production: ComparisonSummary['production']): string {
   if (production.calls === 0) return 'No production usage recorded for this window';
   const spend = money(production);
-  const partial = production.unpriced_calls
-    ? `, ${production.unpriced_calls} of them unpriced`
-    : '';
-  return `Production billed ${spend} over ${production.calls.toLocaleString()} call${
+  const calls = production.calls.toLocaleString();
+  // The sum covers the priced rows only, so attributing it to every call in
+  // the window overstates what those dollars bought. Say which calls it
+  // covers and how many it does not.
+  if (production.unpriced_calls) {
+    const priced = (production.calls - production.unpriced_calls).toLocaleString();
+    return `Production billed ${spend} over ${priced} priced call${
+      production.calls - production.unpriced_calls === 1 ? '' : 's'
+    } of ${calls} in the same window; the other ${production.unpriced_calls.toLocaleString()} are unpriced`;
+  }
+  return `Production billed ${spend} over ${calls} call${
     production.calls === 1 ? '' : 's'
-  } in the same window${partial}`;
+  } in the same window`;
 }
 
 function Stat({ label, value, hint }: { label: string; value: string; hint?: string }) {
@@ -223,9 +230,12 @@ function SummaryGrid({ summary }: { summary: ComparisonSummary }) {
       <Stat
         label="Candidate cost"
         value={money(totals)}
+        // The production half of the tile does not depend on the candidate
+        // half. An unpriced candidate used to blank it out, which threw away
+        // the one figure on the page that was still a real number.
         hint={
           totals.total_cost_usd == null
-            ? 'See the note below'
+            ? `${productionCostHint(summary.production)}. The candidate's own cost is not available: see the note below`
             : productionCostHint(summary.production)
         }
       />
