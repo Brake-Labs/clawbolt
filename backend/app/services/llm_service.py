@@ -301,7 +301,7 @@ async def resolve_user_llm_override(user_id: str) -> UserLLMOverride | None:
 CacheTTL = Literal["5m", "1h"]
 
 
-def _cache_control(ttl: CacheTTL = "1h") -> dict[str, Any]:
+def _cache_control(ttl: CacheTTL) -> dict[str, Any]:
     """Build one ``cache_control`` block with lifetime *ttl*.
 
     Anthropic's default ephemeral lifetime is 5 minutes and is sent as a
