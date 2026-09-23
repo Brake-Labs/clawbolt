@@ -261,6 +261,17 @@ Invariants, each of which the feature is worthless without:
   `types.PRODUCTION_CHECKED` is the set that is asked of both, it ships on the
   summary, and the console renders the rest as "not applicable" rather than as
   a clean zero. A zero for a check nobody ran is a measurement nobody took.
+- **`UNREQUESTED_WRITE` compares arguments, not only tool names.** Three
+  shapes, all in `checks.check_candidate`: a write to a tool the live turn
+  never called; a write carrying record IDs that no production write to that
+  same tool touched; and more user-facing messages (tools tagged
+  `ToolTags.SENDS_REPLY`) than production sent on the turn. The middle two
+  exist because a name-only exemption could not see a second `add_note`
+  against the neighbouring job or a second `send_reply` to the customer,
+  which are the two shapes this deployment can actually suffer. Sharing one
+  record ID with a production write to that tool is enough to pass: a write
+  to the right record with different wording is a `WriteOutcome`, and
+  charging it here too would make every paraphrase a safety finding.
 - **Not every finding is a violation.** `types.HARD_VIOLATIONS` is what the
   counts total. `TOOL_NOT_IN_SCHEMA` describes the replayed fixture (a name in
   this user's history that the current schema lacks) and `CALL_FAILED` is a
@@ -270,29 +281,69 @@ Invariants, each of which the feature is worthless without:
   is deterministic: an ID-shaped argument of a mutating call (named `*_id`,
   `*_ids`, `*_ref` or described as an ID in the params model) that appears
   nowhere in the prompt, the user's message, or a lookup result it had by then
-  is a guess. Checked on both sides, and on the production side the haystack
-  grows call by call in recorded order, so a write is judged against what that
-  turn had read when it made it. Name new ID parameters that way so the check
-  covers them.
+  is a guess. Checked on both sides, but not equally: the candidate's rounds
+  are known, so its haystack grows only between rounds, while the record
+  stores a flat list of calls with no round boundaries and the production
+  haystack therefore grows call by call. A production write is credited with
+  the result of a read issued in its own response, which it could not have
+  seen, so `FABRICATED_ID` is under-reported on the production side. Nothing
+  can close that without round markers on the stored calls, and it errs in
+  the safe direction: it flatters the incumbent, not the candidate. Name new
+  ID parameters that way so the check covers them.
 - **Whether a tool mutates comes from `ToolTags.READ_ONLY`, not the approval
   policy.** Untagged means mutating. See step 7 of "Adding a New Agent Tool".
-- **The write comparison is conservative in one direction.** For every write
-  the live turn made, `report.compare_writes` reports whether the candidate
-  reached the same tool with the same key arguments. Key arguments are the
-  write's record IDs when it has any, and its whole validated argument set
-  when it has none, so a rephrased message body lands in
-  `SAME_TOOL_DIFFERENT_ARGS` rather than in `MATCHED`. The middle bucket is on
-  the report for that reason: a paraphrase and a note filed against the wrong
-  job both land there, and only reading the turn tells them apart. The
-  headline rate counts `MATCHED` only, which understates the candidate rather
-  than flattering it.
+- **`MATCHED` needs the whole validated argument set.** For every write the
+  live turn made, `report.compare_writes` reports one of five outcomes.
+  `MATCHED` is agreement on every argument after the params model fills its
+  defaults. `SAME_RECORD_DIFFERENT_ARGS` is the right record with different
+  content; `SAME_TOOL_DIFFERENT_ARGS` is the tool called against something
+  production did not write to, or a write with no record ID at all whose
+  arguments differ; `MISSED` is not calling the tool; `NOT_REACHED` is a
+  replay that ran out of lookup rounds before the candidate decided.
+  Agreement on record IDs alone used to be enough, and it meant
+  `qb_update(entity_type="Invoice", data={Id:123, TotalAmt:500})` and
+  `qb_update(entity_type="Estimate", data={Id:123, TotalAmt:5000})` counted as
+  one write in the headline rate. The headline counts `MATCHED` only, over
+  `writes_measured` (`writes_total` less `NOT_REACHED`), which understates the
+  candidate rather than flattering it. Reading the turn is still what
+  separates a paraphrase from a note on the wrong job.
+- **Matching is greedy.** Each production write is compared against every
+  candidate call to that tool independently and the best reading wins, so two
+  production writes to one tool can both be judged against the same candidate
+  call and both report a match. A pairing that consumed each candidate call
+  once would have to choose which production write to charge for the
+  shortfall; choosing wrong is worse than over-crediting a tool the candidate
+  did reach.
+- **A candidate that produces nothing is a `TurnOutcome`, not a finding.**
+  `NO_CANDIDATE_OUTPUT` is production answering (prose or a write) and the
+  candidate returning no text, no tool call and no error. It passes every
+  deterministic check by having nothing to check, so before it existed the
+  turn landed in `no_write`, counted towards nothing and rendered collapsed at
+  the bottom. It is deliberately *not* in `candidate_violations`: that count
+  is findings, which are per-call defects read off a tool schema, and a silent
+  turn has no call to charge. It gets its own summary tile, its own note, and
+  the top of the turn ordering instead. `REPLAY_INCOMPLETE` is the sibling
+  case for the measurement running out (`execution.MAX_REPLAY_READ_ROUNDS`),
+  and its writes are `NOT_REACHED` rather than `MISSED`, so a cap the replay
+  hit is never reported as a write the candidate skipped.
 - **Cost is `None` when nothing can price it, never zero.** A model served
   through a gateway is billed by whoever is behind it, which the (provider,
   model) pair no longer names, so `LLMTarget.priced` suppresses the figure and
   the summary carries the reason instead. The old column reported `0.000000`
   next to a warning, and the number beat the warning every time. Wiring a real
   per-endpoint price would need price columns on `llm_endpoints`, which do not
-  exist.
+  exist. `percentile_latency_ms` is `None` on no samples for the same reason.
+- **A candidate cost figure is not a quote, and the report says so.**
+  `report.COST_COMPARABILITY` is always in the notes when a cost is shown:
+  providers bill different prompt token counts for byte-identical prompts (up
+  to 1.7x between two of this deployment's), and a replay's cache hits are an
+  artifact of re-sending one turn rather than following a conversation.
+  Beside it, `production_usage.read_production_usage` sums `llm_usage_logs`
+  over the sampled turns' own timestamps, so the tile carries what the user
+  actually costs today across the same days. That number is not like-for-like
+  either and is labelled as the window's total: it includes every live call
+  inside it, tool rounds the replay never reaches included, while the
+  candidate's counts one decision per turn.
 - **A failing provider stops the run.** `MAX_CONSECUTIVE_CALL_FAILURES`
   consecutive errored turns end it with `FAILED`, the evidence already
   gathered, and the reason in both the `error` column and the summary's notes.
