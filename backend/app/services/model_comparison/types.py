@@ -271,6 +271,19 @@ class RunStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class HistoryMode(StrEnum):
+    """How a replay renders the history before each turn.
+
+    Chosen per run so the operator can replay the same turns both ways and
+    read what the cold-start rebuild changes (``prompt_epoch``).
+    """
+
+    FULL = "full"
+    """Every stored row verbatim, as with ``cold_start_compaction_enabled`` off."""
+    COLD_START_COMPACTION = "cold_start_compaction"
+    """The history a live turn sees with ``cold_start_compaction_enabled`` on."""
+
+
 @dataclass(frozen=True)
 class RecordedToolResult:
     """A tool call and the result it returned.

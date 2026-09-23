@@ -60,6 +60,7 @@ from backend.app.services.llm_endpoints import UnknownLLMEndpointError, resolve_
 from backend.app.services.model_comparison import launch_run
 from backend.app.services.model_comparison.types import (
     HARD_VIOLATIONS,
+    HistoryMode,
     RunStatus,
     Side,
     TurnOutcome,
@@ -148,6 +149,7 @@ def _run_item(
         candidate_provider=run.candidate_provider,
         candidate_model=run.candidate_model,
         candidate_reasoning_effort=run.candidate_reasoning_effort,
+        history_mode=run.history_mode,
         requested_samples=run.requested_samples,
         status=run.status,
         progress_completed=run.progress_completed,
@@ -406,6 +408,11 @@ async def start_run(
     # the row at creation rather than read at call time, so a mid-run change
     # to the global setting cannot silently redefine what was measured.
     effort = payload.candidate_reasoning_effort or settings.reasoning_effort
+    history_mode = payload.history_mode or str(
+        HistoryMode.COLD_START_COMPACTION
+        if settings.cold_start_compaction_enabled
+        else HistoryMode.FULL
+    )
 
     run = ComparisonRun(
         user_id=user_id,
@@ -417,6 +424,7 @@ async def start_run(
         candidate_provider=payload.candidate_provider,
         candidate_model=payload.candidate_model,
         candidate_reasoning_effort=effort,
+        history_mode=history_mode,
         requested_samples=payload.sample_count,
         status=str(RunStatus.PENDING),
     )

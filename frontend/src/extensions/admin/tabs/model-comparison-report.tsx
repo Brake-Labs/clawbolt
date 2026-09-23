@@ -644,8 +644,11 @@ export default function ModelComparisonReportPage({ runId }: { runId: string }) 
               run.candidate_model,
               run.candidate_reasoning_effort,
             )}{' '}
-            against this user's recorded turns on {run.incumbent_model || 'an unrecorded model'},
-            started {formatRelative(run.created_at)}
+            against this user's recorded turns on {run.incumbent_model || 'an unrecorded model'}
+            {run.history_mode === 'cold_start_compaction'
+              ? ' with cold-start compaction'
+              : ' with full history'}
+            , started {formatRelative(run.created_at)}
           </p>
           {/* Offered only once the run has settled. While it is in flight the
               button beside the progress bar is Cancel, which is the step the

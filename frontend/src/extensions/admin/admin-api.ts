@@ -1345,6 +1345,8 @@ export async function startComparisonRun(
     /** '' means "whatever the deployment runs at", resolved server-side. */
     candidateReasoningEffort?: string;
     sampleCount: number;
+    /** '' means "whatever the live loop does today", resolved server-side. */
+    historyMode?: '' | 'full' | 'cold_start_compaction';
   },
 ): Promise<ComparisonRun> {
   const { data, error } = await client.POST(
@@ -1356,6 +1358,7 @@ export async function startComparisonRun(
         candidate_model: body.candidateModel,
         candidate_reasoning_effort: body.candidateReasoningEffort ?? '',
         sample_count: body.sampleCount,
+        history_mode: body.historyMode ?? '',
       },
     } as never,
   );

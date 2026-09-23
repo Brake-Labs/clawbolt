@@ -22,6 +22,7 @@ import backend.app.database as _db_module
 from backend.app.agent.approval import reset_approval_gate
 from backend.app.agent.dto import SessionState, StoredMessage
 from backend.app.agent.memory_db import reset_memory_stores
+from backend.app.agent.prompt_epoch import reset_workspace_snapshots
 from backend.app.agent.session_db import reset_session_stores
 from backend.app.agent.stores import reset_stores
 from backend.app.auth.dependencies import get_current_user
@@ -236,6 +237,7 @@ def _isolate_stores(_pg_async_engine_session: AsyncEngine, tmp_path: Path) -> Ge
         reset_session_stores()
         reset_memory_stores()
         reset_approval_gate()
+        reset_workspace_snapshots()
         yield
 
     async def _truncate() -> None:

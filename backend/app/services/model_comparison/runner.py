@@ -49,6 +49,7 @@ from backend.app.services.model_comparison.sampling import (
 from backend.app.services.model_comparison.types import (
     PRODUCTION_CHECKED,
     Finding,
+    HistoryMode,
     Issue,
     ModelCallResult,
     RecordedToolResult,
@@ -251,9 +252,10 @@ async def _replay_turn(
     *,
     target: LLMTarget,
     reasoning_effort: str,
+    history_mode: HistoryMode = HistoryMode.FULL,
 ) -> TurnReport:
     """Replay one turn through the candidate and describe what came back."""
-    assembled = await assemble_for_sample(fixture, sample)
+    assembled = await assemble_for_sample(fixture, sample, history_mode)
 
     # The candidate may continue through lookups the live turn also made, fed
     # the recorded results; nothing is executed. See ``call_model``.
@@ -314,6 +316,25 @@ async def _production_window(user_id: str, samples: Sequence[ReplaySample]) -> P
         return ProductionUsage()
 
 
+# Read beside the counts of a run replayed with the cold-start rebuild.
+COLD_START_COMPACTION_NOTE = (
+    "History was replayed with cold-start compaction: turns after an idle gap"
+    " saw older tool results as stubs. Production ran with the full history,"
+    " so a write it made from an elided result can read as FABRICATED_ID on"
+    " the production side; that count is how often the rebuild hid something"
+    " a decision used."
+)
+
+
+def _history_mode(raw: str) -> HistoryMode:
+    """The run's history mode, treating an unknown value as ``FULL``."""
+    try:
+        return HistoryMode(raw)
+    except ValueError:
+        logger.warning("Unknown history mode %r on a comparison run; replaying in full", raw)
+        return HistoryMode.FULL
+
+
 async def execute_run(run_id: int, *, concurrency: int) -> None:
     """Replay the configured turns and write the run's summary."""
     run = await _load_run(run_id)
@@ -360,6 +381,7 @@ async def execute_run(run_id: int, *, concurrency: int) -> None:
         api_base=settings.llm_api_base,
     )
 
+    history_mode = _history_mode(run.history_mode)
     cancellation = _CancellationWatcher(run_id)
     semaphore = asyncio.Semaphore(max(1, concurrency))
     turns: list[TurnReport] = []
@@ -384,6 +406,7 @@ async def execute_run(run_id: int, *, concurrency: int) -> None:
                     sample,
                     target=target,
                     reasoning_effort=run.candidate_reasoning_effort,
+                    history_mode=history_mode,
                 )
             except Exception as exc:
                 logger.exception("Replay of seq=%d failed in run %d", sample.seq, run_id)
@@ -463,6 +486,8 @@ async def execute_run(run_id: int, *, concurrency: int) -> None:
         endpoint=run.candidate_endpoint,
         production=await _production_window(run.user_id, samples),
     )
+    if history_mode == HistoryMode.COLD_START_COMPACTION:
+        summary.notes.append(COLD_START_COMPACTION_NOTE)
     if breaker_error:
         # The evidence gathered before the provider went down is kept and
         # still readable. It is a fraction of what was asked for, which the

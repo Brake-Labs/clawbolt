@@ -92,6 +92,7 @@ export function run(overrides: Partial<ComparisonRun> = {}): ComparisonRun {
     candidate_provider: 'anthropic',
     candidate_model: 'candidate',
     candidate_reasoning_effort: 'high',
+    history_mode: 'full',
     requested_samples: 40,
     status: 'completed',
     progress_completed: 40,

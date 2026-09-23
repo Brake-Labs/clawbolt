@@ -329,7 +329,7 @@ def _no_longer_than(ttl: CacheTTL, ceiling: CacheTTL) -> CacheTTL:
     return "5m" if "5m" in (ttl, ceiling) else "1h"
 
 
-def _breakpoint_ttls() -> BreakpointTTLs:
+def breakpoint_ttls() -> BreakpointTTLs:
     """Resolve the configured lifetimes, keeping longer ones first.
 
     Anthropic requires a longer-lived breakpoint to come before a shorter
@@ -359,7 +359,7 @@ def prepare_system_with_caching(system: str, target: LLMTarget) -> str | list[di
     """
     if not target.honors_cache_control:
         return system
-    control = _cache_control(_breakpoint_ttls().prefix)
+    control = _cache_control(breakpoint_ttls().prefix)
     return [{"type": "text", "text": system, "cache_control": control}]
 
 
@@ -406,7 +406,7 @@ def apply_history_cache_breakpoint(
 
     anchor = messages[current_turn_idx - 1]
     content = anchor.get("content")
-    control = _cache_control(_breakpoint_ttls().history)
+    control = _cache_control(breakpoint_ttls().history)
     if isinstance(content, str):
         blocks: list[dict[str, Any]] = [{"type": "text", "text": content, "cache_control": control}]
     elif isinstance(content, list) and content:
@@ -468,7 +468,7 @@ def apply_in_turn_cache_breakpoint(
     ):
         return messages
     blocks = [dict(block) for block in content]
-    blocks[-1] = {**blocks[-1], "cache_control": _cache_control(_breakpoint_ttls().in_turn)}
+    blocks[-1] = {**blocks[-1], "cache_control": _cache_control(breakpoint_ttls().in_turn)}
     messages[-1] = {**last, "content": blocks}
     return messages
 
@@ -484,7 +484,7 @@ def apply_tool_caching(tools: list[dict[str, Any]], target: LLMTarget) -> list[d
         return tools
     if not tools:
         return tools
-    tools[-1] = {**tools[-1], "cache_control": _cache_control(_breakpoint_ttls().prefix)}
+    tools[-1] = {**tools[-1], "cache_control": _cache_control(breakpoint_ttls().prefix)}
     return tools
 
 

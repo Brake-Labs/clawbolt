@@ -15,7 +15,9 @@ today, and every date-relative instruction in it would resolve to the wrong
 day. See ``assemble_for_sample``.
 
 The history for a turn is the window of rows immediately preceding it,
-bounded by ``conversation_history_limit`` and then trimmed by the same
+bounded by ``conversation_history_limit``, rendered by the live loop's
+``prompt_epoch.build_history_view`` (with the cold-start rebuild on or off,
+per the run's ``HistoryMode``), and then trimmed by the same
 ``trim_messages`` governor the live loop uses. The session's current
 ``last_trim_seq`` watermark is deliberately *not* applied: it describes
 what is visible today, and applying it would erase the history that older
@@ -31,11 +33,11 @@ from datetime import UTC, datetime, timedelta
 from backend.app.agent.approval import get_approval_store
 from backend.app.agent.context import (
     _parse_tool_interactions,
-    _stored_messages_to_agent_messages,
 )
 from backend.app.agent.core import AssembledPrompt, ClawboltAgent
 from backend.app.agent.dto import StoredMessage
 from backend.app.agent.messages import AgentMessage
+from backend.app.agent.prompt_epoch import build_history_view
 from backend.app.agent.router import init_storage
 from backend.app.agent.session_db import get_session_store
 from backend.app.agent.stores import ToolConfigStore
@@ -50,7 +52,11 @@ from backend.app.bus import OutboundMessage
 from backend.app.config import settings
 from backend.app.enums import MessageDirection
 from backend.app.models import User
-from backend.app.services.model_comparison.types import RecordedToolResult, ReplaySample
+from backend.app.services.model_comparison.types import (
+    HistoryMode,
+    RecordedToolResult,
+    ReplaySample,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -399,11 +405,32 @@ def select_samples(fixture: ReplayFixture, limit: int) -> list[ReplaySample]:
     return samples[-limit:] if limit > 0 else samples
 
 
-def _history_for(fixture: ReplayFixture, sample: ReplaySample) -> list[AgentMessage]:
-    """Rebuild the conversation history as it stood just before *sample*."""
+def _history_for(
+    fixture: ReplayFixture,
+    sample: ReplaySample,
+    history_mode: HistoryMode = HistoryMode.FULL,
+) -> list[AgentMessage]:
+    """Rebuild the conversation history as it stood just before *sample*.
+
+    Rendered by the function the live loop's history renderer calls, so the
+    cold-start rebuild reads the same row timestamps and makes the same cut.
+    The one thing a replay cannot do is advance the trim watermark: rows a
+    live cold start would have dropped and compacted are dropped here too,
+    but their facts are not in today's memory unless production compacted
+    them itself.
+    """
     preceding = [r for r in fixture.rows if r.seq < sample.seq]
-    window = preceding[-settings.conversation_history_limit :]
-    return _stored_messages_to_agent_messages(window, tz_name=fixture.tz_name)
+    window_start = max(len(preceding) - settings.conversation_history_limit, 0)
+    current = next((r for r in fixture.rows if r.seq == sample.seq), None)
+    return build_history_view(
+        preceding[window_start:],
+        current,
+        fixture.tz_name,
+        compact=history_mode == HistoryMode.COLD_START_COMPACTION,
+        # The rows above the window seed the first row's time marker, as
+        # ``load_conversation_history`` does for the live turn.
+        preceding=preceding[:window_start],
+    ).messages
 
 
 def sample_clock(sample: ReplaySample) -> datetime | None:
@@ -420,7 +447,11 @@ def sample_clock(sample: ReplaySample) -> datetime | None:
     return parsed
 
 
-async def assemble_for_sample(fixture: ReplayFixture, sample: ReplaySample) -> AssembledPrompt:
+async def assemble_for_sample(
+    fixture: ReplayFixture,
+    sample: ReplaySample,
+    history_mode: HistoryMode = HistoryMode.FULL,
+) -> AssembledPrompt:
     """Build the exact prompt the live agent would send for this turn.
 
     A fresh ``ClawboltAgent`` per sample keeps turns independent: the agent
@@ -435,6 +466,10 @@ async def assemble_for_sample(fixture: ReplayFixture, sample: ReplaySample) -> A
     so a replay run days later hands the model a conversation that ends last
     week under a header saying today, and "book it for this past Thursday"
     lands on the wrong Thursday for both models.
+
+    No cache epoch is passed, so the system block carries today's workspace
+    documents whole, which is what a live turn shows whenever nothing changed
+    mid-epoch. A replay must not read or write the live snapshot store.
     """
     agent = ClawboltAgent(user=fixture.user)
     agent.register_tools(fixture.tools)
@@ -443,7 +478,7 @@ async def assemble_for_sample(fixture: ReplayFixture, sample: ReplaySample) -> A
     # prompt on a worker that recently served this user.
     return await agent.assemble_prompt(
         sample.message_context,
-        _history_for(fixture, sample),
+        _history_for(fixture, sample, history_mode),
         deterministic_trim=True,
         now=sample_clock(sample),
     )

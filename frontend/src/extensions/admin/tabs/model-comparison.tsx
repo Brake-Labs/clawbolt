@@ -128,6 +128,9 @@ export default function ModelComparisonTab() {
   // freezes onto the run. Only the candidate has one: nothing is sent to the
   // incumbent, so there is no second effort to set.
   const [candidateEffort, setCandidateEffort] = useState('');
+  // How each replayed turn's history is rendered. Empty follows the live
+  // loop's setting; the other two replay the same turns both ways.
+  const [historyMode, setHistoryMode] = useState<'' | 'full' | 'cold_start_compaction'>('');
   const [sampleCount, setSampleCount] = useState(SAMPLE_DEFAULT);
   const [sampleMax, setSampleMax] = useState(SAMPLE_MAX_FALLBACK);
   // The API's own ceiling on ``limit``. Growing past it 422s, and because the
@@ -239,6 +242,7 @@ export default function ModelComparisonTab() {
         candidateModel: model,
         candidateReasoningEffort: candidateEffort,
         sampleCount,
+        historyMode,
       });
       setRuns(prev => [run, ...prev]);
       navigate(`${adminPath('model-comparison')}/${run.id}`);
@@ -388,6 +392,19 @@ export default function ModelComparisonTab() {
               onChange={setCandidateEffort}
               inheritLabel="Deployment default"
             />
+          </label>
+
+          <label className="block">
+            <span className="mb-1 block text-sm text-muted-foreground">History</span>
+            <select
+              value={historyMode}
+              onChange={e => setHistoryMode(e.target.value as typeof historyMode)}
+              className="w-full rounded-[--radius-md] border border-border bg-card px-3 py-2 text-sm text-foreground"
+            >
+              <option value="">As the live loop renders it</option>
+              <option value="full">Full history</option>
+              <option value="cold_start_compaction">Cold-start compaction</option>
+            </select>
           </label>
         </div>
 

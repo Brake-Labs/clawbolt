@@ -8,14 +8,17 @@ risks.  Both the main agent loop and the heartbeat engine use this builder.
 from __future__ import annotations
 
 import datetime
+import difflib
 import logging
 import zoneinfo
+from dataclasses import dataclass
 
 from backend.app.agent.compaction_note import build_pending_compaction_note
 from backend.app.agent.markdown_registry import truncate_for_injection
 from backend.app.agent.memory_db import build_memory_context
 from backend.app.agent.prompts import load_prompt
 from backend.app.agent.tools.base import Tool
+from backend.app.config import settings
 from backend.app.models import User
 
 logger = logging.getLogger(__name__)
@@ -233,6 +236,71 @@ async def build_memory_section(
     return truncate_for_injection("MEMORY.md", ctx)
 
 
+@dataclass(frozen=True)
+class WorkspaceSnapshot:
+    """The workspace documents as the system prompt renders them."""
+
+    soul: str
+    user: str
+    memory: str
+
+
+async def capture_workspace(user: User) -> WorkspaceSnapshot:
+    """Render SOUL.md, USER.md and MEMORY.md as they stand now."""
+    return WorkspaceSnapshot(
+        soul=build_identity_section(user),
+        user=build_user_section(user),
+        memory=await build_memory_section(user.id),
+    )
+
+
+_DELTA_CONTEXT_LINES = 2
+
+
+def _describe_change(heading: str, filename: str, old: str, new: str) -> str:
+    """Tell the model how *filename* differs from its copy under *heading*.
+
+    A unified diff with the unchanged lines around each change, or the whole
+    current file when that is shorter. The context is what places an edit:
+    a bare "- paid: no" then "+ paid: yes" cannot say which customer it was.
+    """
+    lines = list(
+        difflib.unified_diff(
+            old.splitlines(), new.splitlines(), n=_DELTA_CONTEXT_LINES, lineterm=""
+        )
+    )
+    # Drop the ---/+++ file header (always the first two lines); the sentence
+    # below names the file. Filtering by prefix would also drop a removed
+    # Markdown rule ("---" becomes "----").
+    body = "\n".join(lines[2:])
+    delta = (
+        f'{filename} changed after "{heading}" above was captured. Apply this'
+        ' diff to it ("-" removed, "+" added, " " unchanged context):\n' + body
+    )
+    if len(delta) < len(new):
+        return delta
+    return f'{filename} changed after "{heading}" above was captured. It now reads:\n{new}'
+
+
+def render_workspace_updates(snapshot: WorkspaceSnapshot, live: WorkspaceSnapshot) -> str:
+    """What changed in the workspace documents since *snapshot*, or "".
+
+    The system block carries the snapshot for the whole cache epoch; this
+    rides the current turn so an edit reaches the model on the next turn
+    without rewriting the cached prefix.
+    """
+    changes = [
+        _describe_change(heading, filename, old, new)
+        for heading, filename, old, new in (
+            ("About You", "SOUL.md", snapshot.soul, live.soul),
+            ("About Your User", "USER.md", snapshot.user, live.user),
+            ("Your Memory", "MEMORY.md", snapshot.memory, live.memory),
+        )
+        if old != new
+    ]
+    return "\n\n".join(changes)
+
+
 def build_instructions_section() -> str:
     """Build the behavioral instructions section content.
 
@@ -327,36 +395,48 @@ async def _build_agent_prompt_builder(
     user: User,
     tools: list[Tool],
     message_context: str,
+    *,
+    live: WorkspaceSnapshot | None = None,
+    snapshot: WorkspaceSnapshot | None = None,
 ) -> SystemPromptBuilder:
     """Assemble the composable builder for the main agent loop.
 
     Shared by :func:`build_agent_system_prompt` (full string, used by the
     preview endpoint) and :func:`build_agent_system_prompt_parts` (stable
     and dynamic halves, used by the agent loop).
+
+    *live* is the workspace as it stands now; it is read here when not
+    given. With ``prompt_stable_prefix_enabled`` the stable half carries
+    *snapshot* (the copy taken when the cache epoch opened, see
+    ``prompt_epoch``) or *live* when there is none, and the dynamic half
+    carries whatever changed since. With the setting off, memory and tool
+    guidelines ride the dynamic half as before.
     """
+    stable_prefix = settings.prompt_stable_prefix_enabled
+    live = live or await capture_workspace(user)
+    shown = snapshot if (stable_prefix and snapshot is not None) else live
+
     builder = SystemPromptBuilder()
     builder.set_preamble("You are an AI assistant for solo tradespeople.")
 
-    builder.add_section(
-        "About You",
-        build_identity_section(user),
-    )
+    builder.add_section("About You", shown.soul)
 
-    builder.add_section("About Your User", build_user_section(user))
+    builder.add_section("About Your User", shown.user)
 
     builder.add_section("Instructions", build_instructions_section())
 
     builder.add_section("Proactive Messaging", build_proactive_section())
 
-    # Dynamic sections: content changes between turns, placed after the
-    # stable prefix so prompt caching can reuse the stable portion. Tool
-    # guidelines are dynamic because the tool list tracks integration
-    # state: an OAuth connect or dashboard toggle between turns changes
-    # which usage hints render. Keeping them out of Instructions prevents
-    # that change from busting the stable system-prompt cache.
+    # Tool guidelines come from the same tool list as the tool schemas, which
+    # precede the system block in the cache hierarchy: a tool change already
+    # rewrites everything after the tools. Stable under the stable-prefix
+    # setting for that reason. Without it they stay dynamic, as before.
     tool_guidelines = build_tool_guidelines_section(tools)
     if tool_guidelines:
-        builder.add_section("Tool Guidelines", tool_guidelines, dynamic=True)
+        builder.add_section("Tool Guidelines", tool_guidelines, dynamic=not stable_prefix)
+
+    if stable_prefix:
+        builder.add_section("Your Memory", shown.memory)
 
     # Live integration state is dynamic: a user can complete an OAuth
     # handshake mid-conversation and we want the next turn to reflect it
@@ -365,8 +445,12 @@ async def _build_agent_prompt_builder(
     if integration_status:
         builder.add_section("Connected Integrations", integration_status, dynamic=True)
 
-    memory = await build_memory_section(user.id, query=message_context)
-    builder.add_section("Your Memory", memory, dynamic=True)
+    if stable_prefix:
+        updates = render_workspace_updates(shown, live)
+        if updates:
+            builder.add_section("Workspace Updates", updates, dynamic=True)
+    else:
+        builder.add_section("Your Memory", live.memory, dynamic=True)
 
     # Continuity cover for the trim-to-compaction window (issue #1432):
     # rows dropped by trim vanish from history on the very next message
@@ -407,15 +491,21 @@ async def build_agent_system_prompt_parts(
     user: User,
     tools: list[Tool],
     message_context: str,
+    *,
+    live: WorkspaceSnapshot | None = None,
+    snapshot: WorkspaceSnapshot | None = None,
 ) -> tuple[str, str]:
     """Assemble the agent system prompt as ``(stable, dynamic)`` halves.
 
     The agent loop sends *stable* in the cacheable ``system`` param and
-    appends *dynamic* (memory, integration status) to the current user
-    turn, so a memory write does not invalidate the message-history
-    prompt cache (#1420).
+    appends *dynamic* (integration status, workspace updates) to the current
+    user turn, so nothing that changes mid-epoch invalidates the cached
+    prefix. See :func:`_build_agent_prompt_builder` for *live* and
+    *snapshot*.
     """
-    builder = await _build_agent_prompt_builder(user, tools, message_context)
+    builder = await _build_agent_prompt_builder(
+        user, tools, message_context, live=live, snapshot=snapshot
+    )
     return builder.build_parts()
 
 
