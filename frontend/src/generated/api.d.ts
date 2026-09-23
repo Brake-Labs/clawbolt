@@ -4499,6 +4499,10 @@ export interface components {
             cache_creation_input_tokens: number | null;
             /** Cache Read Input Tokens */
             cache_read_input_tokens: number | null;
+            /** Cache Creation 5M Input Tokens */
+            cache_creation_5m_input_tokens?: number | null;
+            /** Cache Creation 1H Input Tokens */
+            cache_creation_1h_input_tokens?: number | null;
         };
         /** LLMUsageLogListResponse */
         LLMUsageLogListResponse: {

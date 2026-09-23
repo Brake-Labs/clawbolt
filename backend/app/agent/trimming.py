@@ -6,7 +6,7 @@ trimming that preserves tool-call / tool-result pairing.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from backend.app.agent.messages import (
     AgentMessage,
@@ -153,8 +153,9 @@ def trim_messages(
     removing the ``ToolResultMessage`` entries that follow it (and
     vice-versa).
 
-    Dropped messages are summarized and injected as a context note so
-    the LLM retains awareness of what was discussed.
+    Dropped messages are summarized and the note is prepended to the
+    newest user turn (see :func:`_attach_summary`), so the LLM retains
+    awareness of what was discussed without changing the kept history.
 
     Returns a ``TrimResult`` containing the (possibly trimmed) message
     list and the list of dropped messages.
@@ -256,9 +257,32 @@ def trim_messages(
         dropped.extend(removed_block)
 
     result: list[AgentMessage] = [system]
-    if dropped:
-        summary = summarize_dropped_messages(dropped)
-        result.append(UserMessage(content=f"[Summary of earlier conversation: {summary}]"))
     for blk in blocks:
         result.extend(blk)
+    if dropped:
+        _attach_summary(result, summarize_dropped_messages(dropped))
     return TrimResult(messages=result, dropped=dropped)
+
+
+def _attach_summary(messages: list[AgentMessage], summary: str) -> None:
+    """Put the dropped-history *summary* on the newest user turn, in place.
+
+    The kept history must match, byte for byte, what the next turn reloads
+    from above the advanced trim watermark, or the history cache this turn
+    writes is never read and the next turn rewrites the whole history
+    again. The reload has no summary message, so the summary rides the
+    newest user turn instead: that turn is past the history breakpoint and
+    uncached anyway. From the next turn on, the pending-compaction note
+    (``compaction_note``) covers the same rows until compaction lands.
+
+    The newest ``UserMessage`` is the current turn (or a message folded in
+    mid-turn). Only when trimming dropped every user turn does the summary
+    fall back to its own message after the system prompt.
+    """
+    note = f"[Summary of earlier conversation: {summary}]"
+    for idx in range(len(messages) - 1, 0, -1):
+        msg = messages[idx]
+        if isinstance(msg, UserMessage):
+            messages[idx] = replace(msg, content=f"{note}\n\n{msg.content}")
+            return
+    messages.insert(1, UserMessage(content=note))

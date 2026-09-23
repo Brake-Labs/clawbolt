@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+from anthropic.types import CacheCreation
 from any_llm.types.messages import MessageResponse, MessageUsage
 from sqlalchemy import select
 
@@ -51,6 +52,8 @@ async def _read_usage_entries(user_id: str) -> list[dict[str, object]]:
                 "purpose": log.purpose,
                 "cache_creation_input_tokens": log.cache_creation_input_tokens,
                 "cache_read_input_tokens": log.cache_read_input_tokens,
+                "cache_creation_5m_input_tokens": log.cache_creation_5m_input_tokens,
+                "cache_creation_1h_input_tokens": log.cache_creation_1h_input_tokens,
             }
             for log in logs
         ]
@@ -176,3 +179,47 @@ async def test_log_llm_usage_cache_tokens_null_when_absent(test_user: User) -> N
     assert len(entries) == 1
     assert entries[0]["cache_creation_input_tokens"] is None
     assert entries[0]["cache_read_input_tokens"] is None
+    assert entries[0]["cache_creation_5m_input_tokens"] is None
+    assert entries[0]["cache_creation_1h_input_tokens"] is None
+
+
+async def test_log_llm_usage_stores_cache_writes_per_lifetime(test_user: User) -> None:
+    """Anthropic's 5m/1h split is persisted as reported, zeros included."""
+    response = _make_response_with_usage(prompt_tokens=500, completion_tokens=100)
+    response.usage.cache_creation_input_tokens = 300
+    response.usage.cache_creation = CacheCreation(
+        ephemeral_5m_input_tokens=0, ephemeral_1h_input_tokens=300
+    )
+
+    await log_llm_usage(test_user.id, "test-model", response, "agent_main")
+
+    entries = await _read_usage_entries(test_user.id)
+    assert entries[0]["cache_creation_5m_input_tokens"] == 0
+    assert entries[0]["cache_creation_1h_input_tokens"] == 300
+
+
+async def test_log_llm_usage_prices_one_hour_writes_at_the_premium(test_user: User) -> None:
+    """The cost column charges a 1h write more than the same tokens at 5m."""
+    for split in (
+        CacheCreation(ephemeral_5m_input_tokens=10_000, ephemeral_1h_input_tokens=0),
+        CacheCreation(ephemeral_5m_input_tokens=0, ephemeral_1h_input_tokens=10_000),
+    ):
+        response = _make_response_with_usage(prompt_tokens=100, completion_tokens=10)
+        response.usage.cache_creation_input_tokens = 10_000
+        response.usage.cache_creation = split
+        await log_llm_usage(
+            test_user.id, "claude-opus-4-5", response, "agent_main", provider="anthropic"
+        )
+    async with _db_module.db_session_async() as db:
+        costs = list(
+            (
+                await db.execute(
+                    select(LLMUsageLog.cost)
+                    .filter_by(user_id=test_user.id)
+                    .order_by(LLMUsageLog.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert costs[1] > costs[0] > 0

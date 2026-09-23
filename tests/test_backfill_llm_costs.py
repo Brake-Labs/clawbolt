@@ -16,6 +16,7 @@ from sqlalchemy import select
 from backend.app.config import settings
 from backend.app.database import db_session_async
 from backend.app.models import LLMEndpoint, LLMUsageLog, User
+from backend.app.services.llm_pricing import compute_cost
 from scripts.backfill_llm_costs import backfill_costs
 
 
@@ -267,3 +268,41 @@ async def test_a_row_whose_model_is_still_unknown_keeps_its_flag(test_user: User
         False,
         "clawbolt-anthropic:not-a-real-model-99",
     )
+
+
+async def test_backfill_charges_the_one_hour_write_premium(test_user: User) -> None:
+    """A repaired row prices its 1h cache writes the way the live logger does."""
+    async with db_session_async() as db:
+        row = LLMUsageLog(
+            user_id=test_user.id,
+            provider="anthropic",
+            model="claude-opus-4-5",
+            input_tokens=100,
+            output_tokens=10,
+            total_tokens=110,
+            cost=Decimal("0.000000"),
+            purpose="agent_main",
+            cache_creation_input_tokens=10_000,
+            cache_creation_5m_input_tokens=0,
+            cache_creation_1h_input_tokens=10_000,
+        )
+        db.add(row)
+        await db.commit()
+        await db.refresh(row)
+        row_id = row.id
+
+    await backfill_costs(model="claude-opus-4-5", provider="anthropic", apply=True)
+
+    one_hour = compute_cost(
+        "claude-opus-4-5",
+        100,
+        10,
+        provider="anthropic",
+        cache_creation_input_tokens=10_000,
+        cache_creation_1h_input_tokens=10_000,
+    )
+    five_min = compute_cost(
+        "claude-opus-4-5", 100, 10, provider="anthropic", cache_creation_input_tokens=10_000
+    )
+    assert await _cost_of(row_id) == one_hour
+    assert one_hour > five_min

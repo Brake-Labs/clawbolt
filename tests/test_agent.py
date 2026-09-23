@@ -1082,7 +1082,7 @@ async def test_agent_token_trim_fires_on_cached_heavy_context(
         first_sent = mock_amessages.call_args.kwargs["messages"]
         # First turn has no recorded count; the chars/4 heuristic keeps
         # this small history untrimmed.
-        assert "[Summary of earlier conversation:" not in first_sent[0]["content"]
+        assert "[Summary of earlier conversation:" not in first_sent[-1]["content"]
 
         await agent.process_message(
             "Second message",
@@ -1091,7 +1091,9 @@ async def test_agent_token_trim_fires_on_cached_heavy_context(
         )
 
     second_sent = mock_amessages.call_args.kwargs["messages"]
-    assert "[Summary of earlier conversation:" in second_sent[0]["content"]
+    # The summary rides the current turn, so the kept history stays
+    # identical to what the next turn reloads.
+    assert "[Summary of earlier conversation:" in second_sent[-1]["content"]
     assert len(second_sent) < len(first_sent)
     reset_last_input_tokens()
 
@@ -1414,10 +1416,18 @@ def test_trim_messages_injects_summary_when_trimming() -> None:
     ]
     result = trim_messages(messages, target_tokens=5000, input_tokens=20_000)
     assert isinstance(result.messages[0], SystemMessage)
-    # Second message should be the summary
-    assert isinstance(result.messages[1], UserMessage)
-    assert "[Summary of earlier conversation:" in result.messages[1].content
-    assert "earlier message(s)" in result.messages[1].content
+    # The summary is prepended to the newest user turn, not inserted as
+    # its own message at the head of history.
+    newest_user = [m for m in result.messages if isinstance(m, UserMessage)][-1]
+    assert newest_user.content.startswith("[Summary of earlier conversation:")
+    assert "earlier message(s)" in newest_user.content
+    assert newest_user.content.endswith("Topic 18: " + big_content)
+    summaries = [
+        m
+        for m in result.messages
+        if isinstance(m, UserMessage) and "[Summary of earlier conversation:" in m.content
+    ]
+    assert summaries == [newest_user]
     # Dropped list should match
     assert len(result.dropped) > 0
 
@@ -1470,10 +1480,12 @@ def test_trim_messages_caps_turn_count() -> None:
     assert len(result.dropped) > 0
     # Remaining user-turn count (history + current) is at or below the cap.
     user_turns_remaining = sum(1 for m in result.messages if isinstance(m, UserMessage))
-    # At most target_turns + 1 (the injected summary placeholder).
-    assert user_turns_remaining <= 20 + 1
-    # Most recent turn survives.
-    assert result.messages[-1].content == "Current message"
+    assert user_turns_remaining <= 20
+    # Most recent turn survives, carrying the summary of what was dropped.
+    last = result.messages[-1]
+    assert isinstance(last, UserMessage)
+    assert last.content.startswith("[Summary of earlier conversation:")
+    assert last.content.endswith("\n\nCurrent message")
     # System prompt survives.
     assert isinstance(result.messages[0], SystemMessage)
 
@@ -1743,8 +1755,8 @@ async def test_agent_trims_chatty_conversation_below_token_limit(
 
     call_args = mock_amessages.call_args
     sent_messages = call_args.kwargs["messages"]
-    # First non-system message should be the trim summary.
-    assert "[Summary of earlier conversation:" in sent_messages[0]["content"]
+    # The trim summary rides the current turn.
+    assert "[Summary of earlier conversation:" in sent_messages[-1]["content"]
     # Far fewer than the original 400 messages should reach the LLM.
     assert len(sent_messages) < 400
 
@@ -1778,8 +1790,8 @@ async def test_process_message_injects_summary_when_trimming(
     # Check the messages sent to the LLM include a summary
     call_args = mock_amessages.call_args
     sent_messages = call_args.kwargs.get("messages", call_args.args[0] if call_args.args else [])
-    # First message should be the summary (system is extracted to kwarg)
-    assert "[Summary of earlier conversation:" in sent_messages[0]["content"]
+    # The summary rides the current turn, which is the last message.
+    assert "[Summary of earlier conversation:" in sent_messages[-1]["content"]
 
 
 # ---------------------------------------------------------------------------

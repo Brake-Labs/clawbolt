@@ -226,7 +226,9 @@ Photos and files the user sends over a messaging channel are cached on disk whil
 | `CONTEXT_TRIM_TRIGGER_TURNS` | unset (target + 16) | Turn threshold that triggers trimming to `CONTEXT_TRIM_TARGET_TURNS` |
 | `COMPACTION_EVENT_SNAPSHOT_MAX_BYTES_PER_FILE` | `100000` | Per-file cap for compaction snapshots. Oversize content is represented by its head, tail, size, and hash |
 | `LLM_MAX_RETRIES` | `3` | Maximum number of retry attempts on rate limit errors |
-| `LLM_CACHE_EXTENDED_TTL` | `true` | Use Anthropic's 1-hour extended cache TTL instead of the default 5 minutes. Reduces cold-start cache misses for users with multi-hour gaps between messages. Set to `false` on non-Anthropic providers that reject the `ttl` field |
+| `LLM_CACHE_EXTENDED_TTL` | `true` | Use Anthropic's 1-hour cache TTL instead of the default 5 minutes on the tools and system breakpoints. A 1-hour write costs 2x base input, a 5-minute write 1.25x. Set to `false` on non-Anthropic providers that reject the `ttl` field |
+| `LLM_CACHE_HISTORY_TTL` | `1h` | Cache lifetime (`5m` or `1h`) of the breakpoint on the prior conversation history. Capped at the tools and system lifetime, because Anthropic requires longer lifetimes to come first |
+| `LLM_CACHE_IN_TURN_TTL` | `5m` | Cache lifetime (`5m` or `1h`) of the breakpoint on the latest tool result inside a turn. Rounds are seconds apart, so 1h only adds cost. Capped at `LLM_CACHE_HISTORY_TTL` |
 | `LLM_PROMPT_CACHE` | `auto` | `auto` adds cache breakpoints for supported Anthropic Messages providers; `never` disables them. Use `never` with gateways running any-llm older than 1.24 |
 | `MODEL_COMPARISON_CONCURRENCY` | `4` | Turns replayed in parallel by an admin model comparison run (`AUTH_MODE=multi_user`). Each turn issues one call to the candidate, plus one more per recorded lookup it continues through, so this competes with live traffic for the provider rate limit. The baseline is the recorded turn itself and costs nothing |
 | `MODEL_COMPARISON_MAX_SAMPLES` | `200` | Maximum turns one comparison run may replay. Bounds the cost of a mistyped value in the admin form |

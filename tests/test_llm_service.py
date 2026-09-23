@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator, Generator, Iterator
 from contextlib import contextmanager
+from itertools import pairwise
 from typing import Any, get_args
 from unittest.mock import MagicMock, patch
 
@@ -30,7 +31,7 @@ from any_llm.types.messages import (
 from pydantic import ValidationError
 
 from backend.app.agent.llm_parsing import get_response_text, parse_tool_calls
-from backend.app.config import Settings
+from backend.app.config import Settings, log_config_warnings
 from backend.app.services.llm_service import (
     LLMTarget,
     UserLLMOverride,
@@ -67,6 +68,8 @@ def _target(provider: str = "anthropic") -> LLMTarget:
 def _patched_settings(
     *,
     extended_ttl: bool = True,
+    history_ttl: str = "1h",
+    in_turn_ttl: str = "5m",
     api_base: str | None = None,
     prompt_cache: str = "auto",
 ) -> Iterator[MagicMock]:
@@ -79,6 +82,8 @@ def _patched_settings(
     """
     with patch("backend.app.services.llm_service.settings") as mock_settings:
         mock_settings.llm_cache_extended_ttl = extended_ttl
+        mock_settings.llm_cache_history_ttl = history_ttl
+        mock_settings.llm_cache_in_turn_ttl = in_turn_ttl
         mock_settings.llm_api_base = api_base
         mock_settings.llm_prompt_cache = prompt_cache
         yield mock_settings
@@ -202,11 +207,99 @@ def test_prepare_system_wraps_whole_string_in_one_cached_block() -> None:
     assert result[0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
 
 
+# ---------------------------------------------------------------------------
+# Per-breakpoint lifetimes
+# ---------------------------------------------------------------------------
+
+
+def _all_four_breakpoints() -> tuple[
+    list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]] | str
+]:
+    """Stamp every breakpoint on a round-1 request; return tools, messages, system."""
+    messages: list[dict[str, Any]] = [
+        {"role": "user", "content": "older question"},
+        {"role": "assistant", "content": [{"type": "text", "text": "older answer"}]},
+        {"role": "user", "content": "current turn"},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "a", "name": "t"}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a", "content": "x"}]},
+    ]
+    tools = apply_tool_caching([{"name": "t", "description": "", "input_schema": {}}], _target())
+    system = prepare_system_with_caching("system prompt", _target())
+    messages = apply_history_cache_breakpoint(messages, _target())
+    messages = apply_in_turn_cache_breakpoint(messages, _target())
+    return tools, messages, system
+
+
+def _ttls_in_request_order(
+    tools: list[dict[str, Any]],
+    messages: list[dict[str, Any]],
+    system: list[dict[str, Any]] | str,
+) -> list[str]:
+    """Lifetimes of every marker in Anthropic's order: tools, system, messages."""
+    assert isinstance(system, list)
+    controls = [tools[-1]["cache_control"], system[0]["cache_control"]]
+    for msg in messages:
+        content = msg["content"]
+        if isinstance(content, list):
+            controls.extend(b["cache_control"] for b in content if "cache_control" in b)
+    return [c.get("ttl", "5m") for c in controls]
+
+
+def test_default_lifetimes_put_the_in_turn_breakpoint_on_5m() -> None:
+    """Tools, system and history stay on 1h; the in-turn breakpoint is 5m.
+
+    Rounds within a turn are seconds apart, so a 1h write there pays the 2x
+    premium for nothing.
+    """
+    with _patched_settings():
+        tools, messages, system = _all_four_breakpoints()
+    assert _ttls_in_request_order(tools, messages, system) == ["1h", "1h", "1h", "5m"]
+    assert messages[-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_history_and_in_turn_lifetimes_are_configurable() -> None:
+    with _patched_settings(history_ttl="5m", in_turn_ttl="5m"):
+        tools, messages, system = _all_four_breakpoints()
+    assert _ttls_in_request_order(tools, messages, system) == ["1h", "1h", "5m", "5m"]
+
+
+@pytest.mark.parametrize(
+    ("extended", "history", "in_turn"),
+    [
+        (True, "1h", "1h"),
+        (True, "1h", "5m"),
+        (True, "5m", "1h"),
+        (True, "5m", "5m"),
+        (False, "1h", "1h"),
+        (False, "5m", "1h"),
+    ],
+)
+def test_longer_lifetime_never_follows_a_shorter_one(
+    extended: bool, history: str, in_turn: str
+) -> None:
+    """Anthropic rejects a 1h breakpoint after a 5m one, so later ones clamp down."""
+    with _patched_settings(extended_ttl=extended, history_ttl=history, in_turn_ttl=in_turn):
+        tools, messages, system = _all_four_breakpoints()
+    ttls = _ttls_in_request_order(tools, messages, system)
+    assert len(ttls) == 4
+    rank = {"1h": 1, "5m": 0}
+    assert all(rank[a] >= rank[b] for a, b in pairwise(ttls)), ttls
+
+
+def test_config_warns_when_a_lifetime_is_clamped() -> None:
+    clamped = Settings(llm_cache_extended_ttl=False, llm_cache_history_ttl="1h")
+    assert any("llm_cache_history_ttl" in w for w in log_config_warnings(clamped))
+    clamped = Settings(llm_cache_history_ttl="5m", llm_cache_in_turn_ttl="1h")
+    assert any("llm_cache_in_turn_ttl" in w for w in log_config_warnings(clamped))
+    default = Settings()
+    assert not any("llm_cache_" in w for w in log_config_warnings(default))
+
+
 class TestApplyHistoryCacheBreakpoint:
     """The history breakpoint lands on the message before the current turn."""
 
     def _control(self) -> dict[str, object]:
-        return _cache_control()
+        return _cache_control("1h")
 
     def test_marks_message_before_current_turn(self) -> None:
         messages = [
@@ -274,7 +367,7 @@ class TestApplyInTurnCacheBreakpoint:
     """The in-turn breakpoint advances with the tool loop (issue #1430)."""
 
     def _control(self) -> dict[str, object]:
-        return _cache_control()
+        return _cache_control("5m")
 
     def test_marks_trailing_tool_result_block(self) -> None:
         messages = [

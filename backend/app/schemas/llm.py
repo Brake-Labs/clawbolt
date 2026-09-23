@@ -225,6 +225,10 @@ class LLMUsageLogItem(BaseModel):
     pricing_available: bool = True
     cache_creation_input_tokens: int | None
     cache_read_input_tokens: int | None
+    cache_creation_5m_input_tokens: int | None = None
+    """Cache writes billed at the 5-minute lifetime; None when not reported."""
+    cache_creation_1h_input_tokens: int | None = None
+    """Cache writes billed at the 1-hour lifetime; None when not reported."""
 
 
 class LLMUsageLogListResponse(BaseModel):

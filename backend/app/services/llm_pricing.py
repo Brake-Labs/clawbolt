@@ -117,6 +117,7 @@ def compute_cost(
     provider: str = "",
     cache_creation_input_tokens: int | None = None,
     cache_read_input_tokens: int | None = None,
+    cache_creation_1h_input_tokens: int | None = None,
 ) -> Decimal:
     """Return the dollar cost for a single LLM call as a 6-decimal Decimal.
 
@@ -131,6 +132,12 @@ def compute_cost(
     accounting quirks (Anthropic's input bucket includes cached tokens,
     cache-write surcharges, cache-read discounts, OpenAI's prompt-cache
     discount, etc.) so the caller does not have to.
+
+    *cache_creation_1h_input_tokens* is the part of
+    *cache_creation_input_tokens* written with the 1-hour lifetime, when the
+    provider reports the split. The library prices it at the model's 1-hour
+    write rate and the rest at the 5-minute rate; ``None`` prices every
+    write at the 5-minute rate.
 
     Returns ``Decimal('0.000000')`` for (provider, model) pairs that do
     not resolve; the caller should log a warning (see ``UNPRICED_HINT``)
@@ -147,11 +154,15 @@ def compute_cost(
     # ``input_tokens`` to be the total. Per-bucket multipliers come
     # from the cache-specific fields.
     total_input = input_tokens + cache_creation + cache_read
+    # ``cache_write_1h_tokens`` is a subset of ``cache_write_tokens``; the
+    # library charges it the 1-hour rate and the remainder the 5-minute rate.
+    one_hour = min(cache_creation_1h_input_tokens or 0, cache_creation)
     try:
         result = calc_price(
             Usage(
                 input_tokens=total_input,
                 cache_write_tokens=cache_creation,
+                cache_write_1h_tokens=one_hour or None,
                 cache_read_tokens=cache_read,
                 output_tokens=output_tokens,
             ),

@@ -45,6 +45,12 @@ async def log_llm_usage(
 
     cache_creation_input_tokens = response.usage.cache_creation_input_tokens
     cache_read_input_tokens = response.usage.cache_read_input_tokens
+    # Per-lifetime split of the cache writes. Absent (None) for providers
+    # that do not report it, and stored as NULL rather than 0 so "not
+    # reported" never reads as "nothing written at that lifetime".
+    by_ttl = response.usage.cache_creation
+    cache_creation_5m = by_ttl.ephemeral_5m_input_tokens if by_ttl else None
+    cache_creation_1h = by_ttl.ephemeral_1h_input_tokens if by_ttl else None
 
     try:
         store = LLMUsageStore(user_id)
@@ -58,6 +64,8 @@ async def log_llm_usage(
             cache_read_input_tokens=cache_read_input_tokens,
             endpoint=endpoint,
             priced=priced,
+            cache_creation_5m_input_tokens=cache_creation_5m,
+            cache_creation_1h_input_tokens=cache_creation_1h,
         )
     except Exception:
         logger.exception("Failed to log LLM usage for user %s", user_id)
@@ -65,12 +73,14 @@ async def log_llm_usage(
 
     logger.info(
         "LLM usage logged: user=%s target=%s model=%s purpose=%s "
-        "tokens=%d cache_create=%s cache_read=%s",
+        "tokens=%d cache_create=%s (5m=%s 1h=%s) cache_read=%s",
         user_id,
         endpoint or provider or "?",
         model,
         purpose,
         total_tokens,
         cache_creation_input_tokens,
+        cache_creation_5m,
+        cache_creation_1h,
         cache_read_input_tokens,
     )

@@ -7,7 +7,7 @@ import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, cast, get_args
+from typing import Any, Literal, cast, get_args
 
 from anthropic.types import InputJSONDelta, SignatureDelta, TextDelta, ThinkingDelta
 from any_llm import AnyLLMError, LLMProvider, alist_models, amessages
@@ -298,18 +298,50 @@ async def resolve_user_llm_override(user_id: str) -> UserLLMOverride | None:
 # ---------------------------------------------------------------------------
 
 
-def _cache_control() -> dict[str, Any]:
-    """Build the ``cache_control`` block honoring the extended-TTL flag.
+CacheTTL = Literal["5m", "1h"]
 
-    Default Anthropic ephemeral cache TTL is 5 minutes. Users with gaps
-    greater than 5 minutes between messages always miss the cache on
-    their next turn. Setting ``ttl: "1h"`` extends to 1 hour at a 1.5x
-    cache-write premium (vs 1.25x for 5min). Reads are unchanged.
-    Providers that do not understand ``ttl`` silently ignore it.
+
+def _cache_control(ttl: CacheTTL) -> dict[str, Any]:
+    """Build one ``cache_control`` block with lifetime *ttl*.
+
+    Anthropic's default ephemeral lifetime is 5 minutes and is sent as a
+    bare ``{"type": "ephemeral"}``, which every provider accepts. ``"1h"``
+    adds ``ttl: "1h"``. Per Anthropic's prompt caching docs, a 5-minute
+    write costs 1.25x base input and a 1-hour write 2x; reads cost the
+    same for either lifetime. Providers that do not understand ``ttl``
+    silently ignore it.
     """
-    if settings.llm_cache_extended_ttl:
+    if ttl == "1h":
         return {"type": "ephemeral", "ttl": "1h"}
     return {"type": "ephemeral"}
+
+
+@dataclass(frozen=True)
+class BreakpointTTLs:
+    """Lifetime of each breakpoint group, in request order."""
+
+    prefix: CacheTTL
+    history: CacheTTL
+    in_turn: CacheTTL
+
+
+def _no_longer_than(ttl: CacheTTL, ceiling: CacheTTL) -> CacheTTL:
+    return "5m" if "5m" in (ttl, ceiling) else "1h"
+
+
+def _breakpoint_ttls() -> BreakpointTTLs:
+    """Resolve the configured lifetimes, keeping longer ones first.
+
+    Anthropic requires a longer-lived breakpoint to come before a shorter
+    one. The request order is tools and system (``prefix``, from
+    ``llm_cache_extended_ttl``), then the history tail, then the in-turn
+    breakpoint, so each later lifetime is capped at the one before it.
+    ``log_config_warnings`` reports a clamp.
+    """
+    prefix: CacheTTL = "1h" if settings.llm_cache_extended_ttl else "5m"
+    history = _no_longer_than(settings.llm_cache_history_ttl, prefix)
+    in_turn = _no_longer_than(settings.llm_cache_in_turn_ttl, history)
+    return BreakpointTTLs(prefix=prefix, history=history, in_turn=in_turn)
 
 
 def prepare_system_with_caching(system: str, target: LLMTarget) -> str | list[dict[str, Any]]:
@@ -327,7 +359,8 @@ def prepare_system_with_caching(system: str, target: LLMTarget) -> str | list[di
     """
     if not target.honors_cache_control:
         return system
-    return [{"type": "text", "text": system, "cache_control": _cache_control()}]
+    control = _cache_control(_breakpoint_ttls().prefix)
+    return [{"type": "text", "text": system, "cache_control": control}]
 
 
 def apply_history_cache_breakpoint(
@@ -373,13 +406,12 @@ def apply_history_cache_breakpoint(
 
     anchor = messages[current_turn_idx - 1]
     content = anchor.get("content")
+    control = _cache_control(_breakpoint_ttls().history)
     if isinstance(content, str):
-        blocks: list[dict[str, Any]] = [
-            {"type": "text", "text": content, "cache_control": _cache_control()}
-        ]
+        blocks: list[dict[str, Any]] = [{"type": "text", "text": content, "cache_control": control}]
     elif isinstance(content, list) and content:
         blocks = [dict(block) for block in content]
-        blocks[-1] = {**blocks[-1], "cache_control": _cache_control()}
+        blocks[-1] = {**blocks[-1], "cache_control": control}
     else:
         # Empty or unexpected content shape: nothing safe to mark.
         return messages
@@ -414,7 +446,12 @@ def apply_in_turn_cache_breakpoint(
 
     Round 0 ends in the current user turn (plain string content), not
     tool results, so this is a no-op there and the request keeps three
-    breakpoints. Returns the list unchanged when there is nothing safe
+    breakpoints.
+
+    Rounds are seconds apart, so this breakpoint defaults to the 5-minute
+    lifetime (``llm_cache_in_turn_ttl``): a 1-hour write here would pay the
+    2x premium for nothing. It is the last breakpoint, so the shorter
+    lifetime keeps Anthropic's longer-before-shorter ordering. Returns the list unchanged when there is nothing safe
     to mark, or when *target* cannot honor the marker.
     """
     if not target.honors_cache_control:
@@ -431,7 +468,7 @@ def apply_in_turn_cache_breakpoint(
     ):
         return messages
     blocks = [dict(block) for block in content]
-    blocks[-1] = {**blocks[-1], "cache_control": _cache_control()}
+    blocks[-1] = {**blocks[-1], "cache_control": _cache_control(_breakpoint_ttls().in_turn)}
     messages[-1] = {**last, "content": blocks}
     return messages
 
@@ -447,7 +484,7 @@ def apply_tool_caching(tools: list[dict[str, Any]], target: LLMTarget) -> list[d
         return tools
     if not tools:
         return tools
-    tools[-1] = {**tools[-1], "cache_control": _cache_control()}
+    tools[-1] = {**tools[-1], "cache_control": _cache_control(_breakpoint_ttls().prefix)}
     return tools
 
 

@@ -146,6 +146,8 @@ async def get_user_llm_usage_logs(
                 pricing_available=log.pricing_available,
                 cache_creation_input_tokens=log.cache_creation_input_tokens,
                 cache_read_input_tokens=log.cache_read_input_tokens,
+                cache_creation_5m_input_tokens=log.cache_creation_5m_input_tokens,
+                cache_creation_1h_input_tokens=log.cache_creation_1h_input_tokens,
             )
             for log in logs
         ],
