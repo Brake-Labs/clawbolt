@@ -39,7 +39,9 @@ from backend.app.integrations.calendar.sync import (
 from backend.app.models import CalendarConfig
 from backend.app.query_helpers import fetch_all
 from backend.app.services.oauth import (
+    ReconnectRequired,
     oauth_service,
+    reconnect_instruction,
 )
 
 if TYPE_CHECKING:
@@ -472,6 +474,17 @@ def create_calendar_tools(
         """Map of calendar id to access role the connection sees now, or None on failure."""
         try:
             live = await service.list_calendars(show_hidden=True)
+        except ReconnectRequired:
+            raise
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 401:
+                # Still refused after the refresh retry: the connection is
+                # dead, which is not a "could not check right now".
+                raise ReconnectRequired(
+                    "google_calendar", "Google Calendar rejected a refreshed token"
+                ) from exc
+            logger.warning("Could not load live calendar list: HTTP %d", exc.response.status_code)
+            return None
         except Exception as exc:
             logger.warning("Could not load live calendar list: %s", type(exc).__name__)
             return None
@@ -487,7 +500,10 @@ def create_calendar_tools(
         cal_name = _cal_name_map.get(cal_id, cal_id)
         if not event_id:
             return _calendar_not_visible_result(cal_id, cal_name, action, connected_account)
-        live = await _live_calendar_roles()
+        try:
+            live = await _live_calendar_roles()
+        except ReconnectRequired as exc:
+            return _dead_connection_result(exc)
         if live is not None and not is_calendar_visible(cal_id, set(live)):
             return _calendar_not_visible_result(cal_id, cal_name, action, connected_account)
         if live is not None:
@@ -528,7 +544,10 @@ def create_calendar_tools(
         if not _enabled:
             return ToolResult(content="No calendars enabled.")
 
-        live = await _live_calendar_roles()
+        try:
+            live = await _live_calendar_roles()
+        except ReconnectRequired as exc:
+            return _dead_connection_result(exc)
         lines = [
             f"{len(_enabled)} enabled calendar(s), from the calendar selection saved in "
             f"Settings. Connected Google account: {_account_label(connected_account)}."
@@ -623,6 +642,8 @@ def create_calendar_tools(
                 events = await service.list_events(cal_id, time_min, time_max)
                 for event in events:
                     all_events.append((cal_name, event))
+            except ReconnectRequired as exc:
+                return _dead_connection_result(exc)
             except httpx.TimeoutException:
                 return ToolResult(
                     content="Calendar service unavailable (timeout). Try again shortly.",
@@ -719,6 +740,8 @@ def create_calendar_tools(
 
         try:
             event = await service.create_event(resolved_id, create_data)
+        except ReconnectRequired as exc:
+            return _dead_connection_result(exc)
         except httpx.TimeoutException:
             return ToolResult(
                 content="Calendar service unavailable (timeout). Try again shortly.",
@@ -806,6 +829,8 @@ def create_calendar_tools(
 
         try:
             event = await service.update_event(resolved_id, event_id, updates)
+        except ReconnectRequired as exc:
+            return _dead_connection_result(exc)
         except httpx.TimeoutException:
             return ToolResult(
                 content="Calendar service unavailable (timeout). Try again shortly.",
@@ -851,6 +876,8 @@ def create_calendar_tools(
 
         try:
             await service.delete_event(resolved_id, event_id)
+        except ReconnectRequired as exc:
+            return _dead_connection_result(exc)
         except httpx.TimeoutException:
             return ToolResult(
                 content="Calendar service unavailable (timeout). Try again shortly.",
@@ -917,6 +944,8 @@ def create_calendar_tools(
                 for slot in busy_slots:
                     all_slots.append((cal_name, slot))
                 continue
+            except ReconnectRequired as exc:
+                return _dead_connection_result(exc)
             except httpx.TimeoutException:
                 return ToolResult(
                     content="Calendar service unavailable (timeout). Try again shortly.",
@@ -1094,6 +1123,30 @@ def create_calendar_tools(
 # ---------------------------------------------------------------------------
 
 
+def _reconnect_result() -> ToolResult:
+    """AUTH result for a dead Google Calendar connection.
+
+    Covers a 401 that survived the refresh retry and ``ReconnectRequired``
+    from a refresh that found the grant expired or revoked (the token is
+    already retired and the user notified by then).
+    """
+    return ToolResult(
+        content="Calendar disconnected. Please reconnect Google Calendar in Settings.",
+        is_error=True,
+        error_kind=ToolErrorKind.AUTH,
+        hint=(
+            "The connection has expired or was revoked. Do not retry. "
+            f"{reconnect_instruction('google_calendar')}"
+        ),
+    )
+
+
+def _dead_connection_result(exc: ReconnectRequired) -> ToolResult:
+    """Log a dead connection as expected (no traceback) and report it as AUTH."""
+    logger.warning("Google Calendar connection needs reconnecting: %s", exc)
+    return _reconnect_result()
+
+
 def _handle_http_error(exc: httpx.HTTPStatusError, action: str) -> ToolResult:
     """Convert an HTTP error into a user-friendly ToolResult."""
     status = exc.response.status_code
@@ -1109,11 +1162,7 @@ def _handle_http_error(exc: httpx.HTTPStatusError, action: str) -> ToolResult:
     )
     message, _reason = parse_google_api_error(body)
     if status == 401:
-        return ToolResult(
-            content="Calendar disconnected. Please reconnect Google Calendar in Settings.",
-            is_error=True,
-            error_kind=ToolErrorKind.AUTH,
-        )
+        return _reconnect_result()
     if status == 403:
         # 403 has many causes for Calendar: forbidden (read-only calendar
         # under the granted scope), accessNotConfigured (Calendar API

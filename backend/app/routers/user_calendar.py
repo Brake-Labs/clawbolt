@@ -28,7 +28,7 @@ from backend.app.schemas.tools import (
     CalendarListEntry,
     CalendarListResponse,
 )
-from backend.app.services.oauth import oauth_service
+from backend.app.services.oauth import ReconnectRequired, oauth_service
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +55,9 @@ async def list_calendars(
     service = await _get_calendar_service(current_user)
     try:
         calendars = await service.list_calendars()
+    except ReconnectRequired as exc:
+        # The shared refresh retired the dead token, so the connection is gone.
+        raise HTTPException(status_code=400, detail="Google Calendar not connected") from exc
     except Exception as exc:
         logger.exception("Failed to list calendars for user %s", current_user.id)
         raise HTTPException(status_code=502, detail=f"Google Calendar error: {exc}") from exc
@@ -117,8 +120,9 @@ async def update_calendar_config(
             if c.primary:
                 primary_id = c.id
                 break
-    except HTTPException:
-        # Calendar not configured / not connected. Skip the lookup.
+    except (HTTPException, ReconnectRequired):
+        # Calendar not configured / not connected (or the grant just died).
+        # Skip the lookup.
         pass
     except Exception:
         logger.exception(

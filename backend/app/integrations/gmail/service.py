@@ -1,8 +1,7 @@
 """Gmail REST API client using httpx.
 
 Mirrors the shape of ``calendar/service.py``: an httpx-based client with a
-proactive token refresh, reactive 401 retry, and a refresh callback so the
-``oauth_service`` can persist rotated tokens.
+reactive 401 retry that refreshes through the shared, locked OAuth refresh.
 
 Why a hand-rolled client and not ``google-api-python-client``: the rest of
 this codebase is httpx-based, the surface area we need from Gmail is tiny
@@ -15,7 +14,6 @@ from __future__ import annotations
 import base64
 import logging
 import re
-import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from email.message import EmailMessage
@@ -27,12 +25,6 @@ import httpx
 logger = logging.getLogger(__name__)
 
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1"
-GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
-
-# Refresh 5 minutes before expiry. Matches the calendar service so the two
-# integrations behave identically when both are in use.
-_REFRESH_BUFFER_SECONDS = 300
-
 # Cap the body slice we surface to the LLM so a marketing newsletter doesn't
 # eat the context window. Callers asking for "the magic link" only need the
 # first chunk; full retrieval of long bodies is intentionally out of scope.
@@ -134,19 +126,16 @@ class GmailService:
     def __init__(
         self,
         access_token: str,
-        refresh_token: str,
-        client_id: str,
-        client_secret: str,
-        on_token_refresh: Callable[[str, str, float], Awaitable[None]] | None = None,
-        token_expires_at: float = 0.0,
+        refresh_access_token: Callable[[str], Awaitable[str | None]] | None = None,
         sender_email: str = "",
     ) -> None:
+        """``refresh_access_token`` is called with the access token Google just
+        answered 401 to and returns a fresh one, or None when no refresh could
+        run. It owns the OAuth side (locking, persistence, retiring a dead
+        grant) and raises ``ReconnectRequired`` when the grant is dead.
+        """
         self._access_token = access_token
-        self._refresh_token = refresh_token
-        self._client_id = client_id
-        self._client_secret = client_secret
-        self._on_token_refresh = on_token_refresh
-        self._token_expires_at = token_expires_at
+        self._refresh_access_token = refresh_access_token
         # Resolved lazily on first ``send_message`` call so we don't pay
         # the round-trip on read-only flows. ``getProfile`` is the only
         # Gmail endpoint that returns the authenticated user's address;
@@ -157,37 +146,6 @@ class GmailService:
     def provider_name(self) -> str:
         return "gmail"
 
-    # -- Token refresh --------------------------------------------------------
-
-    async def _refresh_access_token(self, client: httpx.AsyncClient) -> None:
-        logger.info("Refreshing Gmail access token")
-        resp = await client.post(
-            GOOGLE_TOKEN_URL,
-            data={
-                "grant_type": "refresh_token",
-                "refresh_token": self._refresh_token,
-                "client_id": self._client_id,
-                "client_secret": self._client_secret,
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        self._access_token = data["access_token"]
-        if "refresh_token" in data:
-            self._refresh_token = data["refresh_token"]
-        if "expires_in" in data:
-            self._token_expires_at = time.time() + data["expires_in"]
-        if self._on_token_refresh:
-            await self._on_token_refresh(
-                self._access_token, self._refresh_token, self._token_expires_at
-            )
-
-    async def _ensure_valid_token(self, client: httpx.AsyncClient) -> None:
-        if self._token_expires_at <= 0:
-            return
-        if time.time() >= (self._token_expires_at - _REFRESH_BUFFER_SECONDS):
-            await self._refresh_access_token(client)
-
     async def _request(
         self,
         method: str,
@@ -196,6 +154,12 @@ class GmailService:
         json: dict[str, Any] | None = None,
         params: Mapping[str, str | list[str]] | None = None,
     ) -> dict[str, Any] | None:
+        """Make an authenticated Gmail API request, refreshing once on a 401.
+
+        Raises ``ReconnectRequired`` when the refresh finds the grant dead; a
+        401 that persists after the refresh is raised as the
+        ``HTTPStatusError`` it is.
+        """
         url = f"{GMAIL_API_BASE}{path}"
         headers = {
             "Authorization": f"Bearer {self._access_token}",
@@ -203,13 +167,15 @@ class GmailService:
             "Content-Type": "application/json",
         }
         async with httpx.AsyncClient(timeout=30.0) as client:
-            await self._ensure_valid_token(client)
-            headers["Authorization"] = f"Bearer {self._access_token}"
             resp = await client.request(method, url, headers=headers, json=json, params=params)
-            if resp.status_code == 401:
-                await self._refresh_access_token(client)
-                headers["Authorization"] = f"Bearer {self._access_token}"
-                resp = await client.request(method, url, headers=headers, json=json, params=params)
+            if resp.status_code == 401 and self._refresh_access_token is not None:
+                new_token = await self._refresh_access_token(self._access_token)
+                if new_token:
+                    self._access_token = new_token
+                    headers["Authorization"] = f"Bearer {new_token}"
+                    resp = await client.request(
+                        method, url, headers=headers, json=json, params=params
+                    )
             resp.raise_for_status()
             if resp.status_code == 204 or not resp.content:
                 return None

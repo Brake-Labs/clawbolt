@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 import urllib.parse
 from collections.abc import Callable, Generator
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -145,9 +144,16 @@ async def test_refresh_keeps_recorded_account(user: User) -> None:
         "google_calendar",
         OAuthTokenData(access_token="old", refresh_token="rt", extra={ACCOUNT_EMAIL_KEY: ACCOUNT}),
     )
-    await svc.build_on_refresh_callback(user.id, "google_calendar")(
-        "new", "rt2", time.time() + 3600
+    client = MagicMock()
+    client.post = AsyncMock(
+        return_value=_json({"access_token": "new", "refresh_token": "rt2", "expires_in": 3600})
     )
+    with (
+        patch("backend.app.services.oauth.get_oauth_config", _config),
+        patch.object(svc, "_get_http", return_value=client),
+    ):
+        await svc.build_rejected_token_refresher(user.id, "google_calendar")("old")
+    client.post.assert_awaited_once()
     assert await svc.get_account_email(user.id, "google_calendar") == ACCOUNT
 
 

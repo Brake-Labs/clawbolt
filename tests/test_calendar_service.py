@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -31,13 +30,7 @@ def _mock_response(
 
 @pytest.fixture()
 def service() -> GoogleCalendarService:
-    return GoogleCalendarService(
-        access_token="test-access-token",
-        refresh_token="test-refresh-token",
-        client_id="test-client-id",
-        client_secret="test-client-secret",
-        token_expires_at=time.time() + 3600,
-    )
+    return GoogleCalendarService(access_token="test-access-token")
 
 
 # ---------------------------------------------------------------------------
@@ -484,185 +477,96 @@ async def test_check_availability_api_error(service: GoogleCalendarService) -> N
 # ---------------------------------------------------------------------------
 
 
-async def test_proactive_token_refresh() -> None:
-    """Should refresh token when about to expire."""
-    svc = GoogleCalendarService(
-        access_token="old-token",
-        refresh_token="refresh-token",
-        client_id="cid",
-        client_secret="csec",
-        token_expires_at=time.time() - 100,  # Already expired
+_EVENTS_URL = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
+
+
+def _events_client(*responses: httpx.Response) -> tuple[Any, AsyncMock]:
+    """Patch target and client that answer ``request`` with *responses* in order.
+
+    Each call's Authorization header is recorded on ``mock_client.sent_auth``
+    at call time, since the service reuses one headers dict across the retry.
+    """
+    mock_client = AsyncMock()
+    queue = list(responses)
+    sent_auth: list[str] = []
+
+    async def _request(*args: Any, **kwargs: Any) -> httpx.Response:
+        sent_auth.append(kwargs["headers"]["Authorization"])
+        return queue.pop(0)
+
+    mock_client.request.side_effect = _request
+    mock_client.sent_auth = sent_auth
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    return patch("httpx.AsyncClient", return_value=mock_client), mock_client
+
+
+def _resp(status: int, body: dict[str, Any]) -> httpx.Response:
+    return httpx.Response(status, json=body, request=httpx.Request("GET", _EVENTS_URL))
+
+
+async def _list(svc: GoogleCalendarService) -> list[Any]:
+    return await svc.list_events(
+        "primary", datetime(2026, 3, 25, tzinfo=UTC), datetime(2026, 3, 26, tzinfo=UTC)
     )
 
-    refresh_response = httpx.Response(
-        200,
-        json={
-            "access_token": "new-token",
-            "refresh_token": "new-refresh",
-            "expires_in": 3600,
-        },
-        request=httpx.Request("POST", "https://oauth2.googleapis.com/token"),
-    )
-    api_response = httpx.Response(
-        200,
-        json={"items": []},
-        request=httpx.Request(
-            "GET", "https://www.googleapis.com/calendar/v3/calendars/primary/events"
-        ),
-    )
 
-    with patch("httpx.AsyncClient") as mock_client_cls:
-        mock_client = AsyncMock()
-        mock_client.post.return_value = refresh_response
-        mock_client.request.return_value = api_response
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-        mock_client_cls.return_value = mock_client
+async def test_401_refreshes_through_the_hook_and_retries() -> None:
+    refresh = AsyncMock(return_value="fresh-token")
+    svc = GoogleCalendarService(access_token="expired-token", refresh_access_token=refresh)
+    patcher, client = _events_client(_resp(401, {}), _resp(200, {"items": []}))
 
-        events = await svc.list_events(
-            "primary",
-            datetime(2026, 3, 25, tzinfo=UTC),
-            datetime(2026, 3, 26, tzinfo=UTC),
-        )
+    with patcher:
+        assert await _list(svc) == []
 
-    assert events == []
-    # Token was refreshed proactively
-    assert svc._access_token == "new-token"
-
-
-async def test_reactive_token_refresh_on_401() -> None:
-    """Should refresh and retry on 401."""
-    svc = GoogleCalendarService(
-        access_token="expired-token",
-        refresh_token="refresh-token",
-        client_id="cid",
-        client_secret="csec",
-        token_expires_at=time.time() + 3600,  # Not yet expired (but server rejects)
-    )
-
-    refresh_response = httpx.Response(
-        200,
-        json={
-            "access_token": "fresh-token",
-            "expires_in": 3600,
-        },
-        request=httpx.Request("POST", "https://oauth2.googleapis.com/token"),
-    )
-    unauthorized_response = httpx.Response(
-        401,
-        json={"error": "invalid_token"},
-        request=httpx.Request(
-            "GET", "https://www.googleapis.com/calendar/v3/calendars/primary/events"
-        ),
-    )
-    success_response = httpx.Response(
-        200,
-        json={"items": []},
-        request=httpx.Request(
-            "GET", "https://www.googleapis.com/calendar/v3/calendars/primary/events"
-        ),
-    )
-
-    with patch("httpx.AsyncClient") as mock_client_cls:
-        mock_client = AsyncMock()
-        mock_client.post.return_value = refresh_response
-        mock_client.request.side_effect = [unauthorized_response, success_response]
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-        mock_client_cls.return_value = mock_client
-
-        events = await svc.list_events(
-            "primary",
-            datetime(2026, 3, 25, tzinfo=UTC),
-            datetime(2026, 3, 26, tzinfo=UTC),
-        )
-
-    assert events == []
+    refresh.assert_awaited_once_with("expired-token")
+    assert client.sent_auth == ["Bearer expired-token", "Bearer fresh-token"]
+    # Later calls on the same service reuse the fresh token.
     assert svc._access_token == "fresh-token"
 
 
-async def test_token_refresh_callback() -> None:
-    """Should call on_token_refresh when tokens are refreshed."""
-    callback_calls: list[tuple[str, str, float]] = []
+async def test_no_refresh_without_a_401() -> None:
+    refresh = AsyncMock(return_value="fresh-token")
+    svc = GoogleCalendarService(access_token="tok", refresh_access_token=refresh)
+    patcher, _ = _events_client(_resp(200, {"items": []}))
 
-    async def on_refresh(access: str, refresh: str, expires_at: float) -> None:
-        callback_calls.append((access, refresh, expires_at))
+    with patcher:
+        await _list(svc)
 
+    refresh.assert_not_awaited()
+
+
+async def test_401_persisting_after_refresh_raises() -> None:
     svc = GoogleCalendarService(
-        access_token="old",
-        refresh_token="old-refresh",
-        client_id="cid",
-        client_secret="csec",
-        on_token_refresh=on_refresh,
-        token_expires_at=time.time() - 100,
+        access_token="old", refresh_access_token=AsyncMock(return_value="new")
     )
+    patcher, _ = _events_client(_resp(401, {}), _resp(401, {}))
 
-    refresh_response = httpx.Response(
-        200,
-        json={
-            "access_token": "new-access",
-            "refresh_token": "new-refresh",
-            "expires_in": 3600,
-        },
-        request=httpx.Request("POST", "https://oauth2.googleapis.com/token"),
-    )
-    api_response = httpx.Response(
-        200,
-        json={"items": []},
-        request=httpx.Request(
-            "GET", "https://www.googleapis.com/calendar/v3/calendars/primary/events"
-        ),
-    )
+    with patcher, pytest.raises(httpx.HTTPStatusError) as exc_info:
+        await _list(svc)
+    assert exc_info.value.response.status_code == 401
 
-    with patch("httpx.AsyncClient") as mock_client_cls:
-        mock_client = AsyncMock()
-        mock_client.post.return_value = refresh_response
-        mock_client.request.return_value = api_response
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-        mock_client_cls.return_value = mock_client
 
-        await svc.list_events(
-            "primary",
-            datetime(2026, 3, 25, tzinfo=UTC),
-            datetime(2026, 3, 26, tzinfo=UTC),
-        )
+async def test_401_stands_when_no_refresh_could_run() -> None:
+    refresh = AsyncMock(return_value=None)
+    svc = GoogleCalendarService(access_token="old", refresh_access_token=refresh)
+    patcher, client = _events_client(_resp(401, {}))
 
-    assert len(callback_calls) == 1
-    assert callback_calls[0][0] == "new-access"
-    assert callback_calls[0][1] == "new-refresh"
-    assert callback_calls[0][2] > time.time()  # actual expires_at from response
+    with patcher, pytest.raises(httpx.HTTPStatusError):
+        await _list(svc)
+    assert client.request.await_count == 1
 
 
 async def test_refresh_failure_propagates() -> None:
-    """Should propagate refresh failure."""
+    """The hook's own errors (ReconnectRequired, a token endpoint 5xx) reach the caller."""
+    boom = RuntimeError("token endpoint down")
     svc = GoogleCalendarService(
-        access_token="old",
-        refresh_token="bad-refresh",
-        client_id="cid",
-        client_secret="csec",
-        token_expires_at=time.time() - 100,
+        access_token="old", refresh_access_token=AsyncMock(side_effect=boom)
     )
+    patcher, _ = _events_client(_resp(401, {}))
 
-    refresh_error = httpx.Response(
-        400,
-        json={"error": "invalid_grant"},
-        request=httpx.Request("POST", "https://oauth2.googleapis.com/token"),
-    )
-
-    with patch("httpx.AsyncClient") as mock_client_cls:
-        mock_client = AsyncMock()
-        mock_client.post.return_value = refresh_error
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-        mock_client_cls.return_value = mock_client
-
-        with pytest.raises(httpx.HTTPStatusError):
-            await svc.list_events(
-                "primary",
-                datetime(2026, 3, 25, tzinfo=UTC),
-                datetime(2026, 3, 26, tzinfo=UTC),
-            )
+    with patcher, pytest.raises(RuntimeError):
+        await _list(svc)
 
 
 # ---------------------------------------------------------------------------

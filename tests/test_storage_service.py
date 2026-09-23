@@ -88,12 +88,7 @@ async def test_mock_move_file_not_found(storage: MockStorageBackend) -> None:
 
 
 def _drive_credentials() -> DriveOAuthCredentials:
-    return DriveOAuthCredentials(
-        access_token="fake-access-token",
-        refresh_token="fake-refresh-token",
-        client_id="fake-client-id",
-        client_secret="fake-client-secret",
-    )
+    return DriveOAuthCredentials(access_token="fake-access-token")
 
 
 @pytest.fixture()

@@ -6,9 +6,14 @@ import logging
 import random
 import ssl
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
+
+from google.auth.transport import Request as GoogleAuthRequest
+from google.oauth2.credentials import Credentials as GoogleOAuthCredentials
+
+from backend.app.services.oauth import ReconnectRequired, reconnect_instruction
 
 logger = logging.getLogger(__name__)
 
@@ -125,17 +130,42 @@ class StorageBackend(ABC):
 
 @dataclass
 class DriveOAuthCredentials:
-    """Minimal token bundle the Drive client needs for auto-refresh.
+    """The per-user token the Drive client sends, and how to replace it.
 
-    ``client_id`` / ``client_secret`` are the deployment-level OAuth client
-    credentials; ``access_token`` / ``refresh_token`` are the per-user
-    tokens issued by Google after the user grants ``drive.file`` scope.
+    ``access_token`` is the token issued by Google after the user grants
+    ``drive.file`` scope. ``refresh_access_token`` is called with the token
+    Drive just answered 401 to and returns a fresh one, or None when no
+    refresh could run. It owns the OAuth side (locking, persistence, retiring
+    a dead grant) and raises ``ReconnectRequired`` when the grant is dead.
     """
 
     access_token: str
-    refresh_token: str
-    client_id: str
-    client_secret: str
+    refresh_access_token: Callable[[str], Awaitable[str | None]] | None = None
+
+
+class _AccessTokenRejected(Exception):
+    """Drive answered 401 to the current access token."""
+
+
+class DriveTokenRefreshUnavailable(Exception):
+    """Drive rejected the access token and no refresh could run this time.
+
+    Transient: the refresh lock was contended or no refresh hook is wired.
+    Says nothing about whether the grant is still good.
+    """
+
+
+class _RejectOnlyCredentials(GoogleOAuthCredentials):
+    """google-auth credentials that report a 401 instead of refreshing.
+
+    google-auth's own refresh posts the refresh token from inside the worker
+    thread, with no lock, no persistence, and no handling of a dead grant.
+    Raising here hands the 401 back to ``_execute_with_retry``, which
+    refreshes through the shared OAuth path on the event loop instead.
+    """
+
+    def refresh(self, request: GoogleAuthRequest) -> None:
+        raise _AccessTokenRejected()
 
 
 # appProperties key holding the human-readable storage path. drive.file
@@ -160,6 +190,10 @@ class GoogleDriveStorage(StorageBackend):
 
     def __init__(self, credentials: DriveOAuthCredentials) -> None:
         self._credentials = credentials
+        # One credentials object shared by every Resource this instance
+        # builds, so a token replaced after a 401 reaches requests that were
+        # built before the refresh. Only ``token`` is read across threads.
+        self._google_credentials = _RejectOnlyCredentials(token=credentials.access_token)
         # ``_service`` is a test-only override. Production leaves it ``None``
         # and ``_get_service`` builds a fresh Resource on every call. The
         # cross-call shared Resource was the root cause of the SSL/timeout
@@ -175,23 +209,56 @@ class GoogleDriveStorage(StorageBackend):
         return self._build_service()
 
     def _build_service(self) -> Any:
-        from google.oauth2.credentials import Credentials
         from googleapiclient.discovery import build
 
-        creds = Credentials(
-            token=self._credentials.access_token,
-            refresh_token=self._credentials.refresh_token,
-            token_uri="https://oauth2.googleapis.com/token",
-            client_id=self._credentials.client_id,
-            client_secret=self._credentials.client_secret,
-        )
         # ``cache_discovery=False`` silences the file-cache deprecation
         # warning; the discovery document is small enough that the network
         # fetch on first call is cached in-process for the rest of the
         # interpreter's lifetime.
-        return build("drive", "v3", credentials=creds, cache_discovery=False)
+        return build("drive", "v3", credentials=self._google_credentials, cache_discovery=False)
 
     async def _execute_with_retry(
+        self,
+        build_request: Callable[[], Any],
+        *,
+        op: str,
+    ) -> Any:
+        """Run a googleapiclient request, refreshing the token once on a 401.
+
+        The refresh goes through ``DriveOAuthCredentials.refresh_access_token``
+        (the shared, locked OAuth refresh), which raises ``ReconnectRequired``
+        when the grant is dead. A 401 that persists after the refresh raises
+        ``ReconnectRequired`` too: retrying cannot help and reconnecting is
+        the fix. Raises ``DriveTokenRefreshUnavailable`` when no refresh
+        could run.
+        """
+        # The token this call sends. A concurrent call may swap in a fresh
+        # one before this call's 401 comes back; naming the token that was
+        # actually rejected lets the shared refresh see that and skip a POST.
+        sent_token = self._google_credentials.token or ""
+        try:
+            return await self._execute_with_backoff(build_request, op=op)
+        except _AccessTokenRejected:
+            pass
+        refresh = self._credentials.refresh_access_token
+        new_token = await refresh(sent_token) if refresh is not None else None
+        if not new_token:
+            raise DriveTokenRefreshUnavailable(
+                f"Google Drive rejected the access token during {op} and no refresh could run"
+            )
+        self._credentials.access_token = new_token
+        self._google_credentials.token = new_token
+        try:
+            return await self._execute_with_backoff(build_request, op=op)
+        except _AccessTokenRejected as exc:
+            logger.warning("Drive rejected a freshly refreshed token during %s", op)
+            raise ReconnectRequired(
+                "google_drive",
+                "Google Drive rejected the request even after a token refresh. "
+                f"{reconnect_instruction('google_drive')}",
+            ) from exc
+
+    async def _execute_with_backoff(
         self,
         build_request: Callable[[], Any],
         *,

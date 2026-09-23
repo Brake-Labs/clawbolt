@@ -171,14 +171,14 @@ async def test_save_and_load_token(oauth_svc: OAuthService, test_user: User) -> 
     assert loaded.realm_id == "realm-1"
 
 
-async def test_build_on_refresh_callback_persists_rotated_refresh_token(
-    oauth_svc: OAuthService, test_user: User
+async def test_rejected_token_refresher_persists_rotation(
+    oauth_svc: OAuthService, test_user: User, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The callback wired into provider services must persist refreshed tokens.
+    """The hook wired into provider services refreshes and persists in one place.
 
-    Regression: QuickBooks/Google Calendar rotate refresh_token on some
-    refreshes. If the callback does not save the new value back to the DB,
-    subsequent tool calls load the stale refresh_token and re-auth fails.
+    Regression: providers rotate refresh_token on some refreshes. If the new
+    value is not saved, the next tool call loads the stale one and re-auth
+    fails. Fields the refresh does not return (realm_id, scopes) must survive.
     """
     original = OAuthTokenData(
         access_token="at-old",
@@ -188,18 +188,35 @@ async def test_build_on_refresh_callback_persists_rotated_refresh_token(
         expires_at=time.time() + 3600,
     )
     await oauth_svc.save_token(test_user.id, "quickbooks", original)
+    monkeypatch.setattr(
+        "backend.app.services.oauth.get_oauth_config",
+        lambda integration: OAuthConfig(
+            integration=integration,
+            client_id="cid",
+            client_secret="csecret",
+            authorize_url="https://oauth.example.invalid/authorize",
+            token_url="https://oauth.example.invalid/token",
+            scopes=[],
+        ),
+    )
+    token_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200, json={"access_token": "at-new", "refresh_token": "rt-new", "expires_in": 60}
+            )
+        )
+    )
+    monkeypatch.setattr(oauth_svc, "_get_http", lambda: token_client)
 
-    callback = oauth_svc.build_on_refresh_callback(test_user.id, "quickbooks")
-    new_expires = time.time() + 7200
-    await callback("at-new", "rt-new", new_expires)
+    refresh = oauth_svc.build_rejected_token_refresher(test_user.id, "quickbooks")
+    assert await refresh("at-old") == "at-new"
 
-    reloaded = await oauth_svc.load_token(test_user.id, "quickbooks")
+    reloaded = await oauth_svc.load_token_uncached(test_user.id, "quickbooks")
     assert reloaded is not None
     assert reloaded.access_token == "at-new"
     assert reloaded.refresh_token == "rt-new"
     assert reloaded.realm_id == "realm-1"
     assert reloaded.scopes == ["scope.a", "scope.b"]
-    assert abs(reloaded.expires_at - new_expires) < 1
 
 
 async def test_refresh_token_returns_early_when_peer_worker_already_refreshed(
@@ -279,84 +296,6 @@ async def test_refresh_token_bypasses_cache_for_post_lock_reload(
     assert result is not None
     assert result.access_token == "at-peer-fresh"
     mock_client.post.assert_not_called()
-
-
-async def test_build_on_refresh_callback_preserves_refresh_token_when_empty(
-    oauth_svc: OAuthService, test_user: User
-) -> None:
-    """When a provider refresh returns no new refresh_token, the callback
-    must keep the existing one rather than wiping it."""
-    original = OAuthTokenData(
-        access_token="at-old",
-        refresh_token="rt-original",
-        expires_at=time.time() + 3600,
-    )
-    await oauth_svc.save_token(test_user.id, "quickbooks", original)
-
-    callback = oauth_svc.build_on_refresh_callback(test_user.id, "quickbooks")
-    await callback("at-new", "", time.time() + 7200)
-
-    reloaded = await oauth_svc.load_token(test_user.id, "quickbooks")
-    assert reloaded is not None
-    assert reloaded.access_token == "at-new"
-    assert reloaded.refresh_token == "rt-original"
-
-
-async def test_build_on_refresh_callback_bypasses_cache_for_post_lock_reload(
-    oauth_svc: OAuthService, test_user: User
-) -> None:
-    """The on_refresh callback must observe a peer worker's just-persisted
-    rotated refresh_token rather than reading a stale cached value.
-
-    Regression for #1085 review feedback. The callback acquires the same
-    advisory lock as refresh_token to avoid losing the rotated
-    refresh_token. Inside that critical section it reloads the current
-    token to merge the new access/refresh values onto fields it doesn't
-    know about (realm_id, scopes). If a stale cache hides a peer worker's
-    recent save here, the callback writes back stale realm_id/scopes
-    on top of the peer's update.
-    """
-    original = OAuthTokenData(
-        access_token="at-old",
-        refresh_token="rt-old",
-        realm_id="realm-stale",
-        scopes=["scope.stale"],
-        expires_at=time.time() - 100,
-    )
-    await oauth_svc.save_token(test_user.id, "quickbooks", original)
-    # Prime the cache via load_token.
-    primed = await oauth_svc.load_token(test_user.id, "quickbooks")
-    assert primed is not None and primed.realm_id == "realm-stale"
-
-    # Simulate a peer worker writing fresh realm_id and scopes_json to
-    # the DB while our cache still has the stale values.
-    from sqlalchemy import update
-
-    from backend.app.models import OAuthToken
-
-    async with db_session_async() as db:
-        await db.execute(
-            update(OAuthToken)
-            .where(
-                OAuthToken.user_id == test_user.id,
-                OAuthToken.integration == "quickbooks",
-            )
-            .values(realm_id="realm-peer-fresh", scopes_json='["scope.peer"]')
-        )
-        await db.commit()
-
-    # Run the callback as the provider client would.
-    callback = oauth_svc.build_on_refresh_callback(test_user.id, "quickbooks")
-    await callback("at-new", "rt-new", time.time() + 7200)
-
-    # The merged write must have started from the peer's fresh values,
-    # not the cached stale ones.
-    reloaded = await oauth_svc.load_token(test_user.id, "quickbooks")
-    assert reloaded is not None
-    assert reloaded.access_token == "at-new"
-    assert reloaded.refresh_token == "rt-new"
-    assert reloaded.realm_id == "realm-peer-fresh"
-    assert reloaded.scopes == ["scope.peer"]
 
 
 async def test_save_token_upsert(oauth_svc: OAuthService, test_user: User) -> None:

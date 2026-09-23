@@ -70,9 +70,7 @@ def test_plan_refuses_listing_without_primary() -> None:
 
 @pytest.fixture()
 def service() -> GoogleCalendarService:
-    return GoogleCalendarService(
-        access_token="at", refresh_token="rt", client_id="cid", client_secret="cs"
-    )
+    return GoogleCalendarService(access_token="at")
 
 
 async def test_list_calendars_follows_pages_and_shows_hidden(
