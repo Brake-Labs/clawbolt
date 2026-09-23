@@ -16,6 +16,7 @@ from backend.app.services.oauth import (
     OAuthConfig,
     OAuthService,
     OAuthTokenData,
+    ReconnectRequired,
     _refresh_lock_key,
     _try_acquire_advisory_lock_async,
 )
@@ -314,6 +315,99 @@ class TestRefreshToken:
         assert result is not None
         assert result.expires_at == 0.0
         assert result.is_expired() is False
+
+
+def _config(integration: str) -> OAuthConfig:
+    return OAuthConfig(
+        integration=integration,
+        client_id="cid",
+        client_secret="csecret",
+        authorize_url="https://example.com/auth",
+        token_url="https://example.com/token",
+        scopes=[],
+    )
+
+
+class TestRefreshRejectedToken:
+    """``refresh_rejected_token``: the refresh a provider service runs on a 401."""
+
+    async def test_refreshes_an_unexpired_token_the_provider_rejected(
+        self, oauth_svc: OAuthService
+    ) -> None:
+        stored = OAuthTokenData(
+            access_token="at-rejected", refresh_token="rt", expires_at=time.time() + 3600
+        )
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(
+            return_value=httpx.Response(
+                200,
+                json={"access_token": "at-new", "expires_in": 3600},
+                request=httpx.Request("POST", "https://example.com/token"),
+            )
+        )
+        with (
+            patch.object(oauth_svc, "load_token", new_callable=AsyncMock, return_value=stored),
+            patch.object(oauth_svc, "save_token", new_callable=AsyncMock),
+            patch.object(oauth_svc, "_get_http", return_value=mock_client),
+            patch("backend.app.services.oauth.get_oauth_config", side_effect=_config),
+        ):
+            result = await oauth_svc.refresh_rejected_token("user-1", "quickbooks", "at-rejected")
+
+        assert result is not None
+        assert result.access_token == "at-new"
+        mock_client.post.assert_awaited_once()
+
+    async def test_skips_the_http_call_when_a_peer_already_refreshed(
+        self, oauth_svc: OAuthService
+    ) -> None:
+        stored = OAuthTokenData(
+            access_token="at-from-peer", refresh_token="rt", expires_at=time.time() + 3600
+        )
+        mock_client = AsyncMock()
+        with (
+            patch.object(oauth_svc, "load_token", new_callable=AsyncMock, return_value=stored),
+            patch.object(oauth_svc, "_get_http", return_value=mock_client),
+        ):
+            result = await oauth_svc.refresh_rejected_token("user-1", "quickbooks", "at-rejected")
+
+        assert result is stored
+        mock_client.post.assert_not_called()
+
+    async def test_permanent_failure_retires_token_and_raises_reconnect(
+        self, oauth_svc: OAuthService
+    ) -> None:
+        perm_error = _make_http_error(400, {"error": "invalid_grant"})
+        with (
+            patch.object(
+                oauth_svc, "refresh_token", new_callable=AsyncMock, side_effect=perm_error
+            ),
+            patch.object(oauth_svc, "delete_token", new_callable=AsyncMock) as delete_mock,
+            patch.object(oauth_svc, "_notify_reauth_needed", new_callable=AsyncMock) as notify,
+            pytest.raises(ReconnectRequired) as excinfo,
+        ):
+            await oauth_svc.refresh_rejected_token("user-1", "quickbooks", "at")
+
+        assert excinfo.value.integration == "quickbooks"
+        assert "reconnect" in str(excinfo.value)
+        delete_mock.assert_awaited_once_with("user-1", "quickbooks")
+        notify.assert_awaited_once_with("user-1", "quickbooks")
+
+    async def test_transient_failure_propagates_and_keeps_token(
+        self, oauth_svc: OAuthService
+    ) -> None:
+        with (
+            patch.object(
+                oauth_svc,
+                "refresh_token",
+                new_callable=AsyncMock,
+                side_effect=_make_http_error(503, {"error": "temporarily_unavailable"}),
+            ),
+            patch.object(oauth_svc, "delete_token", new_callable=AsyncMock) as delete_mock,
+            pytest.raises(httpx.HTTPStatusError),
+        ):
+            await oauth_svc.refresh_rejected_token("user-1", "quickbooks", "at")
+
+        delete_mock.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

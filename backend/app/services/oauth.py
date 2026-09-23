@@ -132,6 +132,21 @@ _PERMANENT_OAUTH_ERROR_CODES = frozenset(
 )
 
 
+class ReconnectRequired(Exception):
+    """The provider has rejected the connection itself; only reconnecting fixes it.
+
+    Raised mid-call when a token refresh fails permanently (the stored token
+    has already been retired and the user notified) or when the provider
+    still rejects a freshly refreshed token. Tools classify it as
+    ``ToolErrorKind.AUTH`` so the agent tells the user to reconnect instead
+    of calling the service temporarily unavailable.
+    """
+
+    def __init__(self, integration: str, message: str) -> None:
+        super().__init__(message)
+        self.integration = integration
+
+
 # ---------------------------------------------------------------------------
 # Intuit discovery document cache
 # ---------------------------------------------------------------------------
@@ -791,7 +806,7 @@ class OAuthService:
     ) -> Callable[[str, str, float], Awaitable[None]]:
         """Return an async callback that persists tokens refreshed mid-call by a service.
 
-        Provider services (QuickBooks, Google Calendar) refresh on 401 and
+        Provider services (Google Calendar, Gmail) refresh on 401 and
         rotate ``refresh_token`` for some providers. Without persisting, the
         rotated refresh token is lost and the next tool call loads the stale
         one from the DB, causing refresh to fail.
@@ -899,12 +914,20 @@ class OAuthService:
         self,
         user_id: str,
         integration: str,
+        *,
+        rejected_access_token: str = "",
     ) -> OAuthTokenData | None:
         """Refresh an expired OAuth token via the provider's token endpoint.
 
         Returns the updated token data on success, or None if no token or
         refresh token exists. Raises on HTTP errors so the caller can
         classify them via ``_is_permanent_refresh_failure``.
+
+        ``rejected_access_token`` is the access token a provider API just
+        answered 401 to. When given, the refresh is skipped only if the stored
+        access token has already moved past it (a peer refreshed), rather than
+        whenever the stored token is unexpired: a token the provider rejects
+        before its expiry still needs refreshing.
 
         A session-scoped Postgres advisory lock serializes concurrent
         refreshes for the same (user, integration). Without it, two workers
@@ -964,7 +987,14 @@ class OAuthService:
                 # providers that don't return an expiry (expires_at == 0,
                 # treated as non-expiring), where an explicit
                 # ``refresh_token`` call still needs to hit the provider.
-                if token.expires_at > 0 and not token.is_expired():
+                # After a mid-call 401 the stored token may be unexpired yet
+                # rejected, so there a peer refresh shows as a changed
+                # access token instead.
+                if rejected_access_token:
+                    peer_refreshed = token.access_token != rejected_access_token
+                else:
+                    peer_refreshed = token.expires_at > 0 and not token.is_expired()
+                if peer_refreshed:
                     logger.info(
                         "Token already refreshed by another worker: user=%s integration=%s",
                         user_id,
@@ -1095,6 +1125,42 @@ class OAuthService:
                     integration,
                 )
             return None
+
+    async def refresh_rejected_token(
+        self,
+        user_id: str,
+        integration: str,
+        rejected_access_token: str,
+    ) -> OAuthTokenData | None:
+        """Refresh after a provider API rejected *rejected_access_token* mid-call.
+
+        For provider services that retry a request on 401. Runs the refresh
+        under the same lock as every other path and, on a permanent failure
+        (``invalid_grant`` and friends), retires the token and notifies the
+        user through ``handle_permanent_refresh_failure``, then raises
+        ``ReconnectRequired``. A transient failure (provider 5xx, network
+        error) propagates unchanged and leaves the token for a later retry.
+        Also raises ``ReconnectRequired`` when the token row is gone, as it is
+        for every later call in a turn whose first call retired it. Returns
+        None when no refresh could run for another reason (the lock was
+        contended), leaving the caller's original 401 to stand.
+        """
+        friendly = integration.replace("_", " ").title()
+        reconnect_message = (
+            f"The {friendly} connection has expired or was revoked. "
+            "The user must reconnect it in Settings > Integrations."
+        )
+        try:
+            refreshed = await self.refresh_token(
+                user_id, integration, rejected_access_token=rejected_access_token
+            )
+        except Exception as exc:
+            if await self.handle_permanent_refresh_failure(user_id, integration, exc):
+                raise ReconnectRequired(integration, reconnect_message) from exc
+            raise
+        if refreshed is None and await self.load_token_uncached(user_id, integration) is None:
+            raise ReconnectRequired(integration, reconnect_message)
+        return refreshed
 
     async def handle_permanent_refresh_failure(
         self,

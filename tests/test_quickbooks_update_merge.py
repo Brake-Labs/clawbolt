@@ -125,14 +125,7 @@ def qbo(monkeypatch: pytest.MonkeyPatch) -> FakeQBO:
 
 
 def _tools() -> list[Tool]:
-    svc = QuickBooksOnlineService(
-        client_id="cid",
-        client_secret="csec",
-        realm_id="9999",
-        access_token="tok",
-        refresh_token="rt",
-        environment="sandbox",
-    )
+    svc = QuickBooksOnlineService(realm_id="9999", access_token="tok", environment="sandbox")
     return create_quickbooks_tools(svc)
 
 

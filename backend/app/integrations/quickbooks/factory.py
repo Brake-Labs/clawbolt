@@ -25,10 +25,7 @@ from backend.app.integrations.quickbooks.service import (
     QuickBooksOnlineService,
     QuickBooksService,
 )
-from backend.app.services.oauth import (
-    _get_intuit_endpoints,
-    oauth_service,
-)
+from backend.app.services.oauth import ReconnectRequired, oauth_service
 
 if TYPE_CHECKING:
     from backend.app.agent.tools.registry import ToolContext
@@ -211,13 +208,19 @@ def _fault_error_kind(exc: Exception) -> ToolErrorKind:
     approach", which is the wrong instruction: the id is wrong (or not
     visible yet) and the model should look it up rather than retry blind.
 
+    A dead connection (the refresh token expired or was revoked, or QBO
+    still refuses a freshly refreshed token) arrives as
+    ``ReconnectRequired``: AUTH, so the model tells the user to reconnect
+    rather than wait out an outage.
+
     A 400 carrying 4000 or 4001 is a query QuickBooks could not parse or
     validate: VALIDATION. Matching on the Intuit code rather than the bare
-    status keeps a failed token refresh (a 400 ``invalid_grant`` from the
-    OAuth endpoint, with no ``Fault`` body) out of this bucket. Everything
-    else (401/403 after the refresh retry, 429, 5xx, network errors, other
-    faults) stays SERVICE.
+    status keeps a 400 with no ``Fault`` body out of this bucket. Everything
+    else (429, 5xx, a token endpoint 5xx, network errors, other faults) stays
+    SERVICE.
     """
+    if isinstance(exc, ReconnectRequired):
+        return ToolErrorKind.AUTH
     if not isinstance(exc, httpx.HTTPStatusError):
         return ToolErrorKind.SERVICE
     codes = _intuit_fault_codes(exc)
@@ -1136,19 +1139,23 @@ def create_quickbooks_tools(
 async def _get_quickbooks_service_for_user(user_id: str) -> QuickBooksService | None:
     """Build a QuickBooks service using OAuth tokens for the given user."""
     token = await oauth_service.get_valid_token(user_id, "quickbooks")
-    if token and token.access_token and token.realm_id:
-        _, token_url = _get_intuit_endpoints()
-        return QuickBooksOnlineService(
-            client_id=settings.quickbooks_client_id,
-            client_secret=settings.quickbooks_client_secret,
-            realm_id=token.realm_id,
-            access_token=token.access_token,
-            refresh_token=token.refresh_token,
-            environment=settings.quickbooks_environment,
-            on_token_refresh=oauth_service.build_on_refresh_callback(user_id, "quickbooks"),
-            token_url=token_url,
+    if not (token and token.access_token and token.realm_id):
+        return None
+
+    async def refresh_access_token(rejected_access_token: str) -> str | None:
+        # The shared refresh: locked against peers, persisted, and a dead
+        # grant retires the token and raises ReconnectRequired.
+        refreshed = await oauth_service.refresh_rejected_token(
+            user_id, "quickbooks", rejected_access_token
         )
-    return None
+        return refreshed.access_token if refreshed else None
+
+    return QuickBooksOnlineService(
+        realm_id=token.realm_id,
+        access_token=token.access_token,
+        environment=settings.quickbooks_environment,
+        refresh_access_token=refresh_access_token,
+    )
 
 
 async def _quickbooks_auth_check(ctx: ToolContext) -> str | None:

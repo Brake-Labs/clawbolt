@@ -7,13 +7,14 @@ that calls the QBO REST API via httpx.
 from __future__ import annotations
 
 import logging
-import time
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
+
+from backend.app.services.oauth import ReconnectRequired
 
 logger = logging.getLogger(__name__)
 
@@ -57,48 +58,21 @@ class QuickBooksOnlineService(QuickBooksService):
 
     def __init__(
         self,
-        client_id: str,
-        client_secret: str,
         realm_id: str,
         access_token: str,
-        refresh_token: str,
         environment: str = "sandbox",
-        on_token_refresh: Callable[[str, str, float], Awaitable[None]] | None = None,
-        token_url: str = "",
+        refresh_access_token: Callable[[str], Awaitable[str | None]] | None = None,
     ) -> None:
-        self._client_id = client_id
-        self._client_secret = client_secret
+        """``refresh_access_token`` is called with the access token QBO just
+        answered 401 to and returns a fresh one, or None when no refresh could
+        run. It owns the OAuth side (locking, persistence, retiring a dead
+        grant) and raises ``ReconnectRequired`` when the grant is dead.
+        """
         self._realm_id = realm_id
         self._access_token = access_token
-        self._refresh_token = refresh_token
-        self._on_token_refresh = on_token_refresh
-        self._token_url = token_url or "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
-        self._token_expires_at = 0.0
+        self._refresh_access_token = refresh_access_token
         base = QBO_PRODUCTION_BASE if environment == "production" else QBO_SANDBOX_BASE
         self._api_base = f"{base}/v3/company/{realm_id}"
-
-    async def _refresh_access_token(self, client: httpx.AsyncClient) -> None:
-        """Refresh the OAuth2 access token using the refresh token."""
-        logger.info("Refreshing QuickBooks access token")
-        resp = await client.post(
-            self._token_url,
-            data={
-                "grant_type": "refresh_token",
-                "refresh_token": self._refresh_token,
-            },
-            auth=(self._client_id, self._client_secret),
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        self._access_token = data["access_token"]
-        if "refresh_token" in data:
-            self._refresh_token = data["refresh_token"]
-        if "expires_in" in data:
-            self._token_expires_at = time.time() + data["expires_in"]
-        if self._on_token_refresh:
-            await self._on_token_refresh(
-                self._access_token, self._refresh_token, self._token_expires_at
-            )
 
     @staticmethod
     def _log_intuit_tid(resp: httpx.Response, *, level: int = logging.DEBUG) -> str:
@@ -128,6 +102,9 @@ class QuickBooksOnlineService(QuickBooksService):
     ) -> dict[str, Any]:
         """Make an authenticated request to the QBO API with token refresh on 401.
 
+        Raises ``ReconnectRequired`` when the refresh finds the grant dead or
+        the retried request is still refused with 401/403.
+
         ``content_type`` defaults to JSON because every entity CRUD endpoint
         wants JSON. The ``/send`` endpoint is the lone exception: Intuit
         requires ``application/octet-stream`` and 500s on JSON.
@@ -143,11 +120,27 @@ class QuickBooksOnlineService(QuickBooksService):
             resp = await client.request(method, url, headers=headers, json=json, params=params)
             self._log_intuit_tid(resp)
 
-            if resp.status_code == 401:
-                await self._refresh_access_token(client)
-                headers["Authorization"] = f"Bearer {self._access_token}"
-                resp = await client.request(method, url, headers=headers, json=json, params=params)
-                self._log_intuit_tid(resp)
+            if resp.status_code == 401 and self._refresh_access_token is not None:
+                new_token = await self._refresh_access_token(self._access_token)
+                if new_token:
+                    self._access_token = new_token
+                    headers["Authorization"] = f"Bearer {new_token}"
+                    resp = await client.request(
+                        method, url, headers=headers, json=json, params=params
+                    )
+                    self._log_intuit_tid(resp)
+                    if resp.status_code in (401, 403):
+                        # A freshly refreshed token is still refused: the
+                        # grant no longer reaches this company, so retrying
+                        # cannot help and reconnecting is the fix.
+                        tid = self._log_intuit_tid(resp, level=logging.WARNING)
+                        raise ReconnectRequired(
+                            "quickbooks",
+                            f"QuickBooks rejected the request with HTTP {resp.status_code} "
+                            "even after a token refresh"
+                            f"{f' (intuit_tid={tid})' if tid else ''}. "
+                            "The user must reconnect QuickBooks in Settings > Integrations.",
+                        )
 
             try:
                 resp.raise_for_status()

@@ -802,14 +802,7 @@ class FakeQBOServiceWithURL(QuickBooksOnlineService):
     ``_build_qbo_url`` returns a real deep link."""
 
     def __init__(self) -> None:
-        super().__init__(
-            client_id="test",
-            client_secret="test",
-            realm_id="9999",
-            access_token="test",
-            refresh_token="test",
-            environment="sandbox",
-        )
+        super().__init__(realm_id="9999", access_token="test", environment="sandbox")
         self._next_id = 2000
 
     async def query(self, query_str: str) -> list[dict[str, Any]]:

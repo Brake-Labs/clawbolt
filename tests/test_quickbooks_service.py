@@ -9,7 +9,7 @@ duplicates.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
 import httpx
 import pytest
@@ -33,15 +33,18 @@ def _patch_transport(
     monkeypatch.setattr(service_module.httpx, "AsyncClient", factory)
 
 
-def _service() -> QuickBooksOnlineService:
+async def _refresh_to_new_access(rejected_access_token: str) -> str | None:
+    return "new-access"
+
+
+def _service(
+    refresh_access_token: Callable[[str], Awaitable[str | None]] | None = _refresh_to_new_access,
+) -> QuickBooksOnlineService:
     return QuickBooksOnlineService(
-        client_id="cid",
-        client_secret="csec",
         realm_id="9999",
         access_token="initial-access",
-        refresh_token="rfresh",
         environment="production",
-        token_url="https://example.invalid/token",
+        refresh_access_token=refresh_access_token,
     )
 
 
@@ -165,15 +168,6 @@ async def test_401_retry_reuses_same_requestid(monkeypatch: pytest.MonkeyPatch) 
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured.append(request)
-        if request.url.path.endswith("/token"):
-            return httpx.Response(
-                200,
-                json={
-                    "access_token": "new-access",
-                    "refresh_token": "new-rfresh",
-                    "expires_in": 3600,
-                },
-            )
         if request.method == "POST" and "/estimate" in request.url.path:
             posts = [r for r in captured if r.method == "POST" and "/estimate" in r.url.path]
             if len(posts) == 1:
@@ -191,6 +185,7 @@ async def test_401_retry_reuses_same_requestid(monkeypatch: pytest.MonkeyPatch) 
     rid_retry = posts[1].url.params.get("requestid")
     assert rid_first is not None
     assert rid_first == rid_retry, "401 retry must reuse the requestid so QBO dedupes the pair"
+    assert posts[1].headers["Authorization"] == "Bearer new-access"
     assert result["Id"] == "1"
 
 
