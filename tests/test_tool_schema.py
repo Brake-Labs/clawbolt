@@ -296,3 +296,21 @@ def test_compact_schema_still_validates_null_and_omission() -> None:
     parsed = _OptionalParams.model_validate({"description": "x", "folder": None})
     assert parsed.folder is None
     assert _OptionalParams.model_validate({"description": "x"}).note == ""
+
+
+class _Address(BaseModel):
+    """Developer docstring for the nested model."""
+
+    street: str
+
+
+class _NestedOptionalParams(BaseModel):
+    site: _Address | None = Field(default=None, description="Job site address.")
+
+
+def test_compact_schema_keeps_field_description_over_nested_docstring() -> None:
+    tool = Tool(name="t", description="d", function=_dummy_func, params_model=_NestedOptionalParams)
+    site = tool_to_function_schema(tool)["input_schema"]["properties"]["site"]
+    assert site["description"] == "Job site address."
+    assert site["type"] == "object"
+    assert site["required"] == ["street"]

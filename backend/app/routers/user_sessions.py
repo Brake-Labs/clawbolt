@@ -129,8 +129,7 @@ async def get_conversation_system_prompt(
       publish hook (currently ``send_media_reply``,
       ``upload_to_storage``, and ``move_file``) are filtered out
       by the registry's dependency gates because the preview can't
-      safely construct those runtime hooks. Their usage hints will
-      not appear in the Tool Guidelines section.
+      safely construct those runtime hooks.
     * If a user's ``BOOTSTRAP.md`` cannot be created on disk by the
       runtime (rare, requires an OS-level error), the runtime drops
       out of onboarding mode while this preview still reports

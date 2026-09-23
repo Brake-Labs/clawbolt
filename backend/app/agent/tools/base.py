@@ -253,8 +253,11 @@ def _collapse_optional(prop: dict[str, Any]) -> dict[str, Any]:
     if isinstance(branches, list) and len(branches) == 2:
         non_null = [b for b in branches if b != {"type": "null"}]
         if len(non_null) == 1 and isinstance(non_null[0], dict):
-            merged = {k: v for k, v in prop.items() if k != "anyOf"}
-            merged.update(non_null[0])
+            # The field's own keys (description, default) win over the
+            # branch's: an inlined nested model carries its docstring as
+            # ``description`` and would otherwise replace the field's.
+            merged = dict(non_null[0])
+            merged.update({k: v for k, v in prop.items() if k != "anyOf"})
             prop = merged
     if "default" in prop and (prop["default"] is None or prop["default"] == ""):
         prop = {k: v for k, v in prop.items() if k != "default"}
