@@ -140,8 +140,16 @@ class Settings(BaseSettings):
     # as a head/tail/hash record rather than full text.
     compaction_event_snapshot_max_bytes_per_file: int = Field(default=100_000, ge=1024)
     llm_max_retries: int = Field(default=3, ge=1)
-    # Use Anthropic's one-hour cache TTL instead of the five-minute default.
+    # Use Anthropic's one-hour cache TTL instead of the five-minute default
+    # on the tools and system breakpoints.
     llm_cache_extended_ttl: bool = True
+    # Lifetime of the breakpoint on the prior-history tail. A 1h write costs
+    # 2x base input and a 5m write 1.25x, so 1h pays off only when turns
+    # often arrive 5 to 60 minutes apart.
+    llm_cache_history_ttl: Literal["5m", "1h"] = "1h"
+    # Lifetime of the breakpoint on the trailing tool_result inside a turn.
+    # Rounds are seconds apart, so the 1h premium buys nothing here.
+    llm_cache_in_turn_ttl: Literal["5m", "1h"] = "5m"
     # "auto" stamps supported Anthropic cache breakpoints; "never" disables them.
     llm_prompt_cache: Literal["auto", "never"] = "auto"
     # Model names genai-prices cannot price, mapped to one it can, as
@@ -694,6 +702,22 @@ def log_config_warnings(s: Settings | None = None) -> list[str]:
             f" 2x the effective turn-trim trigger ({effective_trigger_turns});"
             " the row cap will bind before the turn backstop and old messages"
             " will roll through window-overflow compaction instead"
+        )
+
+    # Anthropic requires a longer-lived breakpoint to precede a shorter one.
+    # The request order is tools, system, history tail, in-turn, so a later
+    # lifetime longer than an earlier one is clamped down (see
+    # ``llm_service._breakpoint_ttls``).
+    prefix_ttl = "1h" if s.llm_cache_extended_ttl else "5m"
+    if s.llm_cache_history_ttl == "1h" and prefix_ttl == "5m":
+        warnings.append(
+            "llm_cache_history_ttl=1h with llm_cache_extended_ttl=false; a 1h"
+            " breakpoint cannot follow a 5m one, so the history tail uses 5m"
+        )
+    if s.llm_cache_in_turn_ttl == "1h" and (s.llm_cache_history_ttl == "5m" or prefix_ttl == "5m"):
+        warnings.append(
+            "llm_cache_in_turn_ttl=1h follows a 5m breakpoint; a 1h breakpoint"
+            " cannot follow a 5m one, so the in-turn breakpoint uses 5m"
         )
 
     # Warn when an iMessage backend is configured but the address users are
