@@ -226,6 +226,31 @@ async def test_qb_create_drops_line_ids_copied_from_another_record() -> None:
     assert body["Line"] == [{k: v for k, v in line.items() if k != "Id"}]
 
 
+async def test_qb_create_drops_the_identity_of_a_copied_record() -> None:
+    """A create body carrying Id and SyncToken is an update to QBO, so a
+    record copied from a query must not overwrite the one that shares its Id."""
+    svc = FakeQBService()
+    fn = _get_tool(create_quickbooks_tools(svc), "qb_create")
+
+    result = await fn(
+        entity_type="Invoice",
+        data={
+            "Id": "42",
+            "SyncToken": "3",
+            "sparse": True,
+            "MetaData": {"CreateTime": "2026-01-01T00:00:00Z"},
+            "CustomerRef": {"value": "3"},
+            "Line": [{"Amount": 100.0, "DetailType": "SalesItemLineDetail"}],
+        },
+    )
+
+    assert result.is_error is False
+    _, body = svc.created[0]
+    for key in ("Id", "SyncToken", "sparse", "MetaData"):
+        assert key not in body
+    assert body["CustomerRef"] == {"value": "3"}
+
+
 async def test_qb_create_invoice_with_linked_estimate() -> None:
     """Creating an invoice with LinkedTxn (estimate-to-invoice workflow)."""
     svc = FakeQBService()

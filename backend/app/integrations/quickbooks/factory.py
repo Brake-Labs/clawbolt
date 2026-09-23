@@ -77,6 +77,9 @@ _ENTITY_LABELS: dict[str, str] = {
 # Entity types that qb_create is allowed to create.
 _CREATABLE_ENTITIES = {"Customer", "Estimate", "Invoice", "Item"}
 
+# Keys that identify an existing record; never valid on a create.
+_RECORD_IDENTITY_KEYS = frozenset({"Id", "SyncToken", "sparse", "MetaData", "domain"})
+
 # Entity types that qb_update is allowed to update.
 _UPDATABLE_ENTITIES = {"Customer", "Estimate", "Invoice", "Item"}
 
@@ -798,6 +801,12 @@ def create_quickbooks_tools(
                 is_error=True,
                 error_kind=ToolErrorKind.VALIDATION,
             )
+
+        # A payload copied from a queried record carries that record's
+        # identity. QBO treats a create body with Id and SyncToken as an
+        # update, so a whole estimate pasted into an Invoice create would
+        # overwrite whichever invoice shares its Id. Strip the identity.
+        data = {k: v for k, v in data.items() if k not in _RECORD_IDENTITY_KEYS}
 
         lines = data.get("Line")
         if isinstance(lines, list):
