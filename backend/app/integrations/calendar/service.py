@@ -22,6 +22,7 @@ from backend.app.integrations.calendar.provider import (
     CalendarEventUpdate,
     CalendarInfo,
 )
+from backend.app.services.oauth import TokenRefreshUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -101,8 +102,10 @@ class GoogleCalendarService:
 
         Returns the parsed JSON body, or None for 204 responses. On a 401 it
         refreshes the token once and retries. Raises ``ReconnectRequired``
-        when the refresh finds the grant dead; a 401 that persists after the
-        refresh is raised as the ``HTTPStatusError`` it is.
+        when the refresh finds the grant dead, and ``TokenRefreshUnavailable``
+        when no refresh could run (the lock was contended). A 401 that
+        persists after a refresh that did run is raised as the
+        ``HTTPStatusError`` it is.
         """
         url = f"{GOOGLE_CALENDAR_API_BASE}{path}"
         headers = {
@@ -116,12 +119,15 @@ class GoogleCalendarService:
 
             if resp.status_code == 401 and self._refresh_access_token is not None:
                 new_token = await self._refresh_access_token(self._access_token)
-                if new_token:
-                    self._access_token = new_token
-                    headers["Authorization"] = f"Bearer {new_token}"
-                    resp = await client.request(
-                        method, url, headers=headers, json=json, params=params
+                if not new_token:
+                    raise TokenRefreshUnavailable(
+                        "Google Calendar rejected the access token and no refresh could run",
+                        request=resp.request,
+                        response=resp,
                     )
+                self._access_token = new_token
+                headers["Authorization"] = f"Bearer {new_token}"
+                resp = await client.request(method, url, headers=headers, json=json, params=params)
 
             resp.raise_for_status()
 

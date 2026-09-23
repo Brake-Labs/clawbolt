@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 from backend.app.agent.approval import ApprovalPolicy, PermissionLevel
 from backend.app.agent.saved_media import (
+    drive_reconnect_result,
     find_saved_file,
     read_saved_file_bytes,
 )
@@ -37,6 +38,7 @@ from backend.app.integrations.companycam.receipts import (
     tags_target,
 )
 from backend.app.integrations.companycam.service import CompanyCamService
+from backend.app.services.oauth import ReconnectRequired
 
 if TYPE_CHECKING:
     from backend.app.agent.tools.registry import ToolContext
@@ -169,13 +171,17 @@ def build_photo_tools(service: CompanyCamService, ctx: ToolContext) -> list[Tool
         #    media tunnel below is the same path that handle-staged
         #    photos take and is battle-tested.
         if not file_bytes and ctx.storage is not None:
-            saved = await find_saved_file(ctx.storage, original_url)
-            if saved is not None:
-                mime_type = saved.mime_type or "image/jpeg"
-                try:
-                    file_bytes = await read_saved_file_bytes(ctx.storage, saved)
-                except FileNotFoundError:
-                    logger.warning("Saved media missing from storage: %s", saved.path)
+            try:
+                saved = await find_saved_file(ctx.storage, original_url)
+                if saved is not None:
+                    mime_type = saved.mime_type or "image/jpeg"
+                    try:
+                        file_bytes = await read_saved_file_bytes(ctx.storage, saved)
+                    except FileNotFoundError:
+                        logger.warning("Saved media missing from storage: %s", saved.path)
+            except ReconnectRequired as exc:
+                # The dead grant is Drive's, not CompanyCam's.
+                return drive_reconnect_result(exc)
 
         if not file_bytes and not photo_uri:
             return ToolResult(

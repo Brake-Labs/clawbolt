@@ -11,9 +11,31 @@ from __future__ import annotations
 
 import logging
 
+from backend.app.agent.tools.base import ToolErrorKind, ToolResult
+from backend.app.services.oauth import ReconnectRequired, reconnect_instruction
 from backend.app.services.storage_service import SavedFile, StorageBackend
 
 logger = logging.getLogger(__name__)
+
+
+def drive_reconnect_result(exc: ReconnectRequired) -> ToolResult:
+    """AUTH result for a dead Google Drive connection, logged as expected.
+
+    For any tool that reads saved files, including the other integrations
+    that pull Drive files through these helpers (CompanyCam, AppFolio). By
+    the time ``ReconnectRequired`` arrives the shared refresh has retired the
+    token and told the user, so this is a warning, not a traceback.
+    """
+    logger.warning("Google Drive connection needs reconnecting: %s", exc)
+    return ToolResult(
+        content="Google Drive disconnected. Please reconnect Google Drive in Settings.",
+        is_error=True,
+        error_kind=ToolErrorKind.AUTH,
+        hint=(
+            "The connection has expired or was revoked. Do not retry. "
+            f"{reconnect_instruction('google_drive')}"
+        ),
+    )
 
 
 def _looks_like_storage_path(ref: str) -> bool:

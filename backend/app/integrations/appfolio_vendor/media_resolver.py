@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 from backend.app.agent.tools.base import ToolErrorKind, ToolResult
 from backend.app.integrations.appfolio_vendor.service import FileUpload
 from backend.app.media.download import generate_filename
+from backend.app.services.oauth import ReconnectRequired
 
 if TYPE_CHECKING:
     from backend.app.agent.tools.registry import ToolContext
@@ -55,7 +56,11 @@ async def resolve_staged_files(
     # Lazy import keeps the test surface narrow and breaks what would
     # otherwise be a circular dependency through ``backend.app.agent``.
     from backend.app.agent import media_staging
-    from backend.app.agent.saved_media import find_saved_file, read_saved_file_bytes
+    from backend.app.agent.saved_media import (
+        drive_reconnect_result,
+        find_saved_file,
+        read_saved_file_bytes,
+    )
 
     staged_cache = await media_staging.get_all_for_user(ctx.user.id)
 
@@ -90,13 +95,17 @@ async def resolve_staged_files(
 
         # 4. Saved file in Drive (path-quoted by the agent).
         if not file_bytes and ctx.storage is not None:
-            saved = await find_saved_file(ctx.storage, ref)
-            if saved is not None:
-                try:
-                    file_bytes = await read_saved_file_bytes(ctx.storage, saved)
-                    mime_type = saved.mime_type or mime_type
-                except FileNotFoundError:
-                    logger.warning("Saved file missing from storage: %s", saved.path)
+            try:
+                saved = await find_saved_file(ctx.storage, ref)
+                if saved is not None:
+                    try:
+                        file_bytes = await read_saved_file_bytes(ctx.storage, saved)
+                        mime_type = saved.mime_type or mime_type
+                    except FileNotFoundError:
+                        logger.warning("Saved file missing from storage: %s", saved.path)
+            except ReconnectRequired as exc:
+                # The dead grant is Drive's, not AppFolio's.
+                return drive_reconnect_result(exc)
 
         if not file_bytes:
             missing.append(ref)

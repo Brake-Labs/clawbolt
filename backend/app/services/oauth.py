@@ -198,6 +198,18 @@ class PermanentRefreshError(Exception):
     """
 
 
+class TokenRefreshUnavailable(httpx.HTTPStatusError):
+    """The provider refused the access token (401) and no refresh could run.
+
+    Raised by a provider service when the mid-call refresh hook returns None,
+    most often because a peer held the refresh lock past the bounded wait.
+    That says nothing about the grant, so callers classify it as a transient
+    ``ToolErrorKind.SERVICE`` rather than as a dead connection. It is an
+    ``HTTPStatusError`` carrying the 401, so handlers that branch on a 401
+    must check for this type first.
+    """
+
+
 # A refresh grant an integration registers when its token endpoint does not
 # take the standard form-encoded, client-secret refresh. Takes the stored
 # refresh token and returns the token endpoint's payload (``access_token``,
@@ -1214,6 +1226,10 @@ class OAuthService:
         False for a transient error, leaving the token for a later retry. Shared
         by the inline path and the background sweep: a sweep that skipped this
         kept a dead token due for refresh and retried it on every tick, forever.
+
+        The notice never depends on this delete. By the time it runs the token
+        is usually gone already, and once it is gone nothing refreshes it again,
+        so a delete that raised here would leave the user never told.
         """
         if not self._is_permanent_refresh_failure(error):
             return False
@@ -1222,7 +1238,14 @@ class OAuthService:
             user_id,
             integration,
         )
-        await self.delete_token(user_id, integration)
+        try:
+            await self.delete_token(user_id, integration)
+        except Exception:
+            logger.exception(
+                "Could not delete dead OAuth token, notifying anyway: user=%s integration=%s",
+                user_id,
+                integration,
+            )
         await self._notify_reauth_needed(user_id, integration)
         return True
 

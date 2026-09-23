@@ -48,6 +48,7 @@ from backend.app.media.download import DownloadedMedia
 from backend.app.media.pipeline import process_message_media
 from backend.app.services.oauth import (
     ReconnectRequired,
+    TokenRefreshUnavailable,
     oauth_service,
     reconnect_instruction,
 )
@@ -390,6 +391,16 @@ def _dead_connection_result(exc: ReconnectRequired) -> ToolResult:
 
 
 def _handle_http_error(exc: httpx.HTTPStatusError, action: str) -> ToolResult:
+    if isinstance(exc, TokenRefreshUnavailable):
+        # The 401 stands only because a peer held the refresh lock, which
+        # says nothing about the grant. Retrying shortly should succeed.
+        logger.warning("Gmail token refresh could not run during %s", action)
+        return ToolResult(
+            content=f"Gmail could not renew its access while trying to {action}.",
+            is_error=True,
+            error_kind=ToolErrorKind.SERVICE,
+            hint="The connection is fine. Retry this call shortly.",
+        )
     status = exc.response.status_code
     body = ""
     with contextlib.suppress(Exception):
