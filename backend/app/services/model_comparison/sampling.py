@@ -427,6 +427,9 @@ def _history_for(
         current,
         fixture.tz_name,
         compact=history_mode == HistoryMode.COLD_START_COMPACTION,
+        # The rebuild keeps write results verbatim and reads this schema to
+        # tell them from reads, as the live renderer reads the turn's tools.
+        tools_by_name=fixture.tools_by_name,
         # The rows above the window seed the first row's time marker, as
         # ``load_conversation_history`` does for the live turn.
         preceding=preceding[:window_start],

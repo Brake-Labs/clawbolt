@@ -40,7 +40,7 @@ from backend.app.agent.skills.loader import load_all_skills
 from backend.app.agent.stores import ToolConfigStore
 from backend.app.agent.tool_assembly import assemble_turn_tools
 from backend.app.agent.tool_summary import append_receipts
-from backend.app.agent.tools.base import ToolTags
+from backend.app.agent.tools.base import Tool, ToolTags
 from backend.app.agent.tools.registry import (
     ToolContext,
     default_registry,
@@ -114,6 +114,9 @@ class PipelineContext:
     combined_context: str = ""
     conversation_history: list[AgentMessage] = field(default_factory=list)
     prompt_epoch: PromptEpoch | None = None
+    # Assembled ahead of the agent step when the history renderer needs to
+    # classify tool calls (see ``load_history_step``); ``run_agent`` reuses it.
+    turn_tools: TurnTools | None = None
     system_prompt_override: str | None = None
     is_onboarding: bool = False
     event_subscribers: list[Callable[[AgentEvent], Awaitable[None]]] = field(default_factory=list)
@@ -270,29 +273,29 @@ async def build_message_context(
     return combined_context
 
 
-async def run_agent(
+@dataclass
+class TurnTools:
+    """The tools one turn offers the model, and the context they close over."""
+
+    context: ToolContext
+    tools: list[Tool]
+    specialist_summaries: dict[str, str]
+    disabled_sub_tools: set[str]
+
+    @property
+    def by_name(self) -> dict[str, Tool]:
+        return {tool.name: tool for tool in self.tools}
+
+
+async def prepare_turn_tools(
     user: User,
     message: StoredMessage,
-    combined_context: str,
-    conversation_history: list[AgentMessage],
     storage: StorageBackend | None,
     to_address: str,
     downloaded_media: list[DownloadedMedia],
     channel: str = "",
-    system_prompt_override: str | None = None,
-    is_onboarding: bool = False,
-    event_subscribers: list[Callable[[AgentEvent], Awaitable[None]]] | None = None,
-    session_id: str = "",
-    request_id: str = "",
-    llm_override: UserLLMOverride | None = None,
-    drain_inbound: Callable[[], Awaitable[list[UserMessage]]] | None = None,
-    prompt_epoch: PromptEpoch | None = None,
-) -> AgentResponse:
-    """Initialize agent with tools and process the message.
-
-    Handles LLM-level errors (content filter, auth, unexpected) by returning
-    an error fallback AgentResponse.
-    """
+) -> TurnTools:
+    """Build the turn's tool context and the tool list the LLM will see."""
     from backend.app.bus import message_bus
 
     publish_outbound = message_bus.publish_outbound if channel else None
@@ -321,10 +324,59 @@ async def run_agent(
     await approval_store.ensure_complete(user.id)
     disabled_sub_tools = await approval_store.get_never_tool_names(user.id)
 
+    tools, specialist_summaries = await assemble_turn_tools(
+        tool_context,
+        disabled_factories=disabled_groups,
+        disabled_sub_tools=disabled_sub_tools,
+    )
+    return TurnTools(
+        context=tool_context,
+        tools=tools,
+        specialist_summaries=specialist_summaries,
+        disabled_sub_tools=disabled_sub_tools,
+    )
+
+
+async def run_agent(
+    user: User,
+    message: StoredMessage,
+    combined_context: str,
+    conversation_history: list[AgentMessage],
+    storage: StorageBackend | None,
+    to_address: str,
+    downloaded_media: list[DownloadedMedia],
+    channel: str = "",
+    system_prompt_override: str | None = None,
+    is_onboarding: bool = False,
+    event_subscribers: list[Callable[[AgentEvent], Awaitable[None]]] | None = None,
+    session_id: str = "",
+    request_id: str = "",
+    llm_override: UserLLMOverride | None = None,
+    drain_inbound: Callable[[], Awaitable[list[UserMessage]]] | None = None,
+    prompt_epoch: PromptEpoch | None = None,
+    turn_tools: TurnTools | None = None,
+) -> AgentResponse:
+    """Initialize agent with tools and process the message.
+
+    *turn_tools* is the turn's tools when an earlier step already built them
+    (see ``load_history_step``); otherwise they are built here.
+
+    Handles LLM-level errors (content filter, auth, unexpected) by returning
+    an error fallback AgentResponse.
+    """
+    if turn_tools is None:
+        turn_tools = await prepare_turn_tools(
+            user, message, storage, to_address, downloaded_media, channel=channel
+        )
+    tool_context = turn_tools.context
+    tools = turn_tools.tools
+    specialist_summaries = turn_tools.specialist_summaries
+    disabled_sub_tools = turn_tools.disabled_sub_tools
+
     agent = ClawboltAgent(
         user=user,
         channel=channel,
-        publish_outbound=publish_outbound,
+        publish_outbound=tool_context.publish_outbound,
         chat_id=to_address,
         tool_context=tool_context,
         registry=default_registry,
@@ -335,11 +387,6 @@ async def run_agent(
         drain_inbound=drain_inbound,
     )
 
-    tools, specialist_summaries = await assemble_turn_tools(
-        tool_context,
-        disabled_factories=disabled_groups,
-        disabled_sub_tools=disabled_sub_tools,
-    )
     agent.register_tools(tools)
 
     # Build onboarding prompt now that tools are available, so that tool
@@ -502,11 +549,24 @@ async def load_history_step(ctx: PipelineContext) -> PipelineContext:
         history_session = ctx.session.model_copy(update={"messages": [*earlier, ctx.message]})
     # Both prompt-cache settings need the epoch; only compaction changes
     # what the history renders. With both off this is the plain loader.
-    renderer = (
-        EpochHistoryRenderer(ctx.user.id, compact=settings.cold_start_compaction_enabled)
-        if settings.prompt_stable_prefix_enabled or settings.cold_start_compaction_enabled
-        else None
-    )
+    renderer: EpochHistoryRenderer | None = None
+    if settings.cold_start_compaction_enabled:
+        # The rebuild keeps write results verbatim, and tells a write from a
+        # read by the tools this turn offers, so they are built here and the
+        # agent step reuses them.
+        ctx.turn_tools = await prepare_turn_tools(
+            ctx.user,
+            ctx.message,
+            ctx.storage,
+            ctx.to_address,
+            ctx.downloaded_media,
+            channel=ctx.channel,
+        )
+        renderer = EpochHistoryRenderer(
+            ctx.user.id, compact=True, tools_by_name=ctx.turn_tools.by_name
+        )
+    elif settings.prompt_stable_prefix_enabled:
+        renderer = EpochHistoryRenderer(ctx.user.id, compact=False)
     ctx.conversation_history = await load_conversation_history(
         history_session, tz_name=ctx.user.timezone, render=renderer
     )
@@ -631,6 +691,7 @@ async def run_agent_step(ctx: PipelineContext) -> PipelineContext:
         llm_override=override,
         drain_inbound=_make_inbound_drain(ctx),
         prompt_epoch=ctx.prompt_epoch,
+        turn_tools=ctx.turn_tools,
     )
     return ctx
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -9,6 +10,8 @@ from pydantic import BaseModel
 
 if TYPE_CHECKING:
     from backend.app.agent.approval import ApprovalPolicy
+
+_logger = logging.getLogger(__name__)
 
 
 class ToolTags(StrEnum):
@@ -34,10 +37,11 @@ class ToolTags(StrEnum):
     ``manage_integration`` all write *without* being gated, so reading it the
     other way misses them.
 
-    The model comparison report is the consumer: it flags a candidate that
-    reaches for a mutating tool the live turn did not call, and it reads this
-    to tell production's writes from its lookups. See
-    ``model_comparison.checks.is_mutating_call``.
+    Two consumers read it through ``is_mutating_call``. The model comparison
+    report flags a candidate that reaches for a mutating tool the live turn
+    did not call, and reads this to tell production's writes from its
+    lookups. The cold-start history rebuild (``prompt_epoch``) stubs only the
+    old results of calls that read, and keeps every write's result verbatim.
     """
 
 
@@ -103,8 +107,8 @@ class Tool:
     reads and ``disable`` writes. Leave the tag off such a tool (untagged
     still means mutating) and set this to a predicate over the call's
     arguments that answers True for the actions that only read. The
-    model comparison report consults it through
-    ``model_comparison.checks.is_mutating_call``.
+    model comparison report and the cold-start history rebuild consult it
+    through ``is_mutating_call``.
     Never consulted for execution: it describes a call, it does not gate one.
     """
     precheck: Callable[[dict[str, Any]], str | None] | None = None
@@ -140,6 +144,41 @@ class Tool:
     for workspace document mutations (resolved per call), ``"user_outbound"``
     for reply senders, ``"user_integrations"`` for integration toggles.
     """
+
+
+def is_mutating_call(tool: Tool, args: dict[str, Any]) -> bool:
+    """Whether this call would change something real.
+
+    Untagged means mutating, which is why every read tool carries
+    ``ToolTags.READ_ONLY`` and ``test_every_tool_is_classified_read_or_write``
+    refuses to pass while one does not. A tool nobody classified is treated as
+    the dangerous case, so the cost of forgetting the tag is a false finding an
+    operator can dismiss rather than a real write nobody was shown.
+
+    The approval policy cannot answer this, in either direction.
+    ``ApprovalPolicy`` defaults ``default_level`` to ``ASK``, so most search
+    and list tools are gated too: reading the gate as "mutating" charged a
+    candidate with an unrequested write for running a saved-file search.
+    Reading it the other way is just as wrong, because ``write_file``,
+    ``edit_file``, ``update_heartbeat`` and ``manage_integration`` all write
+    without being gated, and a candidate that rewrote the user's MEMORY.md or
+    disconnected an integration raised nothing at all.
+
+    The tag classifies a whole tool, so a multi-action tool carries
+    ``Tool.read_only_when`` as well: ``manage_integration(action="status")``
+    only lists integrations, and charging it as a write buried the report in
+    findings over lookups. A predicate that raises answers "mutating", the
+    safe direction.
+    """
+    if ToolTags.READ_ONLY in tool.tags:
+        return False
+    if tool.read_only_when is None:
+        return True
+    try:
+        return not tool.read_only_when(args)
+    except Exception:
+        _logger.warning("read_only_when for %s raised; treating the call as mutating", tool.name)
+        return True
 
 
 def _inline_refs(schema: dict[str, Any]) -> dict[str, Any]:

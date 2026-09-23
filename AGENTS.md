@@ -182,7 +182,7 @@ When you need realistic-looking data, use clearly synthetic values: `jane.doe@ex
 - **Message bus**: async inbound/outbound queues in `bus.py`. Channels publish inbound messages; the agent publishes outbound replies. The ``ChannelManager`` dispatches outbound messages to the correct channel.
 - **Agent loop**: channel webhook -> media pipeline -> tool-calling loop (any-llm `amessages`) -> tool execution -> reply
 - **Memory**: Freeform per-user MEMORY.md managed via workspace tools, backed by `memory_documents` table with automatic compaction
-- **Prompt-cache epochs**: `backend/app/agent/prompt_epoch.py` owns the one definition of a cold start (the first message after the cache idled out, read from message timestamps) and what keys off it: the per-epoch workspace snapshot in the system block, and the cold-start history rebuild. Anything that renders history or the system block for the agent goes through it, so the cached prefix stays byte-identical inside an epoch
+- **Prompt-cache epochs**: `backend/app/agent/prompt_epoch.py` owns the one definition of a cold start (the first message after the cache idled out, read from message timestamps) and what keys off it: the per-epoch workspace snapshot in the system block, and the cold-start history rebuild. Anything that renders history or the system block for the agent goes through it, so the cached prefix stays byte-identical inside an epoch. The rebuild stubs only the results of calls that read (`tools.base.is_mutating_call`, against the turn's own tools); a write's result stays verbatim at any age, because it may be the only place the ID of what it made is written down
 - **Services**: External services abstracted behind service classes in `backend/app/services/`
 
 ## Multi-user mode
