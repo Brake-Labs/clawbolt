@@ -103,13 +103,27 @@ _QB_WRITE_CONCURRENCY_GROUP = "quickbooks_write"
 # up again instead of blindly retrying a "service unavailable".
 _INTUIT_NOT_FOUND_CODES = {"610"}
 
+# Intuit fault codes for a query QuickBooks refused to run: 4000 "Error
+# parsing query" (QueryParserError) and 4001 "Invalid query"
+# (QueryValidationError, e.g. "Property BillAddr not found for Entity
+# Customer"). The query is wrong, not the service. Surfaced as VALIDATION so
+# the model fixes the query and retries instead of telling the user
+# QuickBooks is down.
+_INTUIT_INVALID_QUERY_CODES = {"4000", "4001"}
+
+_INVALID_QUERY_HINT = (
+    "QuickBooks is working; this query is invalid. Fix it and retry: use SELECT * "
+    "instead of naming fields, or simplify the WHERE clause."
+)
+
 
 class QBQueryParams(BaseModel):
     """Parameters for the qb_query tool."""
 
     query: str = Field(
         description=(
-            "SELECT only, e.g. SELECT * FROM Invoice MAXRESULTS 20. Enum values often "
+            "SELECT only, e.g. SELECT * FROM Invoice MAXRESULTS 20. Use SELECT * for "
+            "addresses, emails, and phones. Enum values often "
             "gotten wrong:\n"
             "  Estimate.TxnStatus = 'Pending' | 'Accepted' | 'Closed' | 'Rejected'\n"
             "  Invoice.EmailStatus = 'NotSet' | 'NeedToSend' | 'EmailSent'\n"
@@ -196,12 +210,21 @@ def _fault_error_kind(exc: Exception) -> ToolErrorKind:
     SERVICE tells the model "temporarily unavailable, try a different
     approach", which is the wrong instruction: the id is wrong (or not
     visible yet) and the model should look it up rather than retry blind.
+
+    A 400 carrying 4000 or 4001 is a query QuickBooks could not parse or
+    validate: VALIDATION. Matching on the Intuit code rather than the bare
+    status keeps a failed token refresh (a 400 ``invalid_grant`` from the
+    OAuth endpoint, with no ``Fault`` body) out of this bucket. Everything
+    else (401/403 after the refresh retry, 429, 5xx, network errors, other
+    faults) stays SERVICE.
     """
-    if (
-        isinstance(exc, httpx.HTTPStatusError)
-        and _intuit_fault_codes(exc) & _INTUIT_NOT_FOUND_CODES
-    ):
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return ToolErrorKind.SERVICE
+    codes = _intuit_fault_codes(exc)
+    if codes & _INTUIT_NOT_FOUND_CODES:
         return ToolErrorKind.NOT_FOUND
+    if exc.response.status_code == 400 and codes & _INTUIT_INVALID_QUERY_CODES:
+        return ToolErrorKind.VALIDATION
     return ToolErrorKind.SERVICE
 
 
@@ -777,7 +800,12 @@ def create_quickbooks_tools(
         try:
             rows = await qb_service.query(normalized)
         except Exception as exc:
-            logger.exception("QuickBooks query failed")
+            error_kind = _fault_error_kind(exc)
+            if error_kind is ToolErrorKind.VALIDATION:
+                # The model's query was wrong; no stack trace needed.
+                logger.warning("QuickBooks rejected query: %s", exc)
+            else:
+                logger.exception("QuickBooks query failed")
             if isinstance(exc, httpx.HTTPStatusError):
                 error_str = _format_intuit_fault(exc, entity=entity_name)
             else:
@@ -785,7 +813,8 @@ def create_quickbooks_tools(
             return ToolResult(
                 content=f"QuickBooks query error: {error_str}",
                 is_error=True,
-                error_kind=ToolErrorKind.SERVICE,
+                error_kind=error_kind,
+                hint=_INVALID_QUERY_HINT if error_kind is ToolErrorKind.VALIDATION else "",
             )
 
         return ToolResult(content=_format_results(rows))

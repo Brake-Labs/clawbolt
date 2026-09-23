@@ -7,7 +7,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from backend.app.agent.tools.base import Tool
+from backend.app.agent.tool_errors import build_error_hint
+from backend.app.agent.tools.base import Tool, ToolErrorKind
 from backend.app.agent.tools.registry import ToolContext
 from backend.app.integrations.quickbooks.factory import (
     _describe_qb_query,
@@ -141,6 +142,123 @@ async def test_query_api_error(qb_service: MockQuickBooksService) -> None:
 
     assert result.is_error is True
     assert "error" in result.content.lower()
+
+
+def _query_tool_raising(qb_service: MockQuickBooksService, exc: Exception) -> Tool:
+    async def failing(query_str: str) -> list[dict]:
+        raise exc
+
+    qb_service.query = failing  # type: ignore[assignment]
+    return create_quickbooks_tools(qb_service)[0]
+
+
+def _intuit_fault(status: int, code: str, message: str, detail: str) -> httpx.HTTPStatusError:
+    request = httpx.Request("GET", "https://quickbooks.example.invalid/v3/company/1/query")
+    body = {
+        "Fault": {
+            "Error": [{"Message": message, "Detail": detail, "code": code}],
+            "type": "ValidationFault",
+        }
+    }
+    response = httpx.Response(status, json=body, request=request)
+    return httpx.HTTPStatusError(str(status), request=request, response=response)
+
+
+@pytest.mark.parametrize(
+    ("code", "message", "detail"),
+    [
+        (
+            "4001",
+            "Invalid query",
+            "QueryValidationError: Property BillAddr not found for Entity Customer",
+        ),
+        ("4000", "Error parsing query", 'QueryParserError: Encountered "<EOF>"'),
+    ],
+)
+async def test_query_invalid_query_fault_is_validation(
+    qb_service: MockQuickBooksService, code: str, message: str, detail: str
+) -> None:
+    """Regression: a 400 query fault was reported as SERVICE.
+
+    The SERVICE hint said QuickBooks was temporarily unavailable, so the model
+    never retried with SELECT * and told the user the lookup errored out.
+    """
+    tool = _query_tool_raising(qb_service, _intuit_fault(400, code, message, detail))
+
+    result = await tool.function(
+        query="SELECT DisplayName, BillAddr FROM Customer WHERE DisplayName LIKE '%Acme%'"
+    )
+
+    assert result.is_error is True
+    assert result.error_kind is ToolErrorKind.VALIDATION
+    assert f"code={code}" in result.content
+    hint = build_error_hint(result)
+    assert "SELECT *" in hint
+    assert "retry" in hint.lower()
+    assert "temporarily unavailable" not in hint
+    assert "temporarily unavailable" not in result.content
+
+
+@pytest.mark.parametrize("status", [500, 502, 503])
+async def test_query_server_error_stays_service(
+    qb_service: MockQuickBooksService, status: int
+) -> None:
+    request = httpx.Request("GET", "https://quickbooks.example.invalid/v3/company/1/query")
+    response = httpx.Response(status, content=b"<html>error</html>", request=request)
+    exc = httpx.HTTPStatusError(str(status), request=request, response=response)
+    tool = _query_tool_raising(qb_service, exc)
+
+    result = await tool.function(query="SELECT * FROM Customer")
+
+    assert result.error_kind is ToolErrorKind.SERVICE
+    assert result.hint == ""
+
+
+async def test_query_network_error_stays_service(qb_service: MockQuickBooksService) -> None:
+    request = httpx.Request("GET", "https://quickbooks.example.invalid/v3/company/1/query")
+    tool = _query_tool_raising(
+        qb_service, httpx.ConnectError("connection refused", request=request)
+    )
+
+    result = await tool.function(query="SELECT * FROM Customer")
+
+    assert result.error_kind is ToolErrorKind.SERVICE
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "message"),
+    [
+        (401, "3200", "message=AuthenticationFailed; errorCode=003200; statusCode=401"),
+        (403, "3100", "message=ApplicationAuthorizationFailed; errorCode=003100"),
+        (429, "3001", "message=ThrottleExceeded; errorCode=003001; statusCode=429"),
+    ],
+)
+async def test_query_auth_and_throttle_faults_unchanged(
+    qb_service: MockQuickBooksService, status: int, code: str, message: str
+) -> None:
+    tool = _query_tool_raising(qb_service, _intuit_fault(status, code, message, ""))
+
+    result = await tool.function(query="SELECT * FROM Customer")
+
+    assert result.error_kind is ToolErrorKind.SERVICE
+
+
+async def test_query_failed_token_refresh_stays_service(
+    qb_service: MockQuickBooksService,
+) -> None:
+    """A refresh rejected by the OAuth endpoint is a 400 with no Intuit Fault.
+
+    It must not be read as an invalid query: retrying the query cannot fix it.
+    """
+    request = httpx.Request("POST", "https://oauth.example.invalid/tokens/bearer")
+    response = httpx.Response(400, json={"error": "invalid_grant"}, request=request)
+    exc = httpx.HTTPStatusError("400", request=request, response=response)
+    tool = _query_tool_raising(qb_service, exc)
+
+    result = await tool.function(query="SELECT * FROM Customer")
+
+    assert result.error_kind is ToolErrorKind.SERVICE
+    assert result.hint == ""
 
 
 # -- Tool registration --
