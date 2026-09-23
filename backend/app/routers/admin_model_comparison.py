@@ -222,6 +222,17 @@ def _writes(raw: str) -> list[ComparisonWrite]:
                 if isinstance(entry.get("candidate_arguments"), dict)
                 else None
             ),
+            # Record IDs are the join between the two calls, not content, so
+            # they are served as recorded. Redacting them would leave the
+            # card unable to say the two writes hit the same job.
+            record_ids={
+                str(path): [str(value) for value in values]
+                for path, values in (entry.get("record_ids") or {}).items()
+                if isinstance(values, list)
+            },
+            differing_arguments=[
+                str(name) for name in (entry.get("differing_arguments") or []) if name
+            ],
         )
         for entry in _entries(raw)
     ]
@@ -265,14 +276,22 @@ def _turn_item(turn: ComparisonTurn) -> ComparisonTurnItem:
 
 # Drill-down ordering. The point of the report is the handful of turns an
 # operator acts on, so they come first and a hundred turns where the candidate
-# did what production did sit below them. A write production made and the
-# candidate did not reach outranks everything but a safety violation.
+# did what production did sit below them.
+#
+# A candidate that answered a turn with nothing at all is first: it is the
+# hardest failure on the page and the one that reads cleanest everywhere
+# else, since a turn with no output has nothing to flag. Then a write
+# production made and the candidate did not reach, then the two
+# different-arguments buckets, with "right record" below "wrong record".
 _OUTCOME_PRIORITY = {
-    str(TurnOutcome.WRITE_MISSED): 1,
-    str(TurnOutcome.WRITE_ARGS_DIFFER): 2,
-    str(TurnOutcome.NOT_REPLAYED): 3,
-    str(TurnOutcome.WRITE_MATCHED): 4,
-    str(TurnOutcome.NO_WRITE): 5,
+    str(TurnOutcome.NO_CANDIDATE_OUTPUT): 1,
+    str(TurnOutcome.WRITE_MISSED): 2,
+    str(TurnOutcome.WRITE_ARGS_DIFFER): 3,
+    str(TurnOutcome.WRITE_SAME_RECORD): 4,
+    str(TurnOutcome.NOT_REPLAYED): 5,
+    str(TurnOutcome.REPLAY_INCOMPLETE): 6,
+    str(TurnOutcome.WRITE_MATCHED): 7,
+    str(TurnOutcome.NO_WRITE): 8,
 }
 
 
@@ -287,7 +306,7 @@ def _turn_sort_key(turn: ComparisonTurn) -> tuple[int, int, int, int]:
     has_other_finding = 0 if _entries(turn.findings) else 1
     return (
         has_violation,
-        _OUTCOME_PRIORITY.get(turn.outcome, 6),
+        _OUTCOME_PRIORITY.get(turn.outcome, len(_OUTCOME_PRIORITY) + 1),
         has_other_finding,
         -turn.message_seq,
     )

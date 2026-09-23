@@ -28,9 +28,8 @@ class ComparisonRun(Base):
     A run replays the user's most recent turns through a candidate model and
     records what it decided beside what production actually did. It exists to
     give an operator something to read before moving a user to a different
-    model. It does not decide anything, and there is deliberately no verdict
-    column: the evaluator this replaced had one, and it was wrong in both
-    directions often enough that the operator stopped believing it.
+    model. There is deliberately no verdict column; the
+    ``services.model_comparison`` package docstring says why.
 
     ``summary_json`` holds the serialized summary (outcome buckets, finding
     counts per side, write-match counts, token and latency totals, notes). It

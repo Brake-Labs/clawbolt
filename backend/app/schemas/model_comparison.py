@@ -1,8 +1,8 @@
 """Model comparison: run lifecycle, per-turn reports, and run summaries.
 
-Nothing here carries a verdict, a recommendation or a score. The summary is
-counts: hard safety violations per side, how many of production's writes the
-candidate reached, what it cost and how long it took.
+Nothing on the wire carries a verdict or a score. The summary is counts: hard
+safety violations per side, how many of production's writes the candidate
+reached, what it cost and how long it took.
 
 The response models declare every field required, unlike the request model.
 A field with a default is optional in the exported spec, so the generated
@@ -57,8 +57,40 @@ class ComparisonModelTotals(BaseModel):
     # price-list entry). The reason is also spelled out in ``notes``.
     total_cost_usd: str | None
     cost_unavailable_reason: str
-    latency_p50_ms: float
-    latency_p95_ms: float
+    # ``None`` with no samples, never 0.0, for the same reason the cost is:
+    # a run where every call failed took no measurement, and a zero reads as
+    # an instantaneous model.
+    latency_p50_ms: float | None
+    latency_p95_ms: float | None
+
+
+class ComparisonProductionUsage(BaseModel):
+    """What the user's live loop billed over the window the run sampled.
+
+    The other half of the cost tile. Not a like-for-like total: the window is
+    the sampled turns' own timestamps, so it covers every call the live agent
+    made inside it, while the candidate's figure counts one decision per
+    turn. The console labels it as the user's spend over the same days rather
+    than as what the replay would have cost.
+
+    ``calls`` is 0 when there is nothing to show (no usage rows in the
+    window, no parseable sample timestamps, or the read failed), which the
+    console renders as unavailable.
+    """
+
+    calls: int
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
+    cache_creation_tokens: int
+    billed_prompt_tokens: int
+    # Summed over the priced rows only. ``None`` when none of them is priced.
+    total_cost_usd: str | None
+    # Rows behind an unpriced gateway, whose recorded cost is not a cost.
+    # Non-zero means the dollar figure covers only part of the window.
+    unpriced_calls: int
+    window_start: str
+    window_end: str
 
 
 class ComparisonSummary(BaseModel):
@@ -67,6 +99,10 @@ class ComparisonSummary(BaseModel):
     Counts and totals. A reader who wants a recommendation reads the turns.
     """
 
+    # Turns the run *attempted*: every turn it sampled plus every turn it
+    # could not replay. Not the size of the user's history, and not
+    # necessarily ``requested_samples``, which a run that stopped early never
+    # reached.
     turns_total: int
     turns_replayed: int
     turns_failed: int
@@ -85,16 +121,28 @@ class ComparisonSummary(BaseModel):
     production_violations: int
     production_checked_findings: list[str]
 
-    # Task outcome on write turns. ``writes_args_differ`` is its own bucket
-    # because a rephrased message body and a note filed against the wrong job
-    # both land there, and only one of those is a problem.
+    # Task outcome on write turns, one entry per write production made.
+    # ``writes_matched`` is agreement on the whole validated argument set;
+    # ``writes_same_record`` is the right record with different arguments;
+    # ``writes_args_differ`` is the tool called against something else;
+    # ``writes_not_reached`` is a turn whose replay ran out of lookup rounds,
+    # so the candidate was never asked. The last is excluded from
+    # ``writes_measured``, which is the rate's denominator, because an
+    # unfinished measurement is not a failure to write.
     writes_total: int
     writes_matched: int
+    writes_same_record: int
     writes_args_differ: int
     writes_missed: int
+    writes_not_reached: int
+    writes_measured: int
+    # ``writes_matched / writes_measured``. Full-argument agreement only:
+    # reaching the right record with different arguments is its own bucket
+    # and is deliberately not in this number.
     write_match_rate: float
 
     candidate: ComparisonModelTotals
+    production: ComparisonProductionUsage
     # Caveats about the measurement: unavailable pricing and why, turns that
     # could not be replayed, calls naming a tool the current schema lacks.
     # Never about the candidate.
@@ -202,10 +250,16 @@ class ComparisonWrite(BaseModel):
 
     tool_name: str
     outcome: str
-    # The arguments compared: the write's record IDs, or its whole validated
-    # argument set when it has none. See ``report.key_arguments``.
+    # Production's whole validated argument set: what the candidate's call
+    # had to agree with to be ``matched``. See ``report.compare_writes``.
     key_arguments: dict[str, Any]
     candidate_arguments: dict[str, Any] | None
+    # The write's record IDs, by parameter path. Empty when it carries none,
+    # which is what makes ``same_record_different_args`` unreachable for it.
+    record_ids: dict[str, list[str]]
+    # Parameters whose values differ between the two calls, so the card can
+    # name them instead of leaving the reader to diff two JSON blobs.
+    differing_arguments: list[str]
 
 
 class ComparisonTurnItem(BaseModel):

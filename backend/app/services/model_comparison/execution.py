@@ -92,10 +92,21 @@ def _needs_truncation_retry(result: ModelCallResult, max_tokens: int) -> bool:
 
 
 # Extra rounds a replay may spend on lookups before its decision is recorded.
-# Production runs up to ``MAX_TOOL_ROUNDS``, but a lookup-then-act turn needs
-# one or two, and every round is another paid call. A model still looking
-# things up after this many is reported on the lookup it asked for.
-MAX_REPLAY_READ_ROUNDS = 3
+#
+# Production allows ``settings.max_tool_rounds`` (15). This is deliberately
+# lower, because every round is another paid call on every turn that uses it,
+# and it is deliberately not 3, which is where it sat while a capped turn was
+# reported as a missed write. Six covers the chains this deployment's
+# transcripts actually contain: disambiguate the customer, find their job,
+# pull the invoice, then write is four, and the turns that need more than
+# that are the ones where the operator wants to know the candidate wandered.
+#
+# A turn that still hits it is now reported as ``REPLAY_INCOMPLETE`` with its
+# writes ``NOT_REACHED``, so the cap being reached is visible on the report
+# rather than scored as a failure to write. That is what makes the number
+# tunable: a run whose incomplete count is high says to raise it, and before
+# this change the same run said the candidate did not write.
+MAX_REPLAY_READ_ROUNDS = 6
 
 
 async def call_model(
@@ -129,6 +140,11 @@ async def call_model(
     the replay, and that response is the decision recorded. Without
     *tools_by_name* the replay is single-round.
 
+    A model still asking for replayable lookups when the cap hits sets
+    ``hit_read_round_cap``. Its recorded decision is a read the replay
+    declined to answer, not an answer to the turn, and the report separates
+    the two rather than reading the read as a write the candidate skipped.
+
     Two budget rules keep the replay from charging a model for limits
     production does not impose. A thinking budget at or above ``max_tokens``
     raises ``max_tokens`` to fit it (``fit_max_tokens_to_reasoning``, which
@@ -150,9 +166,16 @@ async def call_model(
             _add_usage(result, spent)
             result.truncation_retries += spent.truncation_retries
         result.replayed_lookups = list(lookups)
-        if tools_by_name is None or round_number == MAX_REPLAY_READ_ROUNDS:
+        if tools_by_name is None:
             return result
         fed = replayable_lookups(result, tools_by_name, recorded)
+        if round_number == MAX_REPLAY_READ_ROUNDS:
+            # ``fed`` is asked even on the last round, for its answer alone:
+            # a model that would have continued was cut off by the cap rather
+            # than deciding, and the report must say so instead of reading
+            # its lookup as a refusal to write.
+            result.hit_read_round_cap = fed is not None
+            return result
         if fed is None:
             return result
         messages.extend(_lookup_round_messages(result, fed, round_number))

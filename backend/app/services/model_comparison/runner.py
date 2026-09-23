@@ -21,11 +21,12 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import cast
 
 from sqlalchemy import CursorResult, func, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from backend.app.config import settings
 from backend.app.database import db_session_async
@@ -34,10 +35,15 @@ from backend.app.services.llm_endpoints import resolve_target
 from backend.app.services.llm_service import LLMTarget
 from backend.app.services.model_comparison import checks, report
 from backend.app.services.model_comparison.execution import call_model
+from backend.app.services.model_comparison.production_usage import (
+    ProductionUsage,
+    read_production_usage,
+)
 from backend.app.services.model_comparison.sampling import (
     ReplayFixture,
     assemble_for_sample,
     build_fixture,
+    sample_clock,
     select_samples,
 )
 from backend.app.services.model_comparison.types import (
@@ -218,6 +224,8 @@ def _turn_row(run_id: int, turn: TurnReport) -> ComparisonTurn:
                     "outcome": str(write.outcome),
                     "key_arguments": write.key_arguments,
                     "candidate_arguments": write.candidate_arguments,
+                    "record_ids": write.record_ids,
+                    "differing_arguments": list(write.differing_arguments),
                 }
                 for write in turn.writes
             ],
@@ -263,7 +271,7 @@ async def _replay_turn(
         *checks.check_candidate(
             candidate,
             fixture.tools_by_name,
-            production_tool_names=sample.production_tool_names,
+            production_calls=sample.production_tool_calls,
             seen=seen,
         ),
         *checks.check_production(sample.production_tool_calls, fixture.tools_by_name, seen=seen),
@@ -272,10 +280,38 @@ async def _replay_turn(
     return TurnReport(
         sample=sample,
         candidate=candidate,
-        outcome=report.turn_outcome(candidate, writes),
+        outcome=report.turn_outcome(candidate, writes, production_acted=sample.production_acted),
         issues=issues,
         writes=writes,
     )
+
+
+async def _production_window(user_id: str, samples: Sequence[ReplaySample]) -> ProductionUsage:
+    """What the user's live loop billed across the days the samples span.
+
+    Bounded by the first and last sampled turn's own timestamps rather than
+    by a fixed lookback, so the two sides of the cost tile describe the same
+    stretch of the user's history.
+
+    A sample whose stored timestamp will not parse is skipped rather than
+    widening the window to wall time: a bad row must not turn "these forty
+    turns" into "everything since the epoch". With none of them parseable
+    there is no window and the usage comes back empty, which the console
+    renders as "not available".
+    """
+    stamps = sorted(filter(None, (sample_clock(s) for s in samples)))
+    if not stamps:
+        logger.info(
+            "No parseable sample timestamps for user %s; skipping production usage", user_id
+        )
+        return ProductionUsage()
+    try:
+        async with db_session_async() as db:
+            return await read_production_usage(db, user_id, start=stamps[0], end=stamps[-1])
+    except SQLAlchemyError:
+        # A caveat on the cost tile is not worth failing a finished run for.
+        logger.exception("Could not read production usage for user %s", user_id)
+        return ProductionUsage()
 
 
 async def execute_run(run_id: int, *, concurrency: int) -> None:
@@ -421,7 +457,12 @@ async def execute_run(run_id: int, *, concurrency: int) -> None:
         raise
 
     turns.sort(key=lambda t: t.sample.seq)
-    summary = report.aggregate(turns, target=target, endpoint=run.candidate_endpoint)
+    summary = report.aggregate(
+        turns,
+        target=target,
+        endpoint=run.candidate_endpoint,
+        production=await _production_window(run.user_id, samples),
+    )
     if breaker_error:
         # The evidence gathered before the provider went down is kept and
         # still readable. It is a fraction of what was asked for, which the
@@ -456,6 +497,7 @@ def _summary_payload(summary: report.RunSummary) -> dict:
     for never silently rewrites the numbers on a run an operator already read.
     """
     totals = summary.candidate
+    live = summary.production
     return {
         "turns_total": summary.turns_total,
         "turns_replayed": summary.turns_replayed,
@@ -468,8 +510,11 @@ def _summary_payload(summary: report.RunSummary) -> dict:
         "production_checked_findings": sorted(str(f) for f in PRODUCTION_CHECKED),
         "writes_total": summary.writes_total,
         "writes_matched": summary.writes_matched,
+        "writes_same_record": summary.writes_same_record,
         "writes_args_differ": summary.writes_args_differ,
         "writes_missed": summary.writes_missed,
+        "writes_not_reached": summary.writes_not_reached,
+        "writes_measured": summary.writes_measured,
         "write_match_rate": round(summary.write_match_rate, 4),
         "candidate": {
             "provider": totals.provider,
@@ -480,14 +525,31 @@ def _summary_payload(summary: report.RunSummary) -> dict:
             "cache_creation_tokens": totals.cache_creation_tokens,
             "billed_prompt_tokens": totals.billed_prompt_tokens,
             # ``None``, never "0.000000". A zero here reads as a measurement,
-            # and for a gateway model name it never is one.
+            # and for a gateway model name it never is one. The latencies are
+            # ``None`` for the same reason when no call came back.
             "total_cost_usd": None if totals.total_cost is None else str(totals.total_cost),
             "cost_unavailable_reason": totals.cost_unavailable_reason,
-            "latency_p50_ms": round(totals.percentile_latency_ms(0.50), 1),
-            "latency_p95_ms": round(totals.percentile_latency_ms(0.95), 1),
+            "latency_p50_ms": _rounded(totals.percentile_latency_ms(0.50)),
+            "latency_p95_ms": _rounded(totals.percentile_latency_ms(0.95)),
+        },
+        "production": {
+            "calls": live.calls,
+            "input_tokens": live.input_tokens,
+            "output_tokens": live.output_tokens,
+            "cache_read_tokens": live.cache_read_tokens,
+            "cache_creation_tokens": live.cache_creation_tokens,
+            "billed_prompt_tokens": live.billed_prompt_tokens,
+            "total_cost_usd": None if live.total_cost is None else str(live.total_cost),
+            "unpriced_calls": live.unpriced_calls,
+            "window_start": live.window_start,
+            "window_end": live.window_end,
         },
         "notes": summary.notes,
     }
+
+
+def _rounded(value: float | None) -> float | None:
+    return None if value is None else round(value, 1)
 
 
 async def mark_interrupted_runs() -> None:

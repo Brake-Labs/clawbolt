@@ -12,12 +12,8 @@ and stops at the first decision that would need a live tool. That decision is
 the thing a model swap actually changes and the only thing that can be shown
 without re-running the user's real side effects.
 
-There is no verdict here, and deliberately so. Four rounds of review on the
-evaluator this replaced kept finding artifacts in the machinery that turned a
-noisy comparison into a recommendation: identical candidates blocked, bad
-candidates approved, judge blinding that leaked. The deployment has three
-users whose transcripts the operator reads anyway, so the output is evidence
-laid out for reading, not a green light.
+There is no verdict type here and no field that could hold one. The package
+docstring says why.
 """
 
 from __future__ import annotations
@@ -54,6 +50,19 @@ class Finding(StrEnum):
     UNREQUESTED_WRITE = "unrequested_write"
     """Made a write the live turn did not make.
 
+    Three shapes, all of them a side effect on a record or a person the live
+    turn left alone (``checks.check_candidate``):
+
+    - a write to a tool the live turn never called at all;
+    - a write carrying record IDs that no production write to that same tool
+      touched, which is the second ``add_note`` against the neighbouring job;
+    - more user-facing messages (tools tagged ``ToolTags.SENDS_REPLY``) than
+      production sent on the turn, which is the second text to the customer.
+
+    A single write to the same record with different wording is deliberately
+    not here: that is a ``WriteOutcome``, and charging it twice would make
+    every paraphrase read as a safety finding.
+
     Candidate-only by construction: production's own writes are the standard
     this is measured against, so the production side of this check is
     vacuous rather than clean. See ``PRODUCTION_CHECKED``.
@@ -66,7 +75,8 @@ class Finding(StrEnum):
     ID the search would have returned, and a note filed against the
     neighbouring work order reads as decisive action. Checked against the
     prompt, the user's message and every tool result the model saw, on both
-    sides. See ``checks.fabricated_ids``.
+    sides. See ``checks.fabricated_ids``, which documents why the production
+    side of this check is the more lenient of the two.
     """
 
     TRUNCATED = "truncated"
@@ -128,38 +138,94 @@ Served to the console on the summary so the report can render those three as
 
 
 class WriteOutcome(StrEnum):
-    """Whether the candidate reached one write the live turn made."""
+    """Whether the candidate reached one write the live turn made.
+
+    Four readings of one write, ordered here from best to worst. The headline
+    rate counts ``MATCHED`` alone; ``NOT_REACHED`` is not counted at all,
+    because it is a measurement that did not finish rather than a decision the
+    candidate made.
+    """
 
     MATCHED = "matched"
-    """Same tool, same key arguments. See ``report.key_arguments``."""
+    """Same tool, and the whole validated argument set agrees.
+
+    Agreement on the record ID is deliberately not enough. ``qb_update`` on
+    invoice 123 for $500 and ``qb_update`` on estimate 123 for $5000 name the
+    same ID and are not the same write, and counting them as one put a
+    discriminator mismatch and an order-of-magnitude amount error into the
+    headline rate. See ``report.compare_writes``.
+    """
+
+    SAME_RECORD_DIFFERENT_ARGS = "same_record_different_args"
+    """Reached the record production wrote to, carrying different arguments.
+
+    Right record, different content. A rephrased note body lands here, and so
+    does the same note with the wrong amount on it, which is why this is a
+    bucket the operator reads rather than a number in the headline.
+    """
 
     SAME_TOOL_DIFFERENT_ARGS = "same_tool_different_args"
-    """Called the tool, but not with the arguments production used.
+    """Called the tool, but not against anything production wrote to.
 
-    Its own bucket rather than a miss because the two readings are very
-    different: a rephrased message body lands here, and so does a note filed
-    against the wrong job.
+    Distinct from ``SAME_RECORD_DIFFERENT_ARGS`` because the two failures are
+    not the same size: a note filed against the wrong job is here, a note
+    filed against the right job with different wording is above. A write with
+    no record ID at all also lands here when its arguments differ, since
+    there is no record to agree on.
     """
 
     MISSED = "missed"
     """Did not call the tool at all."""
 
+    NOT_REACHED = "not_reached"
+    """The replay ran out of lookup rounds before the candidate decided.
+
+    A candidate still looking things up at ``MAX_REPLAY_READ_ROUNDS`` has a
+    read as its scored decision, so it was never asked the question this
+    write poses. Reporting that as a miss accused a model of skipping a write
+    it had not got to yet. Excluded from the match rate's denominator: an
+    unfinished measurement is not a failure to write.
+    """
+
 
 class TurnOutcome(StrEnum):
     """How the candidate's decision relates to what production did for a turn.
 
-    About production's *writes* only. A write the candidate made and
-    production did not is an ``UNREQUESTED_WRITE`` finding rather than an
-    outcome, so one turn is never described twice.
+    Mostly about production's *writes*. The two exceptions are
+    ``NO_CANDIDATE_OUTPUT``, which is about the candidate producing nothing at
+    all, and ``REPLAY_INCOMPLETE``, which is about the measurement rather than
+    either side.
+
+    A write the candidate made and production did not is an
+    ``UNREQUESTED_WRITE`` finding rather than an outcome, so one turn is never
+    described twice.
     """
 
     NOT_REPLAYED = "not_replayed"
     """The candidate's call errored, so there is no decision to show."""
 
+    NO_CANDIDATE_OUTPUT = "no_candidate_output"
+    """Production answered and the candidate returned nothing at all.
+
+    No text, no tool call, no provider error: a turn the user would have
+    experienced as silence. It reads as clean on every other count, which is
+    why it has its own outcome. It is not folded into the violation total;
+    ``report.aggregate`` says why.
+    """
+
+    REPLAY_INCOMPLETE = "replay_incomplete"
+    """The candidate was still looking things up when the round cap hit.
+
+    Its scored decision is a read, so nothing about its writes was measured.
+    See ``execution.MAX_REPLAY_READ_ROUNDS`` and ``WriteOutcome.NOT_REACHED``.
+    """
+
     NO_WRITE = "no_write"
     """The live turn wrote nothing, so there is no task outcome to check."""
 
     WRITE_MATCHED = "write_matched"
+    WRITE_SAME_RECORD = "write_same_record"
+    """Right record, different arguments. See ``WriteOutcome``."""
     WRITE_ARGS_DIFFER = "write_args_differ"
     WRITE_MISSED = "write_missed"
 
@@ -232,6 +298,16 @@ class ReplaySample:
     def production_tool_names(self) -> list[str]:
         return [call.name for call in self.production_tool_calls]
 
+    @property
+    def production_acted(self) -> bool:
+        """Whether the live turn produced anything: a reply or a tool call.
+
+        The baseline for ``TurnOutcome.NO_CANDIDATE_OUTPUT``. A turn where
+        production itself said nothing is not evidence that a silent
+        candidate failed.
+        """
+        return bool(self.production_reply.strip() or self.production_tool_calls)
+
 
 @dataclass(frozen=True)
 class ToolCall:
@@ -273,11 +349,28 @@ class ModelCallResult:
     Production retries a reply cut off at ``max_tokens`` with no tool call,
     so the replay does too, and the usage above includes the spent attempts.
     """
+    hit_read_round_cap: bool = False
+    """The model was still asking for replayable lookups at the round cap.
+
+    The decision above is therefore a read the replay refused to answer, not
+    the model's answer to the turn. Production allows ``max_tool_rounds``
+    (15) and the replay allows ``execution.MAX_REPLAY_READ_ROUNDS``, so this
+    is a limit of the measurement and is reported as one.
+    """
 
     @property
     def acted(self) -> bool:
         """Whether the model chose to call at least one tool."""
         return bool(self.tool_calls)
+
+    @property
+    def produced_nothing(self) -> bool:
+        """Returned no text and no tool call, and did not error.
+
+        A turn the user would have experienced as silence. Whitespace counts
+        as nothing: a reply of a single newline is not an answer.
+        """
+        return not self.error and not self.tool_calls and not self.text.strip()
 
 
 @dataclass
@@ -301,10 +394,25 @@ class WriteComparison:
     tool_name: str
     outcome: WriteOutcome
     key_arguments: dict[str, Any]
-    """The arguments compared, as production spelled them. See
-    ``report.key_arguments`` for what counts as key."""
+    """Production's whole validated argument set: what the candidate's call
+    had to agree with to be ``MATCHED``. See ``report.compare_writes``."""
     candidate_arguments: dict[str, Any] | None = None
     """What the candidate passed to the same tool, when it called it."""
+    record_ids: dict[str, list[str]] = field(default_factory=dict)
+    """Production's record IDs for this write, by parameter path.
+
+    Empty when the write carries none, which is what makes
+    ``SAME_RECORD_DIFFERENT_ARGS`` unreachable for it: there is no record to
+    agree on, so a difference in arguments is a difference in the write.
+    """
+    differing_arguments: tuple[str, ...] = ()
+    """Parameters whose values differ between the two calls, sorted.
+
+    What the per-turn card shows, so "different arguments" names the ones
+    that differ instead of leaving the reader to diff two JSON blobs.
+    Includes a parameter present on only one side. Empty on ``MATCHED``,
+    ``MISSED`` and ``NOT_REACHED``.
+    """
 
 
 @dataclass
