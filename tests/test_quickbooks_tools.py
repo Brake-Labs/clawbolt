@@ -243,12 +243,14 @@ async def test_query_auth_and_throttle_faults_unchanged(
     assert result.error_kind is ToolErrorKind.SERVICE
 
 
-async def test_query_failed_token_refresh_stays_service(
+async def test_query_400_without_intuit_fault_is_not_validation(
     qb_service: MockQuickBooksService,
 ) -> None:
-    """A refresh rejected by the OAuth endpoint is a 400 with no Intuit Fault.
+    """A 400 with no Intuit Fault must not be read as an invalid query.
 
-    It must not be read as an invalid query: retrying the query cannot fix it.
+    The service turns a dead grant into ``ReconnectRequired`` (AUTH, see
+    ``test_quickbooks_reconnect.py``); a raw 400 like this one reaching the
+    tool is unexplained, and retrying the query cannot fix it.
     """
     request = httpx.Request("POST", "https://oauth.example.invalid/tokens/bearer")
     response = httpx.Response(400, json={"error": "invalid_grant"}, request=request)
