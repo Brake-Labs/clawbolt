@@ -75,7 +75,7 @@ function money(totals: { total_cost_usd: string | null }): string {
  *
  * Not a like-for-like figure and the hint says so: the window covers every
  * call the live agent made inside it, including tool rounds the replay never
- * reached, while the candidate's number counts one decision per turn. It is
+ * reached, while the candidate's number covers the sampled turns only. It is
  * here because a candidate cost with nothing beside it reads as what the
  * deployment would pay, and that comparison was never on the page.
  */
@@ -195,7 +195,12 @@ function SummaryGrid({ summary }: { summary: ComparisonSummary }) {
         }
         hint={
           summary.writes_measured
-            ? `${pct(summary.write_match_rate)} matched on every argument, ${summary.writes_same_record} same record with different arguments, ${summary.writes_args_differ} same tool only, ${summary.writes_missed} not made`
+            ? // ``writes_not_reached`` is named here, not only in the note below.
+              // The denominator is the measured writes, so a run that ran out of
+              // lookup rounds on its hard turns reports a rate over what was
+              // left, and a reader who cannot see how many dropped out reads
+              // that rate as the whole sample.
+              `${pct(summary.write_match_rate)} matched on every argument, ${summary.writes_same_record} same record with different arguments, ${summary.writes_args_differ} same tool only, ${summary.writes_missed} not made${summary.writes_not_reached ? `, ${summary.writes_not_reached} not measured` : ''}`
             : summary.writes_total
               ? `${summary.writes_total} write(s), none measured: every replay ran out of lookup rounds`
               : 'The live turns in this sample wrote nothing'

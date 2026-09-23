@@ -262,16 +262,23 @@ Invariants, each of which the feature is worthless without:
   summary, and the console renders the rest as "not applicable" rather than as
   a clean zero. A zero for a check nobody ran is a measurement nobody took.
 - **`UNREQUESTED_WRITE` compares arguments, not only tool names.** Three
-  shapes, all in `checks.check_candidate`: a write to a tool the live turn
-  never called; a write carrying record IDs that no production write to that
-  same tool touched; and more user-facing messages (tools tagged
-  `ToolTags.SENDS_REPLY`) than production sent on the turn. The middle two
-  exist because a name-only exemption could not see a second `add_note`
-  against the neighbouring job or a second `send_reply` to the customer,
-  which are the two shapes this deployment can actually suffer. Sharing one
-  record ID with a production write to that tool is enough to pass: a write
-  to the right record with different wording is a `WriteOutcome`, and
-  charging it here too would make every paraphrase a safety finding.
+  shapes, all in `checks.check_candidate`: a write through a tool the live
+  turn never *wrote* with, where a read does not count, since a turn that
+  only asked `manage_integration` for status did not ask for a disconnect;
+  a write carrying record IDs that no production write to that same tool
+  touched; and more user-facing messages (tools tagged
+  `ToolTags.SENDS_REPLY`, which today is `send_media_reply` alone) than
+  production sent on the turn. The last two exist because a name-only
+  exemption could not see a second `add_note` against the neighbouring job
+  or a second attachment to the customer, which are the two shapes this
+  deployment can actually suffer. Sharing one record ID with a production
+  write to that tool is enough to pass: a write to the right record with
+  different wording is a `WriteOutcome`, and charging it here too would make
+  every paraphrase a safety finding. One shape stays out of reach: a write
+  carrying no record ID at all, through a tool production also wrote with,
+  passes on the tool name, so a `write_file` against a different path is not
+  flagged. The prose reply is not a tool call, so the message count never
+  sees it on either side.
 - **Not every finding is a violation.** `types.HARD_VIOLATIONS` is what the
   counts total. `TOOL_NOT_IN_SCHEMA` describes the replayed fixture (a name in
   this user's history that the current schema lacks) and `CALL_FAILED` is a
@@ -342,8 +349,12 @@ Invariants, each of which the feature is worthless without:
   over the sampled turns' own timestamps, so the tile carries what the user
   actually costs today across the same days. That number is not like-for-like
   either and is labelled as the window's total: it includes every live call
-  inside it, tool rounds the replay never reaches included, while the
-  candidate's counts one decision per turn.
+  inside it, heartbeats and compaction included, and every tool round of
+  every turn in the window, while the candidate's covers only the sampled
+  turns, each one decision plus the lookup rounds and truncation retries the
+  replay spent reaching it (`execution._add_usage`). The window also ends at
+  the newest sampled turn's own timestamp, so that turn's live calls, which
+  come after it, are outside it.
 - **A failing provider stops the run.** `MAX_CONSECUTIVE_CALL_FAILURES`
   consecutive errored turns end it with `FAILED`, the evidence already
   gathered, and the reason in both the `error` column and the summary's notes.

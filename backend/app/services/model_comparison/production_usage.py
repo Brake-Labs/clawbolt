@@ -33,7 +33,11 @@ class ProductionUsage:
     It is not a like-for-like total and must not be rendered as one. The
     window is the sampled turns' own timestamps, so it includes every call
     the live agent made inside it: the tool rounds a replay never reaches,
-    heartbeats, compaction. The replay's figure counts one decision per turn.
+    heartbeats, compaction. The replay's figure covers the sampled turns
+    only, each one decision plus whatever lookup rounds and truncation
+    retries it spent reaching that decision. The window also ends at the
+    newest sampled turn's own timestamp, so that turn's live calls, which
+    come after it, are outside it.
     It answers "what does this user cost today, over the same days", which is
     the question an operator weighing a switch is actually asking.
     """

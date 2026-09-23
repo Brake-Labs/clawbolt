@@ -53,11 +53,20 @@ class Finding(StrEnum):
     Three shapes, all of them a side effect on a record or a person the live
     turn left alone (``checks.check_candidate``):
 
-    - a write to a tool the live turn never called at all;
+    - a write through a tool the live turn never *wrote* with. A read does
+      not count: a live turn that only asked ``manage_integration`` for
+      status did not ask for a disconnect;
     - a write carrying record IDs that no production write to that same tool
       touched, which is the second ``add_note`` against the neighbouring job;
-    - more user-facing messages (tools tagged ``ToolTags.SENDS_REPLY``) than
-      production sent on the turn, which is the second text to the customer.
+    - more user-facing messages (tools tagged ``ToolTags.SENDS_REPLY``, which
+      today is ``send_media_reply`` alone) than production sent on the turn,
+      which is the second attachment to the customer. The ordinary prose
+      reply is not a tool call, so neither side's is counted here.
+
+    One shape is deliberately out of reach: a write carrying no record ID at
+    all, through a tool production also wrote with, passes on the tool name.
+    ``write_file`` against a different path is the case that matters, and
+    nothing on the call says which record it names.
 
     A single write to the same record with different wording is deliberately
     not here: that is a ``WriteOutcome``, and charging it twice would make
@@ -140,10 +149,12 @@ Served to the console on the summary so the report can render those three as
 class WriteOutcome(StrEnum):
     """Whether the candidate reached one write the live turn made.
 
-    Four readings of one write, ordered here from best to worst. The headline
-    rate counts ``MATCHED`` alone; ``NOT_REACHED`` is not counted at all,
-    because it is a measurement that did not finish rather than a decision the
-    candidate made.
+    Four readings of the candidate's decision, ordered here from best to
+    worst, and a fifth for a turn where there was no decision to read.
+    The headline rate counts ``MATCHED`` alone; ``NOT_REACHED`` is not
+    counted at all, because it is a measurement that did not finish rather
+    than a decision the candidate made, which is also why it sits outside
+    that ordering rather than below ``MISSED`` in it.
     """
 
     MATCHED = "matched"

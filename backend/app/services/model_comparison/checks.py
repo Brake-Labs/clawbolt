@@ -318,8 +318,20 @@ def _reply_count(
 
     ``ToolTags.SENDS_REPLY`` is the same tag the concurrency rules use for
     the outbound stream, so a new reply tool is covered the day it is
-    registered. A call the tool would refuse is not a message and is left out
-    by the caller, which only reaches here with calls that validated.
+    registered. Validity is not re-checked here. The candidate's refused
+    calls are filtered out by the caller, and production's are deliberately
+    not: a recorded call is judged against *today's* params models, which
+    ``check_production`` documents as drift rather than misbehaviour, and
+    dropping a drifted production reply from this count would charge the
+    candidate with an unrequested write it did not make. The cost is the
+    other direction, and it is the narrower one: a live turn whose media
+    reply the tool refused still raises the bar by one.
+
+    It counts tool calls only. The agent's ordinary prose reply is
+    ``AgentResponse.reply_text``, dispatched by ``router`` rather than by a
+    tool, so neither side's is counted and it cancels out. What this catches
+    is an extra attachment on top of that: ``send_media_reply`` is the only
+    tool carrying the tag today.
     """
     total = 0
     for name, args in calls:
@@ -350,10 +362,13 @@ def check_candidate(
 
     The arguments matter and not only the names. A check that exempted every
     write to a tool production also used could not see a second ``add_note``
-    against the neighbouring job or a second ``send_reply`` to the customer,
-    which are the two shapes of unrequested write this deployment can
-    actually suffer. Both are checked here, against the record IDs
+    against the neighbouring job or a second ``send_media_reply`` to the
+    customer, which are the two shapes of unrequested write this deployment
+    can actually suffer. Both are checked here, against the record IDs
     production's own writes carried and against how many messages it sent.
+    ``send_media_reply`` is the only tool tagged ``ToolTags.SENDS_REPLY``, so
+    the message count is about an extra attachment: the ordinary prose reply
+    is not a tool call and neither side's is counted.
 
     A single write to the same record with different wording stays unflagged.
     It is a ``WriteOutcome``, the operator reads it as one, and charging it
@@ -418,9 +433,9 @@ def _extra_message_issues(
     """One finding when the candidate sent the user more messages than production.
 
     Counted rather than compared call by call, because the per-call check
-    cannot see this: every one of three ``send_reply`` calls is to a tool
-    production also used, and each is individually exempt. What the user
-    experiences is three texts where they got one.
+    cannot see this: every one of three ``send_media_reply`` calls is to a
+    tool production also used, and each is individually exempt. What the user
+    experiences is three attachments where they got one.
 
     *candidate_calls* is only the calls the per-call pass left uncharged, so
     a reply already reported as unrequested is not reported twice.
@@ -503,19 +518,26 @@ def _unrequested_write_issue(
     name: str,
     arguments: dict[str, Any],
     *,
-    recorded: set[str],
     written_ids: dict[str, set[str]],
     side: Side,
 ) -> Issue | None:
     """Whether this candidate write is one the live turn did not make.
 
-    Two questions, in order. Did production call this tool at all? And, when
-    the write names records, did any production write to this tool touch one
-    of them? A write naming no record at all passes on the tool name alone:
-    there is nothing more to compare, and the message-count check covers the
-    case that matters most (``_extra_message_issues``).
+    Two questions, in order. Did production *write* with this tool at all?
+    And, when the write names records, did any production write to this tool
+    touch one of them? A write naming no record at all passes on the tool
+    name alone: there is nothing more to compare, and the message-count check
+    covers the case that matters most (``_extra_message_issues``).
+
+    The first question is asked of production's writes, not of every call it
+    made. ``manage_integration`` is one tool with a read action, so a live
+    turn that only asked ``action="status"`` would otherwise exempt a
+    candidate that answered the same turn with ``action="disconnect"``, which
+    is the integration-disconnect case ``is_mutating_call`` exists to catch.
+    ``_write_ids_by_tool`` keys an entry for every mutating production call,
+    with or without record IDs, so its keys are exactly that set.
     """
-    if name not in recorded:
+    if name not in written_ids:
         return Issue(
             finding=Finding.UNREQUESTED_WRITE,
             tool_name=name,
@@ -552,17 +574,19 @@ def _check_one_call(
 ) -> list[Issue]:
     """Findings for a single tool call, on either side.
 
-    *recorded* is the tool names this turn's record carries, and it does two
-    jobs for the candidate: a name in it that today's schema lacks is a
-    fixture artifact rather than a hallucination, and a write in it is a
-    write the user's turn asked for, subject to *written_ids*.
+    *recorded* is the tool names this turn's record carries, whether it read
+    or wrote with them. Its one job is the schema question: a name in it that
+    today's schema lacks is a fixture artifact rather than a hallucination.
 
     *written_ids* is the record IDs production's own writes carried, by tool
-    name (``_write_ids_by_tool``). A candidate write naming records none of
-    them touched is unrequested even though the tool name matches, which is
-    the second ``add_note`` against the neighbouring job. Sharing one ID with
-    a production write to that tool is enough to pass: a write to the right
-    record with different arguments is a ``WriteOutcome``, not a finding.
+    name (``_write_ids_by_tool``), and it answers the write question. Its
+    keys are the tools production wrote with, so a candidate write through a
+    tool the live turn only read with is unrequested. A candidate write
+    naming records none of production's touched is unrequested too even
+    though the tool name matches, which is the second ``add_note`` against
+    the neighbouring job. Sharing one ID with a production write to that tool
+    is enough to pass: a write to the right record with different arguments
+    is a ``WriteOutcome``, not a finding.
 
     Both are empty on the production side, where neither question applies.
     """
@@ -595,7 +619,7 @@ def _check_one_call(
     issues: list[Issue] = []
     if check_unrequested:
         unrequested = _unrequested_write_issue(
-            tool, name, arguments, recorded=recorded, written_ids=written_ids, side=side
+            tool, name, arguments, written_ids=written_ids, side=side
         )
         if unrequested is not None:
             issues.append(unrequested)

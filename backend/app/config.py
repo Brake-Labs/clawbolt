@@ -126,10 +126,11 @@ class Settings(BaseSettings):
 
     # Model comparison (admin console, multi_user only). A run replays a
     # user's recent turns through a candidate model, one LLM call per turn
-    # plus up to three more where the turn continues through recorded
-    # lookups. Concurrency is deliberately modest: the run competes with live
-    # user traffic for the same provider rate limit, and a slow comparison is
-    # cheaper than a rate-limited inbound message.
+    # plus up to ``execution.MAX_REPLAY_READ_ROUNDS`` (6) more where the turn
+    # continues through recorded lookups. Concurrency is deliberately modest:
+    # the run competes with live user traffic for the same provider rate
+    # limit, and a slow comparison is cheaper than a rate-limited inbound
+    # message.
     model_comparison_concurrency: int = Field(default=4, ge=1, le=32)
     # Ceiling on turns an operator can request in one run, so a stray value in
     # the admin form cannot start a several-thousand-call job.

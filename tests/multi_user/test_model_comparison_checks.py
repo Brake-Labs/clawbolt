@@ -495,6 +495,53 @@ def test_media_reply_the_tool_refuses_is_not_a_write() -> None:
     assert _candidate(real, tools=tools) == [Finding.UNREQUESTED_WRITE]
 
 
+def test_a_production_read_of_a_tool_is_not_permission_to_write_with_it() -> None:
+    """Regression: ``manage_integration`` is one tool with a read action.
+
+    The exemption keyed off every tool name the record carried, so a live
+    turn that only asked ``action="status"`` covered a candidate that
+    answered the same turn by disconnecting the integration. Nothing was
+    reported: the disconnect carries no record ID, and production made no
+    write for the write comparison to line it up against.
+    """
+    tool = _real_integration_tool()
+    tools = {tool.name: tool}
+    status_only = [_recorded(tool.name, action="status")]
+    disconnect = _call(
+        ToolCall(name=tool.name, arguments={"action": "disconnect", "target": "gmail"})
+    )
+    assert _candidate(disconnect, tools=tools, production=status_only) == [
+        Finding.UNREQUESTED_WRITE
+    ]
+
+    # A live turn that did disconnect something still exempts the candidate.
+    also_disconnected = [_recorded(tool.name, action="disconnect", target="gmail")]
+    assert _candidate(disconnect, tools=tools, production=also_disconnected) == []
+
+
+def test_a_media_reply_production_only_attempted_still_raises_the_bar() -> None:
+    """Known gap, pinned so a change to it is deliberate.
+
+    The live turn asked for an attachment the tool refused, so the user got
+    nothing, yet it still counts towards production's message total and a
+    candidate that sent one real attachment goes unflagged. Filtering the
+    production side through today's params models would be worse: a recorded
+    call that no longer validates is fixture drift (``check_production``),
+    and dropping it would charge the candidate with a message it did send.
+    """
+    tool = _real_media_tool()
+    tools = {tool.name: tool}
+    refused = [_recorded(tool.name, message="here you go", media_url="")]
+    sent = _call(
+        ToolCall(
+            name=tool.name,
+            arguments={"message": "here you go", "media_url": "https://example.com/x.pdf"},
+        )
+    )
+    issues = checks.check_candidate(sent, tools, production_calls=refused, seen="")
+    assert [i.finding for i in issues] == []
+
+
 # ---------------------------------------------------------------------------
 # Writes to record IDs the model was never shown
 # ---------------------------------------------------------------------------
