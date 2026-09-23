@@ -61,12 +61,12 @@ _RETRY_HINT = (
 # figure. The second sentence is the green-lid case: a listing page puts several
 # products' prices side by side, and only the field pairing says which is which.
 #
-# Kept short because it is repeated on every call and stays in history. The
-# tool's usage_hint carries the longer framing once per schema.
+# Kept short because it is repeated on every call and stays in history.
 _RESULT_FOOTER = (
     "Results may be out of date: give any figure with its source URL, as a "
     "ballpark to confirm, never as a firm quote. A price belongs to the item "
-    "named in its own result; give the range when results disagree. No useful "
+    "named in its own result; check it is the item asked for, and give the range "
+    "when results disagree. No useful "
     "detail means the query was too broad: name the product and size and "
     "search once more. Never infer a figure a page does not state."
 )

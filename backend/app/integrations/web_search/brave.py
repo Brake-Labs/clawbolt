@@ -67,19 +67,20 @@ _DROPPED_KEYS = frozenset(
         "subtype",
         "is_live",
         "language",
-        "bestRating",
         "is_tripadvisor",
     }
 )
 
 # Repeated lists capped to their first N entries, keyed by the list's key or by
 # ``parent.key``. A capped list gets a sibling ``<key>_not_shown`` count, so the
-# agent knows there was more and can search more narrowly. Brave ranks the
-# entries, so the cap keeps the most relevant ones.
+# agent knows there was more and can search more narrowly. Offers and extra
+# snippets carry the prices and availability the agent quotes in estimates, so
+# their caps stay loose enough to give a price range; the size saving comes
+# mostly from the denylist above.
 _LIST_CAPS: dict[str, int] = {
     "product_cluster": 3,
-    "offers": 1,
-    "extra_snippets": 2,
+    "offers": 3,
+    "extra_snippets": 5,
     "faq.items": 2,
 }
 

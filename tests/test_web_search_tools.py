@@ -130,7 +130,7 @@ def _bulky_brave_result() -> dict:
                 "thumbnail": {"src": img},
                 "offers": [
                     {"url": f"https://supplier.example.com/{j}/{k}", "price": f"3{j}.{k}9"}
-                    for k in range(3)
+                    for k in range(5)
                 ],
                 "rating": {
                     "ratingValue": 4.6,
@@ -142,7 +142,7 @@ def _bulky_brave_result() -> dict:
             }
             for j in range(5)
         ],
-        "extra_snippets": [f"Snippet {s}: copper moved 4%." for s in range(4)],
+        "extra_snippets": [f"Snippet {s}: copper moved 4%." for s in range(7)],
         "faq": {
             "items": [
                 {"question": f"Q{q}?", "answer": f"A{q}.", "meta_url": {"favicon": img}}
@@ -172,7 +172,6 @@ class TestTrim:
             "subtype",
             "is_live",
             "language",
-            "bestRating",
             "is_tripadvisor",
             "type:",
         ):
@@ -189,6 +188,8 @@ class TestTrim:
         assert "product_cluster[0].offers[0].price: 30.09" in out
         assert "product_cluster[0].offers[0].url: https://supplier.example.com/0/0" in out
         assert "product_cluster[0].rating.ratingValue: 4.6" in out
+        assert "product_cluster[0].rating.bestRating: 5" in out
+        assert "product_cluster[0].offers[2].price: 30.29" in out
         assert "extra_snippets[0]: Snippet 0: copper moved 4%." in out
         assert "faq.items[0].answer: A0." in out
 
@@ -200,12 +201,9 @@ class TestTrim:
         trimmed = self._trimmed()
         assert len(trimmed["product_cluster"]) == 3
         assert trimmed["product_cluster_not_shown"] == 2
-        assert len(trimmed["product_cluster"][0]["offers"]) == 1
+        assert len(trimmed["product_cluster"][0]["offers"]) == 3
         assert trimmed["product_cluster"][0]["offers_not_shown"] == 2
-        assert trimmed["extra_snippets"] == [
-            "Snippet 0: copper moved 4%.",
-            "Snippet 1: copper moved 4%.",
-        ]
+        assert trimmed["extra_snippets"] == [f"Snippet {s}: copper moved 4%." for s in range(5)]
         assert trimmed["extra_snippets_not_shown"] == 2
         assert len(trimmed["faq"]["items"]) == 2
         assert trimmed["faq"]["items_not_shown"] == 2

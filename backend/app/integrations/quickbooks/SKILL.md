@@ -149,7 +149,7 @@ Each line item in the `Line` array should look like:
 
 ## Updating Entities (qb_update)
 
-Pass `entity_type` and `data` with the **full entity payload including Id and SyncToken** from a `qb_query` for that record alone (`WHERE Id = '<id>'`). A result of more than 3 rows cuts long fields such as `Line` and `CustomerMemo`, so never build a payload from one.
+Pass `entity_type` and `data` with the **full entity payload including Id and SyncToken** from a `qb_query` for that record alone (`WHERE Id = '<id>'`).
 
 The SyncToken is required for optimistic concurrency. If the entity was modified since you last queried it, QuickBooks will reject the update with a conflict error. In that case, re-query the entity and try again with the new SyncToken.
 
