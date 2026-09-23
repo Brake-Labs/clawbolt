@@ -2,8 +2,8 @@
 
 The LLM never sees the stored ``StoredMessage.timestamp`` directly; instead
 ``_stored_messages_to_agent_messages`` prepends an absolute, localized
-timestamp marker to a message when it is the first in the slice, follows a
->30min gap, or crosses a local-day boundary. These tests pin that behavior
+timestamp marker to a message when it has no earlier visible message, follows
+a >30min gap, or crosses a local-day boundary. These tests pin that behavior
 without touching the database (both helpers are pure functions).
 """
 
@@ -14,7 +14,7 @@ from backend.app.agent.context import (
     _time_marker,
 )
 from backend.app.agent.dto import StoredMessage
-from backend.app.agent.messages import AssistantMessage, UserMessage
+from backend.app.agent.messages import AgentMessage, AssistantMessage, UserMessage
 
 # A fixed Monday afternoon anchor so weekday/AM-PM rendering is deterministic.
 _BASE = "2026-06-01T13:00:00+00:00"  # 13:00 UTC == 09:00 America/New_York (EDT)
@@ -146,3 +146,61 @@ def test_no_timezone_falls_back_to_utc_render() -> None:
     first = history[0]
     assert isinstance(first, UserMessage)
     assert "01:00 PM" in first.content
+
+
+# --- slice independence ------------------------------------------------------
+#
+# A message must render the same whichever slice it is loaded in. The turn
+# after a trim loads from a later start than the trim turn did; if the first
+# message of the new slice gained a marker it did not have mid-history, the
+# history prefix the trim turn cached would never be read back.
+
+
+def _transcript() -> list[StoredMessage]:
+    """Mixed rows: short gaps, a long gap, an approval prompt and its reply."""
+    return [
+        StoredMessage(direction="inbound", body="Q1", seq=1, timestamp=_iso(0)),
+        StoredMessage(direction="outbound", body="A1", seq=2, timestamp=_iso(0.02)),
+        StoredMessage(direction="inbound", body="Q2", seq=3, timestamp=_iso(0.1)),
+        StoredMessage(
+            direction="outbound",
+            body="Delete it?\nnever: deny and remember",
+            seq=4,
+            timestamp=_iso(0.12),
+        ),
+        StoredMessage(direction="inbound", body="yes", seq=5, timestamp=_iso(0.13)),
+        StoredMessage(direction="outbound", body="Deleted", seq=6, timestamp=_iso(0.15)),
+        StoredMessage(direction="inbound", body="", seq=7, timestamp=_iso(0.2)),
+        StoredMessage(direction="inbound", body="Q3", seq=8, timestamp=_iso(3)),
+        StoredMessage(direction="outbound", body="A3", seq=9, timestamp=_iso(3.05)),
+    ]
+
+
+def _render(history: list[AgentMessage]) -> list[tuple[str, str]]:
+    return [
+        (type(m).__name__, str(m.content))
+        for m in history
+        if isinstance(m, (UserMessage, AssistantMessage))
+    ]
+
+
+def test_every_slice_renders_like_the_full_transcript() -> None:
+    rows = _transcript()
+    full = _render(_stored_messages_to_agent_messages(rows))
+    for start in range(1, len(rows)):
+        sliced = _render(_stored_messages_to_agent_messages(rows[start:], preceding=rows[:start]))
+        # The slice is the tail of the full conversion, message for message.
+        assert sliced == full[len(full) - len(sliced) :], start
+
+
+def test_preceding_row_suppresses_the_first_message_marker() -> None:
+    rows = _transcript()
+    # A1 follows Q1 by about a minute: mid-history it carries no marker.
+    history = _stored_messages_to_agent_messages(rows[1:2], preceding=rows[:1])
+    assert _render(history) == [("AssistantMessage", "A1")]
+
+
+def test_approval_reply_after_a_preceding_prompt_stays_hidden() -> None:
+    rows = _transcript()
+    history = _stored_messages_to_agent_messages(rows[4:6], preceding=rows[:4])
+    assert _render(history) == [("AssistantMessage", "Deleted")]

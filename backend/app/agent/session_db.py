@@ -175,6 +175,21 @@ def _select_recent_messages(
     )
 
 
+def _select_messages_up_to_seq(
+    user_id: str,
+    max_seq: int,
+    count: int,
+) -> Select[tuple[Message]]:
+    """The ``count`` newest messages with ``seq <= max_seq``, newest first."""
+    return (
+        select(Message)
+        .join(ChatSession, Message.session_id == ChatSession.id)
+        .where(ChatSession.user_id == user_id, Message.seq <= max_seq)
+        .order_by(Message.seq.desc())
+        .limit(count)
+    )
+
+
 def _delete_message_by_seq(cs_id: int, seq: int) -> Delete[tuple[Message]]:
     return (
         delete(Message)
@@ -763,6 +778,19 @@ class SessionStore:
             )
             # Return in chronological order
             return [_msg_to_stored(m) for m in reversed(messages)]
+        finally:
+            await db.close()
+
+    async def get_messages_up_to_seq_async(self, max_seq: int, count: int) -> list[StoredMessage]:
+        """The *count* messages ending at ``seq == max_seq``, in chronological order.
+
+        Used to find what came just before the trim watermark, which the hot
+        path (:meth:`get_or_create_session_async`) deliberately does not load.
+        """
+        db = AsyncSessionLocal()
+        try:
+            rows = await fetch_all(db, _select_messages_up_to_seq(self.user_id, max_seq, count))
+            return [_msg_to_stored(m) for m in reversed(rows)]
         finally:
             await db.close()
 

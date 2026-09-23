@@ -4,6 +4,7 @@ import asyncio
 import datetime
 import json
 import logging
+from collections.abc import Sequence
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -347,9 +348,12 @@ _TIMESTAMP_GAP_THRESHOLD = datetime.timedelta(minutes=30)
 def _time_marker(prev_iso: str, cur_iso: str, tz_name: str) -> str | None:
     """Return a localized timestamp marker for a message, or ``None`` to skip.
 
-    A marker is emitted only when the message is the first in the slice
+    A marker is emitted only when the message has no earlier visible message
     (``prev_iso`` empty), is separated from the previous visible message by
     more than ``_TIMESTAMP_GAP_THRESHOLD``, or crosses a local-day boundary.
+    Callers pass the previous visible message of the whole transcript, not
+    of the loaded slice, so a message renders the same whichever slice it is
+    loaded in (see :func:`_stored_messages_to_agent_messages`).
     This surfaces the useful signal (a conversation resumed after a break)
     without prefixing every turn.
 
@@ -388,8 +392,69 @@ def _with_marker(marker: str | None, text: str) -> str:
     return f"{marker}\n{text}" if marker else text
 
 
+# How far before a slice to look for the previous visible message. Only a run
+# of this many hidden rows (approval prompts and their replies, blank
+# attachment placeholders) in a row could hide it.
+_PRECEDING_LOOKBACK_ROWS = 20
+
+
+def _row_content(msg: Any) -> str:
+    """The text a stored row contributes to history, before any marker."""
+    if msg.direction == MessageDirection.OUTBOUND:
+        # Feed the LLM its pre-receipt prose, not the dispatched body.
+        # The dispatched body has the deterministic receipt block
+        # appended by ``append_receipts``; reading it back here on the
+        # next turn would train the model on its own appended
+        # receipts, after which it reproduces the bullet on the next
+        # write turn and the receipt grep has to clean it up
+        # post-hoc. ``llm_reply_text`` is populated by
+        # ``persist_outbound``; legacy rows (before migration 037)
+        # have it empty and fall back to ``body``.
+        return msg.llm_reply_text or msg.body
+    # Prefer processed context (includes media descriptions) over raw body
+    return msg.processed_context if msg.processed_context else msg.body
+
+
+def _is_approval_prompt_row(msg: Any) -> bool:
+    """Whether *msg* is an outbound approval prompt that history drops."""
+    return (
+        msg.direction != MessageDirection.INBOUND
+        and not _parse_tool_interactions(msg.tool_interactions_json)
+        and _is_approval_prompt(_row_content(msg))
+    )
+
+
+def _is_visible_row(msg: Any, after_approval_prompt: bool) -> bool:
+    """Whether *msg* becomes a history message. Mirrors the loop below."""
+    if msg.direction == MessageDirection.INBOUND:
+        content = _row_content(msg)
+        if not (content or "").strip():
+            return False
+        return not (after_approval_prompt and _parse_approval_response(content) is not None)
+    return not _is_approval_prompt_row(msg)
+
+
+def _state_after(preceding: Sequence[Any]) -> tuple[str, bool]:
+    """Converter state at the end of *preceding*: (prev visible ts, after prompt).
+
+    Whether a row is visible depends only on the row before it, so this
+    reproduces what a conversion of the whole transcript would have carried
+    into the slice, without converting the rows before it.
+    """
+    if not preceding:
+        return "", False
+    after_prompt = _is_approval_prompt_row(preceding[-1])
+    for idx in range(len(preceding) - 1, -1, -1):
+        before_is_prompt = idx > 0 and _is_approval_prompt_row(preceding[idx - 1])
+        if _is_visible_row(preceding[idx], before_is_prompt):
+            return preceding[idx].timestamp, after_prompt
+    return "", after_prompt
+
+
 def _stored_messages_to_agent_messages(
-    messages: list[Any], tz_name: str = ""
+    messages: list[Any],
+    tz_name: str = "",
+    preceding: Sequence[Any] = (),
 ) -> list[AgentMessage]:
     """Convert ``StoredMessage`` rows to typed ``AgentMessage`` objects.
 
@@ -401,28 +466,21 @@ def _stored_messages_to_agent_messages(
     Stateful across the loop because dropping an approval prompt also
     requires dropping the user's "yes/no" reply that immediately follows
     it. ``last_was_approval_prompt`` carries that flag forward.
+
+    *preceding* holds the rows just before *messages* in the transcript.
+    They produce no output; they seed the timestamp-marker baseline and the
+    approval flag, so each row converts the same whichever slice it is
+    loaded in. Without them, the first message of every slice got a fresh
+    marker, and the turn after a trim sent a history that differed from the
+    one the trim turn had cached.
     """
     history: list[AgentMessage] = []
-    last_was_approval_prompt = False
     # Timestamp of the previous *visible* message (dropped approval prompts and
     # blank rows do not advance it), so gaps are measured between turns the LLM
     # actually sees.
-    prev_iso = ""
+    prev_iso, last_was_approval_prompt = _state_after(preceding)
     for msg in messages:
-        if msg.direction == MessageDirection.OUTBOUND:
-            # Feed the LLM its pre-receipt prose, not the dispatched body.
-            # The dispatched body has the deterministic receipt block
-            # appended by ``append_receipts``; reading it back here on the
-            # next turn would train the model on its own appended
-            # receipts, after which it reproduces the bullet on the next
-            # write turn and the receipt grep has to clean it up
-            # post-hoc. ``llm_reply_text`` is populated by
-            # ``persist_outbound``; legacy rows (before migration 037)
-            # have it empty and fall back to ``body``.
-            content = msg.llm_reply_text or msg.body
-        else:
-            # Prefer processed context (includes media descriptions) over raw body
-            content = msg.processed_context if msg.processed_context else msg.body
+        content = _row_content(msg)
         if msg.direction == MessageDirection.INBOUND:
             # Rapid-fire attachment-only messages can be batched so the
             # placeholder row is persisted with no body and no processed
@@ -529,12 +587,20 @@ async def load_conversation_history(
             await _advance_trim_watermark_only(session.user_id, overflow[-1].seq)
 
     # Get the most recent `limit` messages, excluding the current (last) one
-    if total_count > 1:
-        messages = all_messages[-(limit):][:-1] if total_count > limit else all_messages[:-1]
-    else:
-        messages = []
+    window_start = max(total_count - limit, 0)
+    messages = all_messages[window_start:-1] if total_count > 1 else []
 
-    history = _stored_messages_to_agent_messages(messages, tz_name=tz_name)
+    # The rows just before the window, so the first loaded message renders
+    # as it did when it was mid-history. The rows below the watermark are
+    # not in ``session.messages`` on the hot path, so they are fetched.
+    preceding: list[Any] = list(all_messages[:window_start][-_PRECEDING_LOOKBACK_ROWS:])
+    if messages and len(preceding) < _PRECEDING_LOOKBACK_ROWS and session.last_trim_seq:
+        below = await get_session_store(session.user_id).get_messages_up_to_seq_async(
+            session.last_trim_seq, _PRECEDING_LOOKBACK_ROWS - len(preceding)
+        )
+        preceding = below + preceding
+
+    history = _stored_messages_to_agent_messages(messages, tz_name=tz_name, preceding=preceding)
     logger.debug(
         "Loaded %d history messages for session %s",
         len(history),
