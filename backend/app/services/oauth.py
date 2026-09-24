@@ -996,10 +996,11 @@ class OAuthService:
         Returns the updated token data on success, or None if no token or
         refresh token exists, including when the user disconnected while the
         refresh POST was in flight. When the user reconnected during the POST,
-        the refreshed tokens belong to the replaced grant: they are dropped and
-        the new connection is returned unchanged. Raises on HTTP errors so the caller can
-        classify them via ``_is_permanent_refresh_failure``. A permanent
-        failure has already deleted the token, under the lock, by then.
+        the refreshed tokens belong to the replaced grant: they are dropped
+        and the new connection is returned unchanged. Raises on HTTP errors so
+        the caller can classify them via ``_is_permanent_refresh_failure``. A
+        permanent failure has already deleted the token, under the lock, by
+        then.
 
         ``rejected_access_token`` is the access token a provider API just
         answered 401 to. When given, the refresh is skipped only if the stored
