@@ -138,9 +138,11 @@ class DriveOAuthCredentials:
 
     ``access_token`` is the token issued by Google after the user grants
     ``drive.file`` scope. ``refresh_access_token`` is called with the token
-    Drive just answered 401 to and returns a fresh one, or None when no
-    refresh could run. It owns the OAuth side (locking, persistence, retiring
-    a dead grant) and raises ``ReconnectRequired`` when the grant is dead.
+    Drive just answered 401 to and returns a fresh one, or None when there is
+    nothing to refresh with (no refresh token, no OAuth config). It owns the
+    OAuth side (locking, persistence, retiring a dead grant), raises
+    ``ReconnectRequired`` when the grant is dead, and raises
+    ``RefreshLockContended`` when a peer held the refresh lock past the wait.
     """
 
     access_token: str
