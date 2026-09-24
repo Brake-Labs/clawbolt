@@ -416,3 +416,79 @@ async def test_disconnect_during_the_refresh_post_stays_disconnected(
     assert await oauth_service.load_token_uncached(test_user.id, "quickbooks") is None
     # The user chose to disconnect, so there is nothing to tell them.
     notify.assert_not_awaited()
+
+
+async def _reconnect(user: User, realm_id: str) -> None:
+    """The user disconnects QuickBooks and connects again, as the OAuth callback does."""
+    await oauth_service.delete_token(user.id, "quickbooks")
+    await oauth_service.save_token(
+        user.id,
+        "quickbooks",
+        OAuthTokenData(
+            access_token="at-new-grant",
+            refresh_token="rt-new-grant",
+            expires_at=time.time() + 3600,
+            realm_id=realm_id,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("new_realm", "succeeds"),
+    [("9999", True), ("8888", False)],
+    ids=["same_company", "different_company"],
+)
+async def test_reconnect_during_the_refresh_post_keeps_the_new_connection(
+    test_user: User,
+    monkeypatch: pytest.MonkeyPatch,
+    notify: AsyncMock,
+    new_realm: str,
+    succeeds: bool,
+) -> None:
+    """Regression: the user disconnected and reconnected while a refresh POST for the
+    old grant was in flight, and the refresh then saved the old grant's tokens and
+    old ``realm_id`` over the new connection."""
+    await _connect(test_user)
+    sent: list[tuple[str, str]] = []
+
+    def qbo(request: httpx.Request) -> httpx.Response:
+        # An Intuit token reaches one company: the new grant works only on its own.
+        auth = request.headers["Authorization"]
+        sent.append((auth, request.url.path))
+        if auth == "Bearer at-new-grant" and f"/company/{new_realm}/" in request.url.path:
+            return httpx.Response(200, json={"QueryResponse": {"Customer": []}})
+        return httpx.Response(401, json={})
+
+    async def token_endpoint(request: httpx.Request) -> httpx.Response:
+        await _reconnect(test_user, new_realm)
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "at-old-grant",
+                "refresh_token": "rt-old-grant",
+                "expires_in": 3600,
+            },
+        )
+
+    tools = await _tools(test_user, monkeypatch, qbo=qbo, token_endpoint=token_endpoint)
+
+    result = await _call_query(tools)
+
+    stored = await oauth_service.load_token_uncached(test_user.id, "quickbooks")
+    assert stored is not None
+    assert (stored.access_token, stored.refresh_token, stored.realm_id) == (
+        "at-new-grant",
+        "rt-new-grant",
+        new_realm,
+    )
+    # The call retries once with the new connection's token, still against the
+    # company this turn was built for. The old grant's token is never sent again.
+    assert [auth for auth, _ in sent] == ["Bearer at-old", "Bearer at-new-grant"]
+    assert all("/company/9999/" in path for _, path in sent)
+    if succeeds:
+        assert result.is_error is False, result.content
+    else:
+        # A token for another company cannot reach this one, so nothing is
+        # written there. The next turn is built for the new company.
+        _assert_reconnect(result)
+    notify.assert_not_awaited()

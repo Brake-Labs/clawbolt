@@ -995,7 +995,9 @@ class OAuthService:
 
         Returns the updated token data on success, or None if no token or
         refresh token exists, including when the user disconnected while the
-        refresh POST was in flight. Raises on HTTP errors so the caller can
+        refresh POST was in flight. When the user reconnected during the POST,
+        the refreshed tokens belong to the replaced grant: they are dropped and
+        the new connection is returned unchanged. Raises on HTTP errors so the caller can
         classify them via ``_is_permanent_refresh_failure``. A permanent
         failure has already deleted the token, under the lock, by then.
 
@@ -1094,8 +1096,11 @@ class OAuthService:
                         return None
                     grant = functools.partial(self._post_refresh_grant, config)
 
+                # ``token`` is updated in place with the response, so keep the
+                # refresh token this POST sends for the check after it.
+                posted_refresh_token = token.refresh_token
                 try:
-                    data = await grant(token.refresh_token)
+                    data = await grant(posted_refresh_token)
                 except Exception as exc:
                     if self._is_permanent_refresh_failure(exc):
                         # Retire the dead grant before releasing the lock. A
@@ -1151,6 +1156,21 @@ class OAuthService:
                         integration,
                     )
                     return None
+                if current.refresh_token != posted_refresh_token:
+                    # The row holds a different grant: the user reconnected
+                    # during the POST (peers cannot rotate the refresh token
+                    # while this lock is held, and every connect stores a new
+                    # one). Saving would put the old grant, and with it the
+                    # old QuickBooks company or AppFolio fingerprint, over the
+                    # new connection. Keep the new one and hand it back: it is
+                    # live, so callers use it as they would a peer's refresh.
+                    logger.info(
+                        "Token reconnected during refresh, discarding result: "
+                        "user=%s integration=%s",
+                        user_id,
+                        integration,
+                    )
+                    return current
                 token.extra = current.extra
                 await self.save_token(user_id, integration, token)
                 logger.info(
@@ -1267,7 +1287,8 @@ class OAuthService:
         ``RefreshLockContended`` when a peer held the lock past the wait,
         which is transient. Returns None when there is nothing to refresh
         with (no refresh token, no OAuth config), leaving the caller's
-        original 401 to stand.
+        original 401 to stand. When the user reconnected while the refresh ran,
+        returns the new connection, so the caller retries with its token.
         """
         friendly = _display_name(integration)
         reconnect_message = (
