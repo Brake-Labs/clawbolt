@@ -19,6 +19,7 @@ from backend.app.services.oauth import (
     ReconnectRequired,
     _refresh_lock_key,
     _try_acquire_advisory_lock_async,
+    is_dead_grant_response,
 )
 
 # ---------------------------------------------------------------------------
@@ -95,6 +96,31 @@ class TestIsPermanentRefreshFailure:
         for code in _PERMANENT_OAUTH_ERROR_CODES:
             error = _make_http_error(400, {"error": code})
             assert OAuthService._is_permanent_refresh_failure(error) is True
+
+    @pytest.mark.parametrize(
+        ("status", "body", "permanent"),
+        [
+            (400, {"error": "invalid_grant"}, True),
+            (401, {"error": "invalid_client"}, True),
+            (400, {"error": "unauthorized_client"}, True),
+            (403, {"error": "invalid_grant"}, False),
+            (404, {"error": "invalid_grant"}, False),
+            (500, {"error": "invalid_grant"}, False),
+            (400, {"error": "invalid_request"}, False),
+            (400, {"message": "not oauth"}, False),
+        ],
+    )
+    def test_shares_one_dead_grant_rule_with_is_dead_grant_response(
+        self, status: int, body: dict, permanent: bool
+    ) -> None:
+        """Regression: the shared classifier took a permanent ``error`` code under any
+        status while ``is_dead_grant_response`` required 400 or 401, so a 403 or a
+        5xx carrying ``invalid_grant`` retired a Google or QuickBooks token but not
+        an AppFolio one. RFC 6749 section 5.2 puts these codes on 400, and on 401
+        for client authentication; Google, Intuit and CompanyCam follow it."""
+        error = _make_http_error(status, body)
+        assert is_dead_grant_response(error.response) is permanent
+        assert OAuthService._is_permanent_refresh_failure(error) is permanent
 
 
 # ---------------------------------------------------------------------------

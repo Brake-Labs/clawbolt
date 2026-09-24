@@ -25,7 +25,11 @@ from backend.app.integrations.quickbooks.service import (
     QuickBooksOnlineService,
     QuickBooksService,
 )
-from backend.app.services.oauth import ReconnectRequired, oauth_service
+from backend.app.services.oauth import (
+    ReconnectRequired,
+    TokenRefreshUnavailable,
+    oauth_service,
+)
 
 if TYPE_CHECKING:
     from backend.app.agent.tools.registry import ToolContext
@@ -211,6 +215,21 @@ def _log_tool_failure(exc: Exception, message: str, *args: object) -> None:
         logger.warning(message + ": reconnect required: %s", *args, exc)
     else:
         logger.exception(message, *args)
+
+
+def _refresh_unavailable_result(action: str) -> ToolResult:
+    """A 401 left standing because a peer held the refresh lock.
+
+    That says nothing about the grant and retrying shortly should succeed,
+    so it is a retryable SERVICE error, logged without a traceback.
+    """
+    logger.warning("QuickBooks token refresh could not run during %s", action)
+    return ToolResult(
+        content=f"QuickBooks could not renew its access while trying to {action}.",
+        is_error=True,
+        error_kind=ToolErrorKind.SERVICE,
+        hint="Another refresh of this connection was in progress. Retry this call shortly.",
+    )
 
 
 def _fault_error_kind(exc: Exception) -> ToolErrorKind:
@@ -816,6 +835,8 @@ def create_quickbooks_tools(
         try:
             rows = await qb_service.query(normalized)
         except Exception as exc:
+            if isinstance(exc, TokenRefreshUnavailable):
+                return _refresh_unavailable_result("query")
             error_kind = _fault_error_kind(exc)
             if error_kind is ToolErrorKind.VALIDATION:
                 # The model's query was wrong; no stack trace needed.
@@ -866,6 +887,8 @@ def create_quickbooks_tools(
         try:
             result = await qb_service.create_entity(entity_type, data)
         except Exception as exc:
+            if isinstance(exc, TokenRefreshUnavailable):
+                return _refresh_unavailable_result(f"create a {entity_type}")
             _log_tool_failure(exc, "QB create %s failed", entity_type)
             if isinstance(exc, httpx.HTTPStatusError):
                 error_str = _format_intuit_fault(exc, entity=entity_type)
@@ -950,6 +973,8 @@ def create_quickbooks_tools(
                 error_kind=ToolErrorKind.VALIDATION,
             )
         except Exception as exc:
+            if isinstance(exc, TokenRefreshUnavailable):
+                return _refresh_unavailable_result(f"update a {entity_type}")
             _log_tool_failure(exc, "QB update %s failed", entity_type)
             if isinstance(exc, httpx.HTTPStatusError):
                 error_str = _format_intuit_fault(exc, entity=entity_type)
@@ -1047,6 +1072,8 @@ def create_quickbooks_tools(
         try:
             await qb_service.send_entity_email(entity_type, entity_id, email)
         except Exception as exc:
+            if isinstance(exc, TokenRefreshUnavailable):
+                return _refresh_unavailable_result(f"send a {entity_type}")
             _log_tool_failure(exc, "QB send %s email failed", entity_type)
             if isinstance(exc, httpx.HTTPStatusError):
                 error_str = _format_intuit_fault(exc, entity=entity_type)

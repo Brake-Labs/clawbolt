@@ -422,3 +422,45 @@ async def test_concurrent_401s_refresh_once(
     assert stored is not None
     assert (stored.jwt, stored.refresh_token) == ("jwt-new", "rt-new")
     notify.assert_not_awaited()
+
+
+async def test_parallel_401s_in_one_turn_outlast_the_lock_wait(
+    test_user: User, monkeypatch: pytest.MonkeyPatch, notify: AsyncMock
+) -> None:
+    """Regression: the refresh POST may hold the lock for ``_REFRESH_TIMEOUT_SECONDS``
+    (30s) but a waiter gives up after ``_LOCK_MAX_WAIT_S`` (5s), so a sibling call
+    in the same turn reported "try again shortly" while its own turn was
+    refreshing. Siblings now await the refresh already in flight."""
+    await _connect(test_user)
+    monkeypatch.setattr(oauth_module, "_LOCK_MAX_WAIT_S", 0.2)
+    rejected = 0
+    all_rejected = asyncio.Event()
+    posted: list[str] = []
+
+    def api(request: httpx.Request) -> httpx.Response:
+        nonlocal rejected
+        if request.headers["Authorization"] == "Bearer jwt-new":
+            return httpx.Response(200, json=_WORK_ORDERS)
+        rejected += 1
+        if rejected == 3:
+            all_rejected.set()
+        return httpx.Response(401, json=_LOGIN_401)
+
+    async def token(request: httpx.Request) -> httpx.Response:
+        posted.append(request.read().decode())
+        await asyncio.wait_for(all_rejected.wait(), timeout=5)
+        # Outlast the lock wait, as a slow token endpoint does.
+        await asyncio.sleep(0.6)
+        return httpx.Response(200, json={"access_token": "jwt-new", "refresh_token": "rt-new"})
+
+    _wire(monkeypatch, api=api, token=token)
+    tools = await _tools(test_user)
+
+    results = await asyncio.gather(_list(tools), _search(tools), _list(tools))
+
+    assert [r.is_error for r in results] == [False, False, False], [r.content for r in results]
+    assert len(posted) == 1
+    stored = await _stored(test_user)
+    assert stored is not None
+    assert (stored.jwt, stored.refresh_token) == ("jwt-new", "rt-new")
+    notify.assert_not_awaited()
