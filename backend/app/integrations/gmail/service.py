@@ -132,9 +132,12 @@ class GmailService:
         sender_email: str = "",
     ) -> None:
         """``refresh_access_token`` is called with the access token Google just
-        answered 401 to and returns a fresh one, or None when no refresh could
-        run. It owns the OAuth side (locking, persistence, retiring a dead
-        grant) and raises ``ReconnectRequired`` when the grant is dead.
+        answered 401 to and returns a fresh one, or None when there is nothing
+        to refresh with (no refresh token, no OAuth config). It owns the OAuth
+        side (locking, persistence, retiring a dead grant), raises
+        ``ReconnectRequired`` when the grant is dead, and raises
+        ``RefreshLockContended`` when a peer held the refresh lock past the
+        wait.
         """
         self._access_token = access_token
         self._refresh_access_token = refresh_access_token
@@ -165,8 +168,12 @@ class GmailService:
         is.
         """
         url = f"{GMAIL_API_BASE}{path}"
+        # The token this call sends. A parallel call may swap in a refreshed
+        # one before this call's 401 comes back; naming the token Google
+        # actually rejected lets the shared refresh skip a second POST.
+        sent_token = self._access_token
         headers = {
-            "Authorization": f"Bearer {self._access_token}",
+            "Authorization": f"Bearer {sent_token}",
             "Accept": "application/json",
             "Content-Type": "application/json",
         }
@@ -174,7 +181,7 @@ class GmailService:
             resp = await client.request(method, url, headers=headers, json=json, params=params)
             if resp.status_code == 401 and self._refresh_access_token is not None:
                 try:
-                    new_token = await self._refresh_access_token(self._access_token)
+                    new_token = await self._refresh_access_token(sent_token)
                 except RefreshLockContended as exc:
                     raise TokenRefreshUnavailable(
                         "Gmail rejected the access token while the refresh lock was busy",

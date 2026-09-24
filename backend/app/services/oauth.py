@@ -921,12 +921,36 @@ class OAuthService:
         against peers and persisted, a dead grant retires the token, notifies
         the user once, and raises ``ReconnectRequired``, and a contended lock
         raises ``RefreshLockContended``.
+
+        A service builds one hook per turn and its parallel tool calls share
+        it. Calls rejected with the same token while a refresh for it is in
+        flight await that refresh and get its outcome, rather than queueing on
+        the advisory lock: a slow token endpoint can hold the lock past
+        ``_LOCK_MAX_WAIT_S``, and a sibling that gave up would report "retry
+        shortly" while its own turn was the one refreshing. Other processes
+        still meet at the advisory lock.
         """
+        in_flight: dict[str, asyncio.Future[OAuthTokenData | None]] = {}
+
+        def _forget(rejected: str, task: asyncio.Future[OAuthTokenData | None]) -> None:
+            if in_flight.get(rejected) is task:
+                del in_flight[rejected]
+            # Every waiter may have been cancelled; retrieve the outcome so an
+            # exception is never reported as unretrieved.
+            if not task.cancelled():
+                task.exception()
 
         async def _refresh(rejected_access_token: str) -> str | None:
-            refreshed = await self.refresh_rejected_token(
-                user_id, integration, rejected_access_token
-            )
+            task = in_flight.get(rejected_access_token)
+            if task is None:
+                task = asyncio.ensure_future(
+                    self.refresh_rejected_token(user_id, integration, rejected_access_token)
+                )
+                in_flight[rejected_access_token] = task
+                task.add_done_callback(functools.partial(_forget, rejected_access_token))
+            # Shielded so one cancelled caller does not cancel the refresh its
+            # siblings are waiting on.
+            refreshed = await asyncio.shield(task)
             return refreshed.access_token if refreshed else None
 
         return _refresh
@@ -939,30 +963,20 @@ class OAuthService:
 
         Permanent errors (e.g. ``invalid_grant`` from a revoked token) mean
         re-authentication is required. Transient errors (network timeouts,
-        provider 5xx) leave the token intact for a later retry.
+        provider 5xx) leave the token intact for a later retry. A token
+        endpoint refusal counts only under ``is_dead_grant_response``, the one
+        rule every integration shares.
         """
         if isinstance(error, PermanentRefreshError):
             return True
         if isinstance(error, httpx.HTTPStatusError):
-            try:
-                body = error.response.json()
-                error_code = body.get("error")
-                is_permanent = error_code in _PERMANENT_OAUTH_ERROR_CODES
-                logger.debug(
-                    "OAuth error classification: status=%s error_code=%s permanent=%s body=%s",
-                    error.response.status_code,
-                    error_code,
-                    is_permanent,
-                    body,
-                )
-                return is_permanent
-            except Exception:
-                logger.debug(
-                    "OAuth error response not JSON: status=%s body=%r",
-                    error.response.status_code,
-                    error.response.text[:200],
-                )
-                return False
+            is_permanent = is_dead_grant_response(error.response)
+            logger.debug(
+                "OAuth error classification: status=%s permanent=%s",
+                error.response.status_code,
+                is_permanent,
+            )
+            return is_permanent
         return False
 
     async def refresh_token(
@@ -980,7 +994,8 @@ class OAuthService:
         caller can tell that transient case from "nothing to refresh".
 
         Returns the updated token data on success, or None if no token or
-        refresh token exists. Raises on HTTP errors so the caller can
+        refresh token exists, including when the user disconnected while the
+        refresh POST was in flight. Raises on HTTP errors so the caller can
         classify them via ``_is_permanent_refresh_failure``. A permanent
         failure has already deleted the token, under the lock, by then.
 
@@ -1123,8 +1138,20 @@ class OAuthService:
                 # landed during the request is not overwritten by the copy
                 # loaded before it.
                 current = await self.load_token_uncached(user_id, integration)
-                if current is not None:
-                    token.extra = current.extra
+                if current is None:
+                    # The user disconnected while the POST was in flight.
+                    # Saving would upsert the credential they just removed, so
+                    # drop the refreshed tokens and report nothing to refresh:
+                    # callers then read the connection as gone. No notice, as
+                    # the user chose this.
+                    logger.info(
+                        "Token disconnected during refresh, discarding result: "
+                        "user=%s integration=%s",
+                        user_id,
+                        integration,
+                    )
+                    return None
+                token.extra = current.extra
                 await self.save_token(user_id, integration, token)
                 logger.info(
                     "Refreshed OAuth token: user=%s integration=%s",

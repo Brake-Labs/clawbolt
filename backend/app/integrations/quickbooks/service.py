@@ -14,7 +14,12 @@ from typing import Any
 
 import httpx
 
-from backend.app.services.oauth import ReconnectRequired, reconnect_instruction
+from backend.app.services.oauth import (
+    ReconnectRequired,
+    RefreshLockContended,
+    TokenRefreshUnavailable,
+    reconnect_instruction,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,9 +69,12 @@ class QuickBooksOnlineService(QuickBooksService):
         refresh_access_token: Callable[[str], Awaitable[str | None]] | None = None,
     ) -> None:
         """``refresh_access_token`` is called with the access token QBO just
-        answered 401 to and returns a fresh one, or None when no refresh could
-        run. It owns the OAuth side (locking, persistence, retiring a dead
-        grant) and raises ``ReconnectRequired`` when the grant is dead.
+        answered 401 to and returns a fresh one, or None when there is nothing
+        to refresh with (no refresh token, no OAuth config). It owns the OAuth
+        side (locking, persistence, retiring a dead grant), raises
+        ``ReconnectRequired`` when the grant is dead, and raises
+        ``RefreshLockContended`` when a peer held the refresh lock past the
+        wait.
         """
         self._realm_id = realm_id
         self._access_token = access_token
@@ -103,15 +111,20 @@ class QuickBooksOnlineService(QuickBooksService):
         """Make an authenticated request to the QBO API with token refresh on 401.
 
         Raises ``ReconnectRequired`` when the refresh finds the grant dead or
-        the retried request is still refused with 401/403.
+        the retried request is still refused with 401/403, and
+        ``TokenRefreshUnavailable`` when the refresh lock was contended.
 
         ``content_type`` defaults to JSON because every entity CRUD endpoint
         wants JSON. The ``/send`` endpoint is the lone exception: Intuit
         requires ``application/octet-stream`` and 500s on JSON.
         """
         url = f"{self._api_base}{path}"
+        # The token this call sends. A parallel call may swap in a refreshed
+        # one before this call's 401 comes back; naming the token QBO actually
+        # rejected lets the shared refresh see that and skip a second POST.
+        sent_token = self._access_token
         headers = {
-            "Authorization": f"Bearer {self._access_token}",
+            "Authorization": f"Bearer {sent_token}",
             "Accept": "application/json",
             "Content-Type": content_type,
         }
@@ -121,7 +134,14 @@ class QuickBooksOnlineService(QuickBooksService):
             self._log_intuit_tid(resp)
 
             if resp.status_code == 401 and self._refresh_access_token is not None:
-                new_token = await self._refresh_access_token(self._access_token)
+                try:
+                    new_token = await self._refresh_access_token(sent_token)
+                except RefreshLockContended as exc:
+                    raise TokenRefreshUnavailable(
+                        "QuickBooks rejected the access token while the refresh lock was busy",
+                        request=resp.request,
+                        response=resp,
+                    ) from exc
                 if new_token:
                     self._access_token = new_token
                     headers["Authorization"] = f"Bearer {new_token}"

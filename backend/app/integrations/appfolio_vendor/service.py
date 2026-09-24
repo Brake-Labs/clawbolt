@@ -536,10 +536,12 @@ class AppFolioVendorService:
         on_customer_ids_resolved: Callable[[list[str]], Awaitable[None]] | None = None,
     ) -> None:
         """``refresh_rejected_jwt`` is called with the JWT AppFolio just
-        answered 401 to and returns a fresh one, or None when no refresh could
-        run. It owns the OAuth side (locking, persistence, retiring a dead
-        grant) and raises ``ReconnectRequired`` when the grant is dead. The
-        factory wires ``oauth_service.build_rejected_token_refresher``.
+        answered 401 to and returns a fresh one, or None when there is nothing
+        to refresh with (no refresh token). It owns the OAuth side (locking,
+        persistence, retiring a dead grant), raises ``ReconnectRequired`` when
+        the grant is dead, and raises ``RefreshLockContended`` when a peer held
+        the refresh lock past the wait. The factory wires
+        ``oauth_service.build_rejected_token_refresher``.
         """
         self._credential = credential
         self._api_base = api_base.rstrip("/")

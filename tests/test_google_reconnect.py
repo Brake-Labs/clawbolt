@@ -362,10 +362,12 @@ async def test_403_and_429_are_not_refreshed_or_reclassified(
 async def test_concurrent_calls_on_a_dead_grant_post_once_and_notify_once(
     test_user: User, monkeypatch: pytest.MonkeyPatch, notify: AsyncMock
 ) -> None:
-    """Two tool calls in one turn hit the same dead grant at once.
+    """Two callers with their own refresh hooks hit the same dead grant at once.
 
-    Regression: the token was deleted only after the refresh lock was
-    released, so the peer waiting on the lock reloaded the still-present
+    Separate hooks, as two workers have, so the second caller queues on the
+    advisory lock (calls sharing one hook await its in-flight refresh
+    instead). Regression: the token was deleted only after the refresh lock
+    was released, so the peer waiting on the lock reloaded the still-present
     token, posted the dead refresh token again, and notified a second time.
     """
     await _connect(test_user, "google_calendar")
@@ -403,8 +405,9 @@ async def test_concurrent_calls_on_a_dead_grant_post_once_and_notify_once(
 
     monkeypatch.setattr(oauth_service, "handle_permanent_refresh_failure", slow_handle)
 
-    refresh = oauth_service.build_rejected_token_refresher(test_user.id, "google_calendar")
-    results = await asyncio.gather(refresh("at-old"), refresh("at-old"), return_exceptions=True)
+    first = oauth_service.build_rejected_token_refresher(test_user.id, "google_calendar")
+    second = oauth_service.build_rejected_token_refresher(test_user.id, "google_calendar")
+    results = await asyncio.gather(first("at-old"), second("at-old"), return_exceptions=True)
 
     assert all(isinstance(r, ReconnectRequired) for r in results), results
     assert len(posts) == 1
