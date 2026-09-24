@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -31,6 +32,17 @@ from backend.app.services.oauth import (
 def oauth_svc() -> OAuthService:
     """Return a fresh OAuthService (no shared state with the module singleton)."""
     return OAuthService()
+
+
+def _db_row(token: OAuthTokenData) -> AsyncMock:
+    """A ``load_token`` stand-in that reads *token* the way the database does.
+
+    Every call returns its own copy, as every real read builds a new object.
+    ``refresh_token`` updates the token it loaded in place, so a mock handing
+    back one shared object would make its post-POST re-read see this refresh's
+    own result instead of the stored row.
+    """
+    return AsyncMock(side_effect=lambda *_args: copy.deepcopy(token))
 
 
 def _make_http_error(
@@ -152,7 +164,7 @@ class TestRefreshToken:
         mock_client.post = AsyncMock(return_value=mock_response)
 
         with (
-            patch.object(oauth_svc, "load_token", new_callable=AsyncMock, return_value=stored),
+            patch.object(oauth_svc, "load_token", _db_row(stored)),
             patch.object(oauth_svc, "save_token", new_callable=AsyncMock) as save_mock,
             patch.object(oauth_svc, "_get_http", return_value=mock_client),
             patch(
@@ -197,7 +209,7 @@ class TestRefreshToken:
         mock_client.post = AsyncMock(return_value=mock_response)
 
         with (
-            patch.object(oauth_svc, "load_token", new_callable=AsyncMock, return_value=stored),
+            patch.object(oauth_svc, "load_token", _db_row(stored)),
             patch.object(oauth_svc, "save_token", new_callable=AsyncMock) as save_mock,
             patch.object(oauth_svc, "_get_http", return_value=mock_client),
             patch(
@@ -225,7 +237,7 @@ class TestRefreshToken:
 
     async def test_no_refresh_token_returns_none(self, oauth_svc: OAuthService) -> None:
         stored = OAuthTokenData(access_token="at", refresh_token="")
-        with patch.object(oauth_svc, "load_token", new_callable=AsyncMock, return_value=stored):
+        with patch.object(oauth_svc, "load_token", _db_row(stored)):
             result = await oauth_svc.refresh_token("user-1", "google_calendar")
         assert result is None
 
@@ -248,7 +260,7 @@ class TestRefreshToken:
 
         before = time.time()
         with (
-            patch.object(oauth_svc, "load_token", new_callable=AsyncMock, return_value=stored),
+            patch.object(oauth_svc, "load_token", _db_row(stored)),
             patch.object(oauth_svc, "save_token", new_callable=AsyncMock),
             patch.object(oauth_svc, "_get_http", return_value=mock_client),
             patch(
@@ -283,7 +295,7 @@ class TestRefreshToken:
         mock_client.post = AsyncMock(return_value=mock_response)
 
         with (
-            patch.object(oauth_svc, "load_token", new_callable=AsyncMock, return_value=stored),
+            patch.object(oauth_svc, "load_token", _db_row(stored)),
             patch.object(oauth_svc, "save_token", new_callable=AsyncMock),
             patch.object(oauth_svc, "_get_http", return_value=mock_client),
             patch(
@@ -321,7 +333,7 @@ class TestRefreshToken:
         mock_client.post = AsyncMock(return_value=mock_response)
 
         with (
-            patch.object(oauth_svc, "load_token", new_callable=AsyncMock, return_value=stored),
+            patch.object(oauth_svc, "load_token", _db_row(stored)),
             patch.object(oauth_svc, "save_token", new_callable=AsyncMock),
             patch.object(oauth_svc, "_get_http", return_value=mock_client),
             patch(
@@ -372,7 +384,7 @@ class TestRefreshRejectedToken:
             )
         )
         with (
-            patch.object(oauth_svc, "load_token", new_callable=AsyncMock, return_value=stored),
+            patch.object(oauth_svc, "load_token", _db_row(stored)),
             patch.object(oauth_svc, "save_token", new_callable=AsyncMock),
             patch.object(oauth_svc, "_get_http", return_value=mock_client),
             patch("backend.app.services.oauth.get_oauth_config", side_effect=_config),
@@ -391,12 +403,12 @@ class TestRefreshRejectedToken:
         )
         mock_client = AsyncMock()
         with (
-            patch.object(oauth_svc, "load_token", new_callable=AsyncMock, return_value=stored),
+            patch.object(oauth_svc, "load_token", _db_row(stored)),
             patch.object(oauth_svc, "_get_http", return_value=mock_client),
         ):
             result = await oauth_svc.refresh_rejected_token("user-1", "quickbooks", "at-rejected")
 
-        assert result is stored
+        assert result == stored
         mock_client.post.assert_not_called()
 
     async def test_permanent_failure_retires_token_and_raises_reconnect(
@@ -710,10 +722,16 @@ class TestRefreshTokenLockSerialization:
         # and short-circuit without hitting the upstream.
         persisted: dict[str, OAuthTokenData] = {"current": initial_token}
 
+        saves = 0
+
         def _load_uncached(uid: str, ig: str) -> OAuthTokenData | None:
-            return persisted["current"]
+            # A copy per read, as the database gives: the refresh updates the
+            # token it loaded in place, and must not see that on its re-read.
+            return copy.deepcopy(persisted["current"])
 
         def _save(uid: str, ig: str, token: OAuthTokenData) -> None:
+            nonlocal saves
+            saves += 1
             # Snapshot the token so subsequent reads see the rotated
             # value. ``OAuthTokenData`` is a dataclass; the production
             # code mutates the instance in place before saving, so we
@@ -801,6 +819,7 @@ class TestRefreshTokenLockSerialization:
             f"expected exactly one upstream POST under the lock, got {call_count}; "
             "the advisory lock failed to serialize concurrent refreshes"
         )
+        assert saves == 1
         assert all(r is not None for r in results), (
             "every caller should return the rotated token; "
             f"got {[None if r is None else 'token' for r in results]}"

@@ -359,6 +359,49 @@ async def test_403_and_429_are_not_refreshed_or_reclassified(
     notify.assert_not_awaited()
 
 
+@EVERY_INTEGRATION
+async def test_a_401_arriving_after_a_sibling_refreshed_does_not_refresh_again(
+    test_user: User, monkeypatch: pytest.MonkeyPatch, notify: AsyncMock, spec: _Spec
+) -> None:
+    """Regression: the service named its current token, not the one Google refused,
+    so a 401 that came back after a sibling's refresh posted the new refresh
+    token again and rotated the tokens for nothing."""
+    await _connect(test_user, spec.integration)
+    first_retry_done = asyncio.Event()
+    old_token_calls = 0
+    posts: list[httpx.Request] = []
+
+    async def google(request: httpx.Request) -> httpx.Response:
+        nonlocal old_token_calls
+        if request.headers["Authorization"] == "Bearer at-new":
+            first_retry_done.set()
+            return httpx.Response(200, json={"items": [], "messages": []})
+        old_token_calls += 1
+        if old_token_calls == 2:
+            # This call's 401 comes back only after the sibling refreshed.
+            await asyncio.wait_for(first_retry_done.wait(), timeout=5)
+        return httpx.Response(401, json={})
+
+    def token_endpoint(request: httpx.Request) -> httpx.Response:
+        posts.append(request)
+        return httpx.Response(
+            200, json={"access_token": "at-new", "refresh_token": "rt-new", "expires_in": 3600}
+        )
+
+    _wire(monkeypatch, google=google, token_endpoint=token_endpoint)
+    tools = await _tools(test_user, spec)
+
+    results = await asyncio.gather(spec.calls[0](tools), spec.calls[0](tools))
+
+    assert [r.is_error for r in results] == [False, False], [r.content for r in results]
+    assert old_token_calls == 2
+    assert len(posts) == 1
+    stored = await _stored(test_user, spec.integration)
+    assert stored is not None
+    assert (stored.access_token, stored.refresh_token) == ("at-new", "rt-new")
+    notify.assert_not_awaited()
+
+
 async def test_concurrent_calls_on_a_dead_grant_post_once_and_notify_once(
     test_user: User, monkeypatch: pytest.MonkeyPatch, notify: AsyncMock
 ) -> None:

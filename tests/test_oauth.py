@@ -1447,3 +1447,81 @@ async def test_refresh_sweep_keeps_a_token_after_transient_failure(
     assert await oauth_svc.load_token_uncached(test_user.id, "gmail") is not None
     notify.assert_not_awaited()
     assert refresh.await_count == 2
+
+
+@pytest.mark.parametrize("entry_point", ["rejected_token_hook", "get_valid_token", "sweep"])
+async def test_reconnect_during_the_refresh_post_keeps_the_new_connection(
+    oauth_svc: OAuthService,
+    test_user: User,
+    monkeypatch: pytest.MonkeyPatch,
+    entry_point: str,
+) -> None:
+    """Regression: a user who reconnected to another QuickBooks company while a
+    refresh POST for the old grant was in flight had the old grant's tokens and
+    company saved over the new connection. Every refresh entry point now leaves
+    the new connection in place, and the callers that use a token get its token.
+    """
+    await _mark_user_active(test_user.id)
+    await oauth_svc.save_token(
+        test_user.id,
+        "quickbooks",
+        OAuthTokenData(
+            access_token="at-old",
+            refresh_token="rt-old",
+            expires_at=time.time() + 60,
+            realm_id="9999",
+        ),
+    )
+    new_connection = OAuthTokenData(
+        access_token="at-new-grant",
+        refresh_token="rt-new-grant",
+        expires_at=time.time() + 3600,
+        realm_id="8888",
+        extra={"connected_via": "callback"},
+    )
+    posted: list[str] = []
+
+    async def token_endpoint(request: httpx.Request) -> httpx.Response:
+        posted.append(request.read().decode())
+        # The user disconnects and connects another company while this answers.
+        await oauth_svc.delete_token(test_user.id, "quickbooks")
+        await oauth_svc.save_token(test_user.id, "quickbooks", new_connection)
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "at-old-grant",
+                "refresh_token": "rt-old-grant",
+                "expires_in": 3600,
+            },
+        )
+
+    monkeypatch.setattr(
+        "backend.app.services.oauth.get_oauth_config",
+        lambda integration: OAuthConfig(
+            integration=integration,
+            client_id="cid",
+            client_secret="csecret",
+            authorize_url="https://oauth.example.invalid/authorize",
+            token_url="https://oauth.example.invalid/token",
+            scopes=[],
+        ),
+    )
+    token_client = httpx.AsyncClient(transport=httpx.MockTransport(token_endpoint))
+    monkeypatch.setattr(oauth_svc, "_get_http", lambda: token_client)
+
+    with patch.object(oauth_svc, "_notify_reauth_needed", new_callable=AsyncMock) as notify:
+        if entry_point == "rejected_token_hook":
+            refresh = oauth_svc.build_rejected_token_refresher(test_user.id, "quickbooks")
+            assert await refresh("at-old") == "at-new-grant"
+        elif entry_point == "get_valid_token":
+            valid = await oauth_svc.get_valid_token(test_user.id, "quickbooks")
+            assert valid is not None
+            assert (valid.access_token, valid.realm_id) == ("at-new-grant", "8888")
+        else:
+            await OAuthRefreshScheduler(oauth_svc).sweep()
+
+    assert len(posted) == 1
+    assert "rt-old" in posted[0]
+    stored = await oauth_svc.load_token_uncached(test_user.id, "quickbooks")
+    assert stored == new_connection
+    notify.assert_not_awaited()

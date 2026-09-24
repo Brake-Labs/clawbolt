@@ -36,9 +36,11 @@ from backend.app.agent.tools.registry import ToolContext
 from backend.app.integrations.appfolio_vendor.auth import (
     INTEGRATION_NAME,
     AppFolioCredential,
+    clear_credential,
     load_credential,
     save_credential,
     save_customer_ids,
+    upsert_fingerprint,
 )
 from backend.app.integrations.appfolio_vendor.factory import (
     _appfolio_vendor_auth_check,
@@ -464,3 +466,70 @@ async def test_parallel_401s_in_one_turn_outlast_the_lock_wait(
     assert stored is not None
     assert (stored.jwt, stored.refresh_token) == ("jwt-new", "rt-new")
     notify.assert_not_awaited()
+
+
+@pytest.mark.parametrize("disconnected_first", [False, True], ids=["new_link", "disconnect"])
+async def test_reconnect_during_the_refresh_post_keeps_the_new_credential(
+    test_user: User,
+    monkeypatch: pytest.MonkeyPatch,
+    notify: AsyncMock,
+    disconnected_first: bool,
+) -> None:
+    """Regression: the user connected a new magic link while a refresh POST for the
+    old grant was in flight, and the refresh then saved the old grant's JWT and
+    refresh token over the new credential. After a disconnect the new credential
+    also has a new fingerprint, which the old JWT is not bound to, so the stored
+    credential stopped working altogether."""
+    await _connect(test_user)
+    new_fingerprint = ""
+    seen: list[tuple[str, str]] = []
+
+    def api(request: httpx.Request) -> httpx.Response:
+        # A JWT is accepted only with the fingerprint it was issued for.
+        bearer, fingerprint = request.headers["Authorization"], request.headers["X-Fingerprint"]
+        seen.append((bearer, fingerprint))
+        if (bearer, fingerprint) == ("Bearer jwt-new-grant", new_fingerprint):
+            return httpx.Response(200, json=_WORK_ORDERS)
+        return httpx.Response(401, json=_LOGIN_401)
+
+    async def token(request: httpx.Request) -> httpx.Response:
+        nonlocal new_fingerprint
+        # The connect flow, as ``connect_via_magic_link`` runs it.
+        if disconnected_first:
+            await clear_credential(test_user.id)
+        new_fingerprint = await upsert_fingerprint(test_user.id)
+        await save_credential(
+            user_id=test_user.id,
+            jwt="jwt-new-grant",
+            fingerprint=new_fingerprint,
+            customer_ids=[],
+            refresh_token="rt-new-grant",
+        )
+        return httpx.Response(
+            200, json={"access_token": "jwt-old-grant", "refresh_token": "rt-old-grant"}
+        )
+
+    _wire(monkeypatch, api=api, token=token)
+    tools = await _tools(test_user)
+
+    result = await _list(tools)
+
+    stored = await _stored(test_user)
+    assert stored is not None
+    assert (stored.jwt, stored.refresh_token, stored.fingerprint) == (
+        "jwt-new-grant",
+        "rt-new-grant",
+        new_fingerprint,
+    )
+    assert (new_fingerprint == "fp-1") is not disconnected_first
+    # The call retries once with the new credential's JWT; the old grant's is
+    # never sent. This turn's service still carries the fingerprint it was built
+    # with, so the retry works only when the reconnect kept it.
+    assert [bearer for bearer, _ in seen] == ["Bearer jwt-old", "Bearer jwt-new-grant"]
+    assert result.is_error is disconnected_first, result.content
+    if disconnected_first:
+        # Not a dead session: the user is not told to reconnect again.
+        assert result.error_kind is ToolErrorKind.SERVICE
+    notify.assert_not_awaited()
+    # The next turn is built from the new credential and works.
+    assert (await _list(await _tools(test_user))).is_error is False
