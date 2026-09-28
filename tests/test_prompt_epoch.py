@@ -650,7 +650,7 @@ async def test_live_turn_classifies_history_by_its_own_tools(
         patch.object(settings, "cold_start_verbatim_turns", 1),
         patch("backend.app.agent.router.assemble_turn_tools", assemble),
         patch(
-            "backend.app.agent.core.amessages",
+            "backend.app.agent.core.amessages_streamed",
             new_callable=AsyncMock,
             return_value=make_text_response("Sent."),
         ) as llm,
@@ -700,7 +700,7 @@ async def _turn(
     return systems, mock.call_args_list[-1].kwargs["messages"]
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_system_block_is_byte_identical_within_an_epoch(
     mock_amessages: AsyncMock, test_user: User
 ) -> None:
@@ -761,7 +761,7 @@ def test_a_repeated_line_is_placed_by_its_context() -> None:
     assert " ## Test Customer C\n-- deposit paid: no\n+- deposit paid: yes" in updates
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_the_next_cold_start_folds_the_edit_into_the_snapshot(
     mock_amessages: AsyncMock, test_user: User
 ) -> None:
@@ -778,7 +778,7 @@ async def test_the_next_cold_start_folds_the_edit_into_the_snapshot(
     assert "Workspace Updates" not in messages[-1]["content"]
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_an_unchanged_workspace_adds_nothing_to_the_current_turn(
     mock_amessages: AsyncMock, test_user: User
 ) -> None:
@@ -793,7 +793,7 @@ async def test_an_unchanged_workspace_adds_nothing_to_the_current_turn(
     assert "Workspace Updates" not in current_turn
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_heartbeat_turns_render_the_live_workspace(
     mock_amessages: AsyncMock, test_user: User
 ) -> None:
@@ -812,7 +812,7 @@ async def test_heartbeat_turns_render_the_live_workspace(
     assert "Workspace Updates" not in call.kwargs["messages"][-1]["content"]
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_both_settings_off_keep_the_old_layout(
     mock_amessages: AsyncMock, test_user: User
 ) -> None:
@@ -986,7 +986,7 @@ def _sent_results(messages: list[dict[str, Any]]) -> list[str]:
     ]
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_stripped_guidance_is_delivered_again_once(
     mock_amessages: AsyncMock, test_user: User, one_hour_cache: None
 ) -> None:

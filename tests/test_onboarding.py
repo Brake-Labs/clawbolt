@@ -337,7 +337,7 @@ def mock_download_media() -> AsyncMock:
 # --- Integration tests ---
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_onboarding_uses_onboarding_prompt(
     mock_amessages: object,
     new_user: User,
@@ -365,7 +365,7 @@ async def test_onboarding_uses_onboarding_prompt(
     assert "first conversation" in system_msg or "blank slate" in system_msg
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_onboarding_completes_when_bootstrap_deleted(
     mock_amessages: object,
     new_user: User,
@@ -411,7 +411,7 @@ async def test_onboarding_completes_when_bootstrap_deleted(
     assert not refreshed.heartbeat_text
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_complete_profile_uses_normal_prompt(
     mock_amessages: object,
     test_user: User,
@@ -449,7 +449,7 @@ async def test_complete_profile_uses_normal_prompt(
 # ---------------------------------------------------------------------------
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_prepopulated_user_gets_onboarding_complete(
     mock_amessages: object,
 ) -> None:
@@ -529,7 +529,7 @@ async def test_prepopulated_user_gets_onboarding_complete(
     assert refreshed.onboarding_complete is True
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_empty_user_without_bootstrap_self_heals_and_onboards(
     mock_amessages: object,
 ) -> None:
@@ -593,7 +593,7 @@ async def test_empty_user_without_bootstrap_self_heals_and_onboards(
 
 
 @patch("backend.app.agent.heartbeat.evaluate_heartbeat_need")
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_prepopulated_user_included_in_heartbeat(
     mock_amessages: object,
     mock_eval: AsyncMock,
@@ -691,7 +691,7 @@ async def test_prepopulated_user_included_in_heartbeat(
 # ---------------------------------------------------------------------------
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_no_completion_message_when_already_onboarded(
     mock_amessages: object,
     test_user: User,
@@ -899,7 +899,7 @@ def test_is_onboarding_needed_no_heuristic_evidence() -> None:
     assert is_onboarding_needed(user) is True
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_onboarding_completes_via_heuristic_when_bootstrap_not_deleted(
     mock_amessages: object,
 ) -> None:
@@ -1004,7 +1004,7 @@ async def test_onboarding_completes_via_heuristic_when_bootstrap_not_deleted(
     assert not refreshed.heartbeat_text
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_heuristic_does_not_fire_when_only_name_set_early(
     mock_amessages: object,
 ) -> None:
@@ -1088,7 +1088,7 @@ async def test_heuristic_does_not_fire_when_only_name_set_early(
     assert refreshed.onboarding_complete is False
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_heuristic_blocked_by_message_count_gate(
     mock_amessages: object,
 ) -> None:
@@ -1175,7 +1175,7 @@ async def test_heuristic_blocked_by_message_count_gate(
     assert refreshed.onboarding_complete is False
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_onboarding_force_completes_at_max_user_messages(
     mock_amessages: object,
 ) -> None:
@@ -1261,7 +1261,7 @@ async def test_onboarding_force_completes_at_max_user_messages(
 # ---------------------------------------------------------------------------
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_auto_exit_when_name_tz_captured_and_min_turns_reached(
     mock_amessages: object,
 ) -> None:
@@ -1352,7 +1352,7 @@ async def test_auto_exit_when_name_tz_captured_and_min_turns_reached(
     assert refreshed.onboarding_complete is True
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_auto_exit_does_not_fire_below_min_turns(
     mock_amessages: object,
 ) -> None:
@@ -1425,7 +1425,7 @@ async def test_auto_exit_does_not_fire_below_min_turns(
     assert refreshed.onboarding_complete is False
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_auto_exit_does_not_fire_without_timezone(
     mock_amessages: object,
 ) -> None:

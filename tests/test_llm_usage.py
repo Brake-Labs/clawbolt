@@ -132,7 +132,7 @@ async def test_log_llm_usage_different_models(test_user: User) -> None:
 # ---------------------------------------------------------------------------
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_agent_process_message_logs_usage(
     mock_amessages: MagicMock,
     test_user: User,

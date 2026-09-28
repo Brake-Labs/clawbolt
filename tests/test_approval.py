@@ -845,7 +845,7 @@ class TestApprovalGate:
 
 
 class TestAgentApproval:
-    @patch("backend.app.agent.core.amessages")
+    @patch("backend.app.agent.core.amessages_streamed")
     async def test_tool_without_policy_executes_normally(
         self, mock_amessages: object, test_user: User
     ) -> None:
@@ -866,7 +866,7 @@ class TestAgentApproval:
         assert response.reply_text == "Done!"
         assert any(tc.name == "echo" and not tc.is_error for tc in response.tool_calls)
 
-    @patch("backend.app.agent.core.amessages")
+    @patch("backend.app.agent.core.amessages_streamed")
     async def test_tool_with_auto_skips_gate(self, mock_amessages: object, test_user: User) -> None:
         """Tool with AUTO default_level executes without prompting."""
         tool = Tool(
@@ -885,7 +885,7 @@ class TestAgentApproval:
         response = await agent.process_message("echo hello")
         assert any(tc.name == "echo" and not tc.is_error for tc in response.tool_calls)
 
-    @patch("backend.app.agent.core.amessages")
+    @patch("backend.app.agent.core.amessages_streamed")
     async def test_tool_with_deny_returns_error(
         self, mock_amessages: object, test_user: User
     ) -> None:
@@ -906,7 +906,7 @@ class TestAgentApproval:
         response = await agent.process_message("do it")
         assert any(tc.name == "dangerous" and tc.is_error for tc in response.tool_calls)
 
-    @patch("backend.app.agent.core.amessages")
+    @patch("backend.app.agent.core.amessages_streamed")
     async def test_tool_with_ask_approved_executes(
         self, mock_amessages: object, test_user: User
     ) -> None:
@@ -952,7 +952,7 @@ class TestAgentApproval:
         assert any(tc.name == "fetcher" and not tc.is_error for tc in response.tool_calls)
         mock_publish.assert_called()
 
-    @patch("backend.app.agent.core.amessages")
+    @patch("backend.app.agent.core.amessages_streamed")
     async def test_tool_with_ask_denied_returns_error(
         self, mock_amessages: object, test_user: User
     ) -> None:
@@ -994,7 +994,7 @@ class TestAgentApproval:
 
         assert any(tc.name == "fetcher" and tc.is_error for tc in response.tool_calls)
 
-    @patch("backend.app.agent.core.amessages")
+    @patch("backend.app.agent.core.amessages_streamed")
     async def test_always_persists_auto_to_store(
         self, mock_amessages: object, test_user: User
     ) -> None:
@@ -1038,7 +1038,7 @@ class TestAgentApproval:
         level = await store.check_permission(test_user.id, "fetcher")
         assert level == PermissionLevel.ALWAYS
 
-    @patch("backend.app.agent.core.amessages")
+    @patch("backend.app.agent.core.amessages_streamed")
     async def test_always_allow_all_persists_tool_level_for_every_resource(
         self, mock_amessages: object, test_user: User
     ) -> None:
@@ -1097,7 +1097,7 @@ class TestAgentApproval:
             == PermissionLevel.ALWAYS
         )
 
-    @patch("backend.app.agent.core.amessages")
+    @patch("backend.app.agent.core.amessages_streamed")
     async def test_always_allow_all_does_not_escalate_when_tool_opted_out(
         self, mock_amessages: object, test_user: User
     ) -> None:
@@ -1159,7 +1159,7 @@ class TestAgentApproval:
             == PermissionLevel.ASK
         )
 
-    @patch("backend.app.agent.core.amessages")
+    @patch("backend.app.agent.core.amessages_streamed")
     async def test_always_allow_scopes_to_single_resource(
         self, mock_amessages: object, test_user: User
     ) -> None:
@@ -1216,7 +1216,7 @@ class TestAgentApproval:
             == PermissionLevel.ASK
         )
 
-    @patch("backend.app.agent.core.amessages")
+    @patch("backend.app.agent.core.amessages_streamed")
     async def test_never_persists_deny_to_store(
         self, mock_amessages: object, test_user: User
     ) -> None:
@@ -1260,7 +1260,7 @@ class TestAgentApproval:
         level = await store.check_permission(test_user.id, "fetcher")
         assert level == PermissionLevel.NEVER
 
-    @patch("backend.app.agent.core.amessages")
+    @patch("backend.app.agent.core.amessages_streamed")
     async def test_tool_with_ask_interrupted_returns_error(
         self, mock_amessages: object, test_user: User
     ) -> None:
@@ -1310,7 +1310,7 @@ class TestAgentApproval:
         level = await store.check_permission(test_user.id, "fetcher")
         assert level == PermissionLevel.ASK  # unchanged from default
 
-    @patch("backend.app.agent.core.amessages")
+    @patch("backend.app.agent.core.amessages_streamed")
     async def test_interrupted_does_not_persist_permission(
         self, mock_amessages: object, test_user: User
     ) -> None:
@@ -1359,7 +1359,7 @@ class TestAgentApproval:
         assert "fetcher" not in data.get("tools", {})
         assert "fetcher" not in data.get("resources", {})
 
-    @patch("backend.app.agent.core.amessages")
+    @patch("backend.app.agent.core.amessages_streamed")
     async def test_stored_auto_skips_prompt(self, mock_amessages: object, test_user: User) -> None:
         """A stored AUTO permission skips the approval prompt entirely."""
         mock_publish = AsyncMock()

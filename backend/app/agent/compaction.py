@@ -381,7 +381,9 @@ async def compact_session(
         {"role": "user", "content": "\n".join(user_prompt_parts)},
     ]
     compaction_system = prepare_system_with_caching(COMPACTION_SYSTEM_PROMPT, target)
-    compaction_reasoning = target.reasoning_kwargs(settings.reasoning_effort)
+    compaction_reasoning = target.reasoning_kwargs(
+        settings.compaction_reasoning_effort or settings.reasoning_effort
+    )
     compaction_thinking = compaction_reasoning.get("thinking")
     # A thinking budget must fit under ``max_tokens``. See ``fit_max_tokens_to_reasoning``.
     compaction_max_tokens = fit_max_tokens_to_reasoning(

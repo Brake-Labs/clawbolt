@@ -30,7 +30,7 @@ class _InputParams(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_agent_sends_typing_indicator_before_llm_call(
     mock_amessages: object, test_user: User
 ) -> None:
@@ -58,7 +58,7 @@ async def test_agent_sends_typing_indicator_before_llm_call(
     assert typing_calls[0].args[0].chat_id == "123456789"
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_agent_sends_typing_indicator_before_each_tool_round(
     mock_amessages: object,
     test_user: User,
@@ -106,7 +106,7 @@ async def test_agent_sends_typing_indicator_before_each_tool_round(
     assert typing_calls[0].args[0].chat_id == "123456789"
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_agent_works_without_publish_outbound(
     mock_amessages: object, test_user: User
 ) -> None:
@@ -120,7 +120,7 @@ async def test_agent_works_without_publish_outbound(
     mock_amessages.assert_called_once()  # type: ignore[union-attr]
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_agent_typing_indicator_failure_does_not_break_agent(
     mock_amessages: object, test_user: User
 ) -> None:
@@ -141,7 +141,7 @@ async def test_agent_typing_indicator_failure_does_not_break_agent(
     mock_publish.assert_called()
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_agent_no_typing_indicator_without_chat_id(
     mock_amessages: object, test_user: User
 ) -> None:
@@ -167,7 +167,7 @@ async def test_agent_no_typing_indicator_without_chat_id(
     assert len(typing_calls) == 0
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_agent_sends_one_typing_indicator_per_tool_round(
     mock_amessages: object,
     test_user: User,
@@ -238,7 +238,7 @@ def _typing_calls(mock_publish: AsyncMock) -> list[OutboundMessage]:
 
 
 @patch("backend.app.agent.core._TYPING_KEEPALIVE_SECONDS", 0.01)
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_agent_refreshes_typing_indicator_during_slow_tool_call(
     mock_amessages: object,
     test_user: User,
@@ -300,7 +300,7 @@ async def test_agent_refreshes_typing_indicator_during_slow_tool_call(
 
 
 @patch("backend.app.agent.core._TYPING_KEEPALIVE_SECONDS", 0.01)
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_typing_keepalive_stops_when_tool_raises(
     mock_amessages: object,
     test_user: User,
@@ -344,7 +344,7 @@ async def test_typing_keepalive_stops_when_tool_raises(
 
 
 @patch("backend.app.agent.core._TYPING_KEEPALIVE_SECONDS", 0.01)
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_typing_keepalive_stops_when_the_wrapped_await_raises(
     mock_amessages: object,
     test_user: User,
@@ -383,7 +383,7 @@ async def test_typing_keepalive_stops_when_the_wrapped_await_raises(
 
 
 @patch("backend.app.agent.core._TYPING_KEEPALIVE_SECONDS", 0.01)
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_typing_keepalive_noop_without_chat_id(
     mock_amessages: object,
     test_user: User,

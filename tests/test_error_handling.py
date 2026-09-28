@@ -36,7 +36,7 @@ def mock_download_media() -> AsyncMock:
     return AsyncMock()
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_agent_llm_failure_returns_friendly_message(
     mock_amessages: object,
     test_user: User,
@@ -58,7 +58,7 @@ async def test_agent_llm_failure_returns_friendly_message(
     assert "try again" in response.reply_text
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_all_media_download_failure_adds_note(
     mock_amessages: object,
     test_user: User,
@@ -87,7 +87,7 @@ async def test_all_media_download_failure_adds_note(
     assert "couldn't download" in user_msg
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 @patch("backend.app.media.pipeline.analyze_image", new_callable=AsyncMock)
 async def test_partial_media_success(
     mock_vision: AsyncMock,
@@ -131,7 +131,7 @@ async def test_partial_media_success(
     assert mock_vision.await_count == 0
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_outbound_stored_and_published_to_bus(
     mock_amessages: object,
     test_user: User,
@@ -161,7 +161,7 @@ async def test_outbound_stored_and_published_to_bus(
     assert not message_bus.outbound.empty()
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 @patch("backend.app.agent.router.process_message_media", new_callable=AsyncMock)
 async def test_media_pipeline_failure_falls_back_to_text(
     mock_pipeline: AsyncMock,

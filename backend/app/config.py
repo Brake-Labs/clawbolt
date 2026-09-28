@@ -202,6 +202,9 @@ class Settings(BaseSettings):
     memory_recall_limit: int = Field(default=20, ge=1)
     compaction_enabled: bool = True
     compaction_model: str = ""  # empty = fall back to llm_model
+    # Empty = fall back to reasoning_effort. Lets the main agent run at a high
+    # effort without paying for it on every compaction.
+    compaction_reasoning_effort: str = ""
     compaction_endpoint: str = ""
     compaction_provider: str = ""
     compaction_max_tokens: int = Field(default=16_000, ge=1)
@@ -373,6 +376,9 @@ class Settings(BaseSettings):
     heartbeat_interval_minutes: int = Field(default=30, ge=1)
     heartbeat_max_daily_messages: int = Field(default=5, ge=1)
     heartbeat_model: str = ""  # empty = fall back to llm_model
+    # Empty = fall back to reasoning_effort. A heartbeat check runs every 30
+    # minutes, so the main agent's effort would multiply its cost.
+    heartbeat_reasoning_effort: str = ""
     heartbeat_endpoint: str = ""
     heartbeat_provider: str = ""
     heartbeat_concurrency: int = Field(default=5, ge=1)
@@ -597,9 +603,11 @@ PERSISTABLE_SETTINGS: frozenset[str] = frozenset(
         "vision_endpoint",
         "vision_provider",
         "heartbeat_model",
+        "heartbeat_reasoning_effort",
         "heartbeat_endpoint",
         "heartbeat_provider",
         "compaction_model",
+        "compaction_reasoning_effort",
         "compaction_endpoint",
         "compaction_provider",
         "compaction_max_tokens",
