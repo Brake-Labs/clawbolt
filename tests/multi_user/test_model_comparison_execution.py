@@ -272,3 +272,24 @@ async def test_without_a_tool_set_the_replay_is_single_round() -> None:
     with patch("backend.app.services.model_comparison.execution.amessages", mock):
         await call_model(_prompt(), None, target=TARGET, reasoning_effort="", recorded=RECORDED)
     assert mock.await_count == 1
+
+
+async def test_replay_writes_every_breakpoint_at_the_five_minute_lifetime() -> None:
+    """A replay's cache is read within minutes, so a 1-hour write pays 2x for nothing."""
+    mock = AsyncMock(return_value=_response(text="ok"))
+    tools = [{"name": "lookup", "description": "d", "input_schema": {"type": "object"}}]
+    with (
+        patch.object(settings, "llm_cache_extended_ttl", True),
+        patch.object(settings, "llm_cache_history_ttl", "1h"),
+        patch("backend.app.services.model_comparison.execution.amessages", mock),
+    ):
+        await call_model(
+            _prompt(),
+            tools,
+            target=LLMTarget(provider="anthropic", model="m", honors_cache_control=True),
+            reasoning_effort="",
+        )
+
+    kwargs = mock.await_args.kwargs
+    assert kwargs["system"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert kwargs["tools"][-1]["cache_control"] == {"type": "ephemeral"}

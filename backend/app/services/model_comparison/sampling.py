@@ -37,7 +37,7 @@ from backend.app.agent.context import (
 from backend.app.agent.core import AssembledPrompt, ClawboltAgent
 from backend.app.agent.dto import StoredMessage
 from backend.app.agent.messages import AgentMessage
-from backend.app.agent.prompt_epoch import build_history_view
+from backend.app.agent.prompt_epoch import build_history_view, find_epoch
 from backend.app.agent.router import init_storage
 from backend.app.agent.session_db import get_session_store
 from backend.app.agent.stores import ToolConfigStore
@@ -403,6 +403,30 @@ def select_samples(fixture: ReplayFixture, limit: int) -> list[ReplaySample]:
             )
         index = end + 1
     return samples[-limit:] if limit > 0 else samples
+
+
+def chain_by_epoch(fixture: ReplayFixture, samples: list[ReplaySample]) -> list[list[ReplaySample]]:
+    """Split *samples* into runs of consecutive turns that shared a production epoch.
+
+    Turns in one epoch render byte-identical history up to their own rows
+    (``build_history_view``), so replaying them in order lets each read the
+    previous one's cached prefix. The epoch is found over the same window
+    ``_history_for`` renders, so a chain breaks where the rendered history
+    would.
+    """
+    chains: list[list[ReplaySample]] = []
+    previous_key: int | None = None
+    for sample in samples:
+        preceding = [r for r in fixture.rows if r.seq < sample.seq]
+        window = preceding[max(len(preceding) - settings.conversation_history_limit, 0) :]
+        current = next((r for r in fixture.rows if r.seq == sample.seq), None)
+        key = find_epoch(window, current)[0].key if current is not None else sample.seq
+        if chains and key == previous_key:
+            chains[-1].append(sample)
+        else:
+            chains.append([sample])
+        previous_key = key
+    return chains
 
 
 def _history_for(

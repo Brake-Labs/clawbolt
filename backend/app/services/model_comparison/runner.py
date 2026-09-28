@@ -43,6 +43,7 @@ from backend.app.services.model_comparison.sampling import (
     ReplayFixture,
     assemble_for_sample,
     build_fixture,
+    chain_by_epoch,
     sample_clock,
     select_samples,
 )
@@ -392,37 +393,36 @@ async def execute_run(run_id: int, *, concurrency: int) -> None:
 
     async def worker(sample: ReplaySample) -> None:
         nonlocal completed, consecutive_failures, breaker_error
-        async with semaphore:
-            if await cancellation.is_cancelled():
-                raise asyncio.CancelledError
-            if breaker_error:
-                # The provider is failing every call. Return rather than
-                # raise: the turns that already landed are the run's evidence
-                # and ``gather`` must not discard the bookkeeping for them.
-                return
-            try:
-                turn = await _replay_turn(
-                    fixture,
-                    sample,
-                    target=target,
-                    reasoning_effort=run.candidate_reasoning_effort,
-                    history_mode=history_mode,
-                )
-            except Exception as exc:
-                logger.exception("Replay of seq=%d failed in run %d", sample.seq, run_id)
-                # A turn that could not even be assembled still belongs in
-                # the report, as a failure rather than a silent omission.
-                detail = f"{type(exc).__name__}: {exc}"
-                turn = TurnReport(
-                    sample=sample,
-                    candidate=ModelCallResult(
-                        provider=run.candidate_provider,
-                        model=run.candidate_model,
-                        error=detail,
-                    ),
-                    outcome=TurnOutcome.NOT_REPLAYED,
-                    issues=[Issue(finding=Finding.CALL_FAILED, detail=detail)],
-                )
+        if await cancellation.is_cancelled():
+            raise asyncio.CancelledError
+        if breaker_error:
+            # The provider is failing every call. Return rather than
+            # raise: the turns that already landed are the run's evidence
+            # and ``gather`` must not discard the bookkeeping for them.
+            return
+        try:
+            turn = await _replay_turn(
+                fixture,
+                sample,
+                target=target,
+                reasoning_effort=run.candidate_reasoning_effort,
+                history_mode=history_mode,
+            )
+        except Exception as exc:
+            logger.exception("Replay of seq=%d failed in run %d", sample.seq, run_id)
+            # A turn that could not even be assembled still belongs in
+            # the report, as a failure rather than a silent omission.
+            detail = f"{type(exc).__name__}: {exc}"
+            turn = TurnReport(
+                sample=sample,
+                candidate=ModelCallResult(
+                    provider=run.candidate_provider,
+                    model=run.candidate_model,
+                    error=detail,
+                ),
+                outcome=TurnOutcome.NOT_REPLAYED,
+                issues=[Issue(finding=Finding.CALL_FAILED, detail=detail)],
+            )
         failure = turn.candidate.error
         async with lock:
             turns.append(turn)
@@ -473,8 +473,22 @@ async def execute_run(run_id: int, *, concurrency: int) -> None:
             )
             return
 
+    async def run_chain(chain: Sequence[ReplaySample]) -> None:
+        # A chain holds its slot from first turn to last so each turn reads
+        # the cache its predecessor wrote seconds ago, rather than queueing
+        # behind other chains long enough for it to expire.
+        async with semaphore:
+            for sample in chain:
+                await worker(sample)
+
+    chains = chain_by_epoch(fixture, samples)
     try:
-        await asyncio.gather(*(worker(s) for s in samples))
+        # The first turn runs alone so the system prompt and tool list it
+        # writes to the cache are there for every later call to read. Calls
+        # started together would each miss and write their own copy.
+        await run_chain(chains[0][:1])
+        chains[0] = chains[0][1:]
+        await asyncio.gather(*(run_chain(chain) for chain in chains if chain))
     except asyncio.CancelledError:
         logger.info("Model comparison run %d cancelled after %d turns", run_id, completed)
         raise

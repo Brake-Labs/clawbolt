@@ -28,10 +28,15 @@ from backend.app.services.model_comparison.sampling import (
     _production_tool_calls,
     assemble_for_sample,
     build_fixture,
+    chain_by_epoch,
     sample_clock,
     select_samples,
 )
-from backend.app.services.model_comparison.types import RecordedToolResult, ReplaySample
+from backend.app.services.model_comparison.types import (
+    HistoryMode,
+    RecordedToolResult,
+    ReplaySample,
+)
 
 BASE_TIME = _dt.datetime(2026, 5, 1, 12, 0, tzinfo=_dt.UTC)
 
@@ -558,3 +563,57 @@ def test_a_corrupt_timestamp_does_not_hand_out_a_batch_exemption() -> None:
     rows[1].timestamp = "not a timestamp"
     assert _production_reply(rows, 0) == ""
     assert _production_tool_calls(rows, 0) == ()
+
+
+# ---------------------------------------------------------------------------
+# Turns of one production epoch replay as a chain that shares a cache prefix
+# ---------------------------------------------------------------------------
+
+
+def test_samples_chain_until_a_cold_gap_opens_a_new_epoch() -> None:
+    later = BASE_TIME + _dt.timedelta(hours=5)
+    rows = [
+        _row(1, "inbound", "a", BASE_TIME),
+        _row(2, "outbound", "a!", BASE_TIME + _dt.timedelta(seconds=20)),
+        _row(3, "inbound", "b", BASE_TIME + _dt.timedelta(minutes=3)),
+        _row(4, "outbound", "b!", BASE_TIME + _dt.timedelta(minutes=4)),
+        _row(5, "inbound", "c", later),
+        _row(6, "outbound", "c!", later + _dt.timedelta(seconds=20)),
+        _row(7, "inbound", "d", later + _dt.timedelta(minutes=2)),
+    ]
+    fixture = ReplayFixture(user=User(id="u"), rows=rows)
+    samples = [
+        ReplaySample(seq=seq, timestamp=rows[seq - 1].timestamp, message_context="x")
+        for seq in (1, 3, 5, 7)
+    ]
+
+    chains = chain_by_epoch(fixture, samples)
+
+    assert [[s.seq for s in chain] for chain in chains] == [[1, 3], [5, 7]]
+
+
+async def test_turns_in_one_epoch_share_the_system_block_and_history_prefix(
+    db_session: Session, test_user: User, _reset_stores: None
+) -> None:
+    """The premise chaining rests on: the later turn's prompt extends the earlier one's."""
+    _seed(
+        db_session,
+        test_user,
+        [
+            ("inbound", "first ask", None),
+            ("outbound", "first answer", None),
+            ("inbound", "second ask", None),
+            ("outbound", "second answer", None),
+            ("inbound", "third ask", None),
+        ],
+    )
+    fixture = await _fixture_for(test_user)
+    first, second = select_samples(fixture, limit=3)[1:]
+    assert len(chain_by_epoch(fixture, [first, second])) == 1
+
+    mode = HistoryMode.COLD_START_COMPACTION
+    earlier = (await assemble_for_sample(fixture, first, mode)).messages
+    later = (await assemble_for_sample(fixture, second, mode)).messages
+
+    # Everything but the current turn is prefix the next turn resends.
+    assert later[: len(earlier) - 1] == earlier[:-1]
