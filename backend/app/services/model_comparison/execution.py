@@ -16,9 +16,8 @@ import copy
 import logging
 import time
 from collections.abc import Sequence
-from typing import Any, cast
+from typing import Any
 
-from any_llm import amessages
 from any_llm.exceptions import AnyLLMError
 from any_llm.types.messages import MessageResponse
 
@@ -36,6 +35,7 @@ from backend.app.config import settings
 from backend.app.services.llm_service import (
     BreakpointTTLs,
     LLMTarget,
+    amessages_streamed,
     apply_history_cache_breakpoint,
     apply_in_turn_cache_breakpoint,
     apply_tool_caching,
@@ -322,16 +322,17 @@ async def _dispatch(
 
     started = time.monotonic()
     try:
-        response = cast(
-            MessageResponse,
-            await amessages(
-                **target.connection_kwargs(),
-                system=system,
-                messages=msg_dicts,
-                tools=schemas,
-                max_tokens=max_tokens,
-                **reasoning,
-            ),
+        # Streamed: the Anthropic SDK refuses an unstreamed call whose
+        # ``max_tokens`` could run past 10 minutes, which every budget from
+        # ``high`` effort up does once ``fit_max_tokens_to_reasoning`` raises
+        # it over the thinking budget. See ``amessages_streamed``.
+        response = await amessages_streamed(
+            **target.connection_kwargs(),
+            system=system,
+            messages=msg_dicts,
+            tools=schemas,
+            max_tokens=max_tokens,
+            **reasoning,
         )
     except AnyLLMError as exc:
         logger.warning("Comparison call failed for %s: %s", target.describe(), exc)
