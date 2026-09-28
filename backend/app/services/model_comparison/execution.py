@@ -34,6 +34,7 @@ from backend.app.agent.messages import (
 from backend.app.agent.tools.base import Tool
 from backend.app.config import settings
 from backend.app.services.llm_service import (
+    BreakpointTTLs,
     LLMTarget,
     apply_history_cache_breakpoint,
     apply_in_turn_cache_breakpoint,
@@ -107,6 +108,12 @@ def _needs_truncation_retry(result: ModelCallResult, max_tokens: int) -> bool:
 # tunable: a run whose incomplete count is high says to raise it, and before
 # this change the same run said the candidate did not write.
 MAX_REPLAY_READ_ROUNDS = 6
+
+# Every breakpoint a replay writes is read within minutes, by the next round
+# or the next turn of the same epoch (see ``runner.execute_run``), so the
+# 1-hour lifetime the live loop uses between a user's messages would pay the
+# 2x write premium where 1.25x buys the same reads.
+REPLAY_CACHE_TTLS = BreakpointTTLs(prefix="5m", history="5m", in_turn="5m")
 
 
 async def call_model(
@@ -305,13 +312,13 @@ async def _dispatch(
     msg_dicts = copy.deepcopy(msg_dicts)
     schemas = copy.deepcopy(tool_schemas) if tool_schemas else None
 
-    msg_dicts = apply_history_cache_breakpoint(msg_dicts, target)
-    msg_dicts = apply_in_turn_cache_breakpoint(msg_dicts, target)
+    msg_dicts = apply_history_cache_breakpoint(msg_dicts, target, REPLAY_CACHE_TTLS)
+    msg_dicts = apply_in_turn_cache_breakpoint(msg_dicts, target, REPLAY_CACHE_TTLS)
     system: str | list[dict[str, Any]] | None = system_str
     if system is not None:
-        system = prepare_system_with_caching(system, target)
+        system = prepare_system_with_caching(system, target, REPLAY_CACHE_TTLS)
     if schemas:
-        schemas = apply_tool_caching(schemas, target)
+        schemas = apply_tool_caching(schemas, target, REPLAY_CACHE_TTLS)
 
     started = time.monotonic()
     try:

@@ -827,3 +827,51 @@ async def test_no_usage_in_the_window_reports_nothing_rather_than_zero_dollars(
         )
     assert usage.calls == 0
     assert usage.total_cost is None
+
+
+async def test_the_first_turn_warms_the_cache_alone_and_chains_run_in_order(
+    db_session: Session, test_user: User
+) -> None:
+    """Calls started together all miss the cache; a chain's turns must each read the last."""
+    run_id = _make_run(db_session, test_user.id, samples=5)
+    samples = _samples(5)
+    events: list[tuple[str, int]] = []
+
+    async def call(assembled: AssembledPrompt, *args: Any, **kwargs: Any) -> ModelCallResult:
+        seq = kwargs["recorded"][0].arguments["seq"]
+        events.append(("start", seq))
+        await asyncio.sleep(0.01)
+        events.append(("end", seq))
+        return _result(text="ok")
+
+    samples = [
+        ReplaySample(
+            seq=s.seq,
+            timestamp=s.timestamp,
+            message_context=s.message_context,
+            production_tool_calls=(
+                RecordedToolResult(name="lookup", arguments={"seq": s.seq}, result="ok"),
+            ),
+        )
+        for s in samples
+    ]
+    by_seq = {s.seq: s for s in samples}
+    chains = [[by_seq[1], by_seq[2]], [by_seq[3], by_seq[4]], [by_seq[5]]]
+    patches = _patched_run(samples=samples, call_side_effect=call)
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patches[3],
+        patch(
+            "backend.app.services.model_comparison.runner.chain_by_epoch",
+            return_value=chains,
+        ),
+    ):
+        await execute_run(run_id, concurrency=4)
+
+    assert events[:2] == [("start", 1), ("end", 1)]
+    for before, after in ((1, 2), (3, 4)):
+        assert events.index(("end", before)) < events.index(("start", after))
+    # Separate chains still overlap.
+    assert events.index(("start", 5)) < events.index(("end", 3))

@@ -344,7 +344,9 @@ def breakpoint_ttls() -> BreakpointTTLs:
     return BreakpointTTLs(prefix=prefix, history=history, in_turn=in_turn)
 
 
-def prepare_system_with_caching(system: str, target: LLMTarget) -> str | list[dict[str, Any]]:
+def prepare_system_with_caching(
+    system: str, target: LLMTarget, ttls: BreakpointTTLs | None = None
+) -> str | list[dict[str, Any]]:
     """Wrap a system prompt string as a single cache-marked content block.
 
     The whole system string is stable across turns: the agent loop now
@@ -356,16 +358,21 @@ def prepare_system_with_caching(system: str, target: LLMTarget) -> str | list[di
     keeps a plain string plain rather than wrapping it in a block list that
     any-llm's bridge would only flatten back again. See
     :func:`provider_honors_cache_control`.
+
+    *ttls* overrides the configured lifetimes here and in the other
+    breakpoint helpers, for a caller whose prompts live on a different
+    timescale from the live loop's (the model comparison replay).
     """
     if not target.honors_cache_control:
         return system
-    control = _cache_control(breakpoint_ttls().prefix)
+    control = _cache_control((ttls or breakpoint_ttls()).prefix)
     return [{"type": "text", "text": system, "cache_control": control}]
 
 
 def apply_history_cache_breakpoint(
     messages: list[dict[str, Any]],
     target: LLMTarget,
+    ttls: BreakpointTTLs | None = None,
 ) -> list[dict[str, Any]]:
     """Stamp a ``cache_control`` breakpoint on the prior-history tail.
 
@@ -406,7 +413,7 @@ def apply_history_cache_breakpoint(
 
     anchor = messages[current_turn_idx - 1]
     content = anchor.get("content")
-    control = _cache_control(breakpoint_ttls().history)
+    control = _cache_control((ttls or breakpoint_ttls()).history)
     if isinstance(content, str):
         blocks: list[dict[str, Any]] = [{"type": "text", "text": content, "cache_control": control}]
     elif isinstance(content, list) and content:
@@ -423,6 +430,7 @@ def apply_history_cache_breakpoint(
 def apply_in_turn_cache_breakpoint(
     messages: list[dict[str, Any]],
     target: LLMTarget,
+    ttls: BreakpointTTLs | None = None,
 ) -> list[dict[str, Any]]:
     """Stamp a ``cache_control`` breakpoint on a trailing tool-result block.
 
@@ -468,12 +476,17 @@ def apply_in_turn_cache_breakpoint(
     ):
         return messages
     blocks = [dict(block) for block in content]
-    blocks[-1] = {**blocks[-1], "cache_control": _cache_control(breakpoint_ttls().in_turn)}
+    blocks[-1] = {
+        **blocks[-1],
+        "cache_control": _cache_control((ttls or breakpoint_ttls()).in_turn),
+    }
     messages[-1] = {**last, "content": blocks}
     return messages
 
 
-def apply_tool_caching(tools: list[dict[str, Any]], target: LLMTarget) -> list[dict[str, Any]]:
+def apply_tool_caching(
+    tools: list[dict[str, Any]], target: LLMTarget, ttls: BreakpointTTLs | None = None
+) -> list[dict[str, Any]]:
     """Add a cache_control marker to the last tool definition.
 
     Anthropic caches everything up to and including the marked block, so
@@ -484,7 +497,7 @@ def apply_tool_caching(tools: list[dict[str, Any]], target: LLMTarget) -> list[d
         return tools
     if not tools:
         return tools
-    tools[-1] = {**tools[-1], "cache_control": _cache_control(breakpoint_ttls().prefix)}
+    tools[-1] = {**tools[-1], "cache_control": _cache_control((ttls or breakpoint_ttls()).prefix)}
     return tools
 
 
