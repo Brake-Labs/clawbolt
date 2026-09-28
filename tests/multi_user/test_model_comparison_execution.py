@@ -59,7 +59,7 @@ def _response(
 
 
 async def _call(mock: AsyncMock, *, effort: str = "", target: LLMTarget = TARGET) -> Any:
-    with patch("backend.app.services.model_comparison.execution.amessages", mock):
+    with patch("backend.app.services.model_comparison.execution.amessages_streamed", mock):
         return await call_model(_prompt(), None, target=target, reasoning_effort=effort)
 
 
@@ -166,7 +166,7 @@ NOTE = {"name": "add_note", "input": {"work_order_id": "71002", "body": "done"}}
 
 
 async def _replay(mock: AsyncMock, recorded: tuple[RecordedToolResult, ...] = RECORDED) -> Any:
-    with patch("backend.app.services.model_comparison.execution.amessages", mock):
+    with patch("backend.app.services.model_comparison.execution.amessages_streamed", mock):
         return await call_model(
             _prompt(),
             None,
@@ -269,7 +269,7 @@ async def test_the_round_cap_leaves_headroom_over_a_lookup_chain() -> None:
 
 async def test_without_a_tool_set_the_replay_is_single_round() -> None:
     mock = AsyncMock(return_value=_response(tool=SEARCH))
-    with patch("backend.app.services.model_comparison.execution.amessages", mock):
+    with patch("backend.app.services.model_comparison.execution.amessages_streamed", mock):
         await call_model(_prompt(), None, target=TARGET, reasoning_effort="", recorded=RECORDED)
     assert mock.await_count == 1
 
@@ -281,7 +281,7 @@ async def test_replay_writes_every_breakpoint_at_the_five_minute_lifetime() -> N
     with (
         patch.object(settings, "llm_cache_extended_ttl", True),
         patch.object(settings, "llm_cache_history_ttl", "1h"),
-        patch("backend.app.services.model_comparison.execution.amessages", mock),
+        patch("backend.app.services.model_comparison.execution.amessages_streamed", mock),
     ):
         await call_model(
             _prompt(),
@@ -293,3 +293,11 @@ async def test_replay_writes_every_breakpoint_at_the_five_minute_lifetime() -> N
     kwargs = mock.await_args.kwargs
     assert kwargs["system"][-1]["cache_control"] == {"type": "ephemeral"}
     assert kwargs["tools"][-1]["cache_control"] == {"type": "ephemeral"}
+
+
+async def test_an_xhigh_replay_is_streamed() -> None:
+    """Regression: the SDK refused every unstreamed xhigh call as possibly over 10 minutes."""
+    mock = AsyncMock(return_value=_response(text="ok"))
+    result = await _call(mock, effort="xhigh")
+    assert result.error == ""
+    assert mock.await_args.kwargs["max_tokens"] > 32768
