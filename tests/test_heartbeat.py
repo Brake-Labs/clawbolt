@@ -4024,7 +4024,10 @@ async def test_heartbeat_auto_approves_send_media_reply(user: User) -> None:
 class TestHeartbeatThinkingBudgetFits:
     """A thinking budget must stay below ``max_tokens``, as in the agent loop."""
 
-    @pytest.mark.parametrize(("effort", "fits"), [("high", True), ("auto", False)])
+    @pytest.mark.parametrize(
+        ("effort", "override", "fits"),
+        [("high", "", True), ("auto", "", False), ("xhigh", "auto", False)],
+    )
     @patch("backend.app.agent.heartbeat.log_llm_usage")
     @patch("backend.app.agent.heartbeat.build_heartbeat_system_prompt", new_callable=AsyncMock)
     @patch("backend.app.agent.heartbeat.HeartbeatStore")
@@ -4041,8 +4044,10 @@ class TestHeartbeatThinkingBudgetFits:
         mock_log_usage: MagicMock,
         user: User,
         effort: str,
+        override: str,
         fits: bool,
     ) -> None:
+        """``heartbeat_reasoning_effort``, when set, replaces the agent's effort."""
         mock_settings.llm_model = "claude-sonnet-4-5"
         mock_settings.llm_provider = "anthropic"
         mock_settings.llm_api_base = None
@@ -4055,6 +4060,7 @@ class TestHeartbeatThinkingBudgetFits:
         mock_settings.llm_max_tokens_heartbeat = 256
         mock_settings.heartbeat_recent_messages_count = 5
         mock_settings.reasoning_effort = effort
+        mock_settings.heartbeat_reasoning_effort = override
 
         mock_session_store = MagicMock()
         mock_session_store.get_recent_messages_async = AsyncMock(return_value=[])

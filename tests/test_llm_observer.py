@@ -165,7 +165,7 @@ def test_compute_min_message_seq_skips_none_seqs() -> None:
 # ---------------------------------------------------------------------------
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_observer_fires_from_agent_loop(
     mock_amessages: MagicMock,
     test_user: User,
@@ -198,7 +198,7 @@ async def test_observer_fires_from_agent_loop(
     assert isinstance(payload.started_at, datetime)
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_observer_fires_again_after_context_length_trim_retry(
     mock_amessages: MagicMock,
     test_user: User,
@@ -283,7 +283,7 @@ async def test_observer_fires_from_compaction(
     assert payload.min_message_seq_in_prompt is None
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_observer_exception_does_not_crash_agent_loop(
     mock_amessages: MagicMock,
     test_user: User,
@@ -394,7 +394,7 @@ async def test_emit_response_swallows_observer_exception(
 # ---------------------------------------------------------------------------
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_response_observer_fires_from_agent_loop(
     mock_amessages: MagicMock,
     test_user: User,
@@ -440,7 +440,7 @@ async def test_response_observer_fires_from_agent_loop(
         assert "type" in block
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_response_observer_purpose_followup_after_trim_retry(
     mock_amessages: MagicMock,
     test_user: User,
@@ -470,7 +470,7 @@ async def test_response_observer_purpose_followup_after_trim_retry(
     assert any(r.purpose == PURPOSE_AGENT_FOLLOWUP for r in responses)
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_response_observer_exception_does_not_crash_agent_loop(
     mock_amessages: MagicMock,
     test_user: User,

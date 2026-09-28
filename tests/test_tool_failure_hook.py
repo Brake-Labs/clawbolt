@@ -68,7 +68,7 @@ async def _run(agent: ClawboltAgent, tool: Tool, mock_llm: AsyncMock) -> None:
 
 
 @patch("backend.app.agent.core.build_agent_system_prompt_parts", new_callable=AsyncMock)
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_tool_returning_an_error_reaches_the_hook(
     mock_llm: AsyncMock,
     mock_prompt: AsyncMock,
@@ -95,7 +95,7 @@ async def test_tool_returning_an_error_reaches_the_hook(
 
 
 @patch("backend.app.agent.core.build_agent_system_prompt_parts", new_callable=AsyncMock)
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_result_text_excludes_our_own_error_hint(
     mock_llm: AsyncMock,
     mock_prompt: AsyncMock,
@@ -115,7 +115,7 @@ async def test_result_text_excludes_our_own_error_hint(
 
 
 @patch("backend.app.agent.core.build_agent_system_prompt_parts", new_callable=AsyncMock)
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_tool_raising_reaches_the_hook_as_internal(
     mock_llm: AsyncMock,
     mock_prompt: AsyncMock,
@@ -135,7 +135,7 @@ async def test_tool_raising_reaches_the_hook_as_internal(
 
 
 @patch("backend.app.agent.core.build_agent_system_prompt_parts", new_callable=AsyncMock)
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_successful_tool_does_not_reach_the_hook(
     mock_llm: AsyncMock,
     mock_prompt: AsyncMock,
@@ -153,7 +153,7 @@ async def test_successful_tool_does_not_reach_the_hook(
 
 
 @patch("backend.app.agent.core.build_agent_system_prompt_parts", new_callable=AsyncMock)
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_a_raising_handler_does_not_break_the_turn(
     mock_llm: AsyncMock,
     mock_prompt: AsyncMock,

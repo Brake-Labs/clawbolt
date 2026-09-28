@@ -2578,11 +2578,17 @@ async def test_hygiene_only_compaction_skips_empty_memory(
     mock_llm.assert_not_called()
 
 
-@pytest.mark.parametrize(("effort", "fits"), [("high", True), ("auto", False)])
+@pytest.mark.parametrize(
+    ("effort", "override", "fits"),
+    [("high", "", True), ("auto", "", False), ("xhigh", "auto", False)],
+)
 async def test_compaction_max_tokens_makes_room_for_the_thinking_budget(
-    test_user: UserData, effort: str, fits: bool
+    test_user: UserData, effort: str, override: str, fits: bool
 ) -> None:
-    """A thinking budget must stay below ``max_tokens``, as in the agent loop."""
+    """A thinking budget must stay below ``max_tokens``, as in the agent loop.
+
+    ``compaction_reasoning_effort``, when set, replaces the agent's effort.
+    """
     mock_response = make_text_response(json.dumps({"memory_update": "", "summary": ""}))
     messages: list[AgentMessage] = [UserMessage(content="test")]
 
@@ -2605,6 +2611,7 @@ async def test_compaction_max_tokens_makes_room_for_the_thinking_budget(
         mock_settings.heartbeat_endpoint = ""
         mock_settings.compaction_endpoint = ""
         mock_settings.reasoning_effort = effort
+        mock_settings.compaction_reasoning_effort = override
         await compact_session(test_user.id, messages)
 
     kwargs = mock_llm.call_args.kwargs

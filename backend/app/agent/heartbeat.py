@@ -383,7 +383,9 @@ async def evaluate_heartbeat_need(
         },
     ]
     heartbeat_tools = [HEARTBEAT_DECISION_TOOL]
-    heartbeat_reasoning = target.reasoning_kwargs(settings.reasoning_effort)
+    heartbeat_reasoning = target.reasoning_kwargs(
+        settings.heartbeat_reasoning_effort or settings.reasoning_effort
+    )
     heartbeat_thinking = heartbeat_reasoning.get("thinking")
     # A thinking budget must fit under ``max_tokens``. See ``fit_max_tokens_to_reasoning``.
     heartbeat_max_tokens = fit_max_tokens_to_reasoning(

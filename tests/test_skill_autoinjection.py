@@ -69,7 +69,7 @@ def _patched_skills() -> AbstractContextManager[dict[str, str]]:
     return patch.dict(loader._skill_instructions, {"estimation": _SKILL_BODY})
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_first_use_appends_skill_guidance(mock_amessages: object, test_user: User) -> None:
     """The first specialist tool result carries the category's SKILL.md."""
     mock_amessages.side_effect = [  # type: ignore[union-attr]
@@ -98,7 +98,7 @@ async def test_first_use_appends_skill_guidance(mock_amessages: object, test_use
     assert any(_SKILL_BODY in block["content"] for block in tool_result_blocks)
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_validation_error_gets_skill_guidance(
     mock_amessages: object, test_user: User
 ) -> None:
@@ -121,7 +121,7 @@ async def test_validation_error_gets_skill_guidance(
     assert _SKILL_BODY not in valid_record.result
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_no_reinjection_within_turn(mock_amessages: object, test_user: User) -> None:
     """A second call to the same category in a later round gets no second copy."""
     mock_amessages.side_effect = [  # type: ignore[union-attr]
@@ -140,7 +140,7 @@ async def test_no_reinjection_within_turn(mock_amessages: object, test_user: Use
     assert _SKILL_BODY not in response.tool_calls[1].result
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_no_reinjection_when_history_carries_marker(
     mock_amessages: object, test_user: User
 ) -> None:
@@ -171,7 +171,7 @@ async def test_no_reinjection_when_history_carries_marker(
     assert _SKILL_BODY not in response.tool_calls[0].result
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_list_capabilities_lookup_suppresses_first_use_injection(
     mock_amessages: object, test_user: User
 ) -> None:
@@ -197,7 +197,7 @@ async def test_list_capabilities_lookup_suppresses_first_use_injection(
     assert _SKILL_BODY not in estimate_record.result
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_core_tool_result_gets_no_guidance(mock_amessages: object, test_user: User) -> None:
     """Tools outside any specialist factory are left untouched."""
     mock_amessages.side_effect = [  # type: ignore[union-attr]
@@ -214,7 +214,7 @@ async def test_core_tool_result_gets_no_guidance(mock_amessages: object, test_us
     assert "[skill-guidance:" not in response.tool_calls[0].result
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_category_without_skill_md_is_untouched(
     mock_amessages: object, test_user: User
 ) -> None:

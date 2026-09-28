@@ -119,7 +119,7 @@ async def test_message_during_turn_yields_one_reply_covering_both(test_user: Use
         channel="telegram", sender_id=test_user.channel_identifier, text=CAPTION_TEXT
     )
 
-    with patch("backend.app.agent.core.amessages", new=llm):
+    with patch("backend.app.agent.core.amessages_streamed", new=llm):
         first_task = asyncio.create_task(process_inbound_from_bus(first))
         await asyncio.wait_for(llm.first_call_started.wait(), timeout=10)
 
@@ -189,7 +189,7 @@ async def test_message_during_tool_round_is_folded_before_next_llm_call(
         channel="telegram", sender_id=test_user.channel_identifier, text=CAPTION_TEXT
     )
     with (
-        patch("backend.app.agent.core.amessages", side_effect=fake_llm),
+        patch("backend.app.agent.core.amessages_streamed", side_effect=fake_llm),
         patch("backend.app.agent.router.assemble_turn_tools", side_effect=fake_assemble),
     ):
         first_task = asyncio.create_task(process_inbound_from_bus(first))
@@ -234,7 +234,7 @@ async def test_folded_message_media_goes_through_media_pipeline(test_user: User)
         media_refs=[("file-photo-2", "image/jpeg")],
     )
 
-    with patch("backend.app.agent.core.amessages", new=llm):
+    with patch("backend.app.agent.core.amessages_streamed", new=llm):
         first_task = asyncio.create_task(process_inbound_from_bus(first, download_media=download))
         await asyncio.wait_for(llm.first_call_started.wait(), timeout=10)
         second_task = asyncio.create_task(process_inbound_from_bus(second, download_media=download))
@@ -263,7 +263,7 @@ async def test_no_folding_when_idle(test_user: User) -> None:
         calls.append(copy.deepcopy(kwargs["messages"]))
         return next(replies_iter)
 
-    with patch("backend.app.agent.core.amessages", side_effect=fake_llm):
+    with patch("backend.app.agent.core.amessages_streamed", side_effect=fake_llm):
         for text in (PHOTO_TEXT, CAPTION_TEXT):
             await process_inbound_from_bus(
                 InboundMessage(
@@ -414,7 +414,7 @@ async def test_webchat_dispatch_is_never_foldable(test_user: User) -> None:
 async def test_agent_without_drain_hook_is_unchanged(test_user: User) -> None:
     """Heartbeats and webchat build the agent without a drain hook."""
     with patch(
-        "backend.app.agent.core.amessages",
+        "backend.app.agent.core.amessages_streamed",
         new_callable=AsyncMock,
         return_value=make_text_response("only reply"),
     ) as mock_llm:
@@ -432,7 +432,7 @@ async def test_agent_sends_draft_when_last_round_has_no_room(test_user: User) ->
     with (
         patch("backend.app.agent.core.MAX_TOOL_ROUNDS", 1),
         patch(
-            "backend.app.agent.core.amessages",
+            "backend.app.agent.core.amessages_streamed",
             new_callable=AsyncMock,
             return_value=make_text_response(STALE_REPLY),
         ),
@@ -447,7 +447,7 @@ async def test_agent_sends_draft_when_last_round_has_no_room(test_user: User) ->
 async def test_agent_survives_drain_failure(test_user: User) -> None:
     drain = AsyncMock(side_effect=RuntimeError("boom"))
     with patch(
-        "backend.app.agent.core.amessages",
+        "backend.app.agent.core.amessages_streamed",
         new_callable=AsyncMock,
         return_value=make_text_response("still replies"),
     ):
@@ -517,7 +517,7 @@ async def test_message_that_interrupts_approval_is_answered_in_same_turn(
 
     gate = get_approval_gate()
     with (
-        patch("backend.app.agent.core.amessages", side_effect=fake_llm),
+        patch("backend.app.agent.core.amessages_streamed", side_effect=fake_llm),
         patch("backend.app.agent.router.assemble_turn_tools", side_effect=fake_assemble),
         patch.object(
             ClawboltAgent,

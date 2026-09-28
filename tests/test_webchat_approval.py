@@ -80,7 +80,7 @@ def _auto_tool(name: str = "reader") -> Tool:
 class TestWebchatApprovalSSE:
     """Verify that approval prompts are published as SSE events for webchat."""
 
-    @patch("backend.app.agent.core.amessages")
+    @patch("backend.app.agent.core.amessages_streamed")
     async def test_approval_publishes_sse_event_with_request_id(
         self, mock_amessages: object, test_user: User
     ) -> None:
@@ -128,7 +128,7 @@ class TestWebchatApprovalSSE:
 
         message_bus.remove_event_queue(request_id)
 
-    @patch("backend.app.agent.core.amessages")
+    @patch("backend.app.agent.core.amessages_streamed")
     async def test_no_sse_event_without_request_id(
         self, mock_amessages: object, test_user: User
     ) -> None:

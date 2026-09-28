@@ -35,7 +35,7 @@ async def test_full_message_round_trip(
 
     with (
         patch(
-            "backend.app.agent.core.amessages",
+            "backend.app.agent.core.amessages_streamed",
             new_callable=AsyncMock,
             return_value=make_text_response("I can help with that deck estimate!"),
         ),
@@ -81,7 +81,7 @@ async def test_full_message_round_trip_new_user() -> None:
 
     with (
         patch(
-            "backend.app.agent.core.amessages",
+            "backend.app.agent.core.amessages_streamed",
             new_callable=AsyncMock,
             return_value=make_text_response("Welcome to Clawbolt! What's your name?"),
         ),
@@ -127,7 +127,7 @@ async def test_full_message_agent_failure_still_stores_inbound(
 
     with (
         patch(
-            "backend.app.agent.core.amessages",
+            "backend.app.agent.core.amessages_streamed",
             new_callable=AsyncMock,
             side_effect=RuntimeError("LLM service down"),
         ),

@@ -49,7 +49,7 @@ def mock_download_media() -> AsyncMock:
     return AsyncMock()
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_text_only_message(
     mock_amessages: object,
     test_user: User,
@@ -76,7 +76,7 @@ async def test_text_only_message(
             break
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 @patch("backend.app.media.pipeline.analyze_image", new_callable=AsyncMock)
 async def test_message_with_photo(
     mock_vision: AsyncMock,
@@ -113,7 +113,7 @@ async def test_message_with_photo(
     assert mock_vision.await_count == 0
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_stores_outbound_message(
     mock_amessages: object,
     test_user: User,
@@ -136,7 +136,7 @@ async def test_stores_outbound_message(
     assert outbound_msgs[-1].body == "Reply stored!"
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_stores_tool_interactions_with_outbound(
     mock_amessages: object,
     test_user: User,
@@ -177,7 +177,7 @@ async def test_stores_tool_interactions_with_outbound(
     assert "result" in interactions[0]
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_no_tool_interactions_for_text_only_response(
     mock_amessages: object,
     test_user: User,
@@ -200,7 +200,7 @@ async def test_no_tool_interactions_for_text_only_response(
     assert outbound_msgs[-1].tool_interactions_json == ""
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_media_download_failure_still_processes_text(
     mock_amessages: object,
     test_user: User,
@@ -223,7 +223,7 @@ async def test_media_download_failure_still_processes_text(
     assert response.reply_text == "Got your text!"
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_partial_media_download_failure_surfaces_note(
     mock_amessages: object,
     test_user: User,
@@ -265,7 +265,7 @@ async def test_partial_media_download_failure_surfaces_note(
     assert "couldn't download 1 of the 2 attachments" in inbound_message.processed_context
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_processed_context_saved_to_message(
     mock_amessages: object,
     test_user: User,
@@ -287,7 +287,7 @@ async def test_processed_context_saved_to_message(
     assert inbound_message.body in inbound_message.processed_context
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 @patch("backend.app.agent.router.init_storage", new_callable=AsyncMock)
 async def test_file_tools_wired_when_storage_configured(
     mock_init_storage: AsyncMock,
@@ -312,7 +312,7 @@ async def test_file_tools_wired_when_storage_configured(
     mock_init_storage.assert_awaited()
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 @patch("backend.app.agent.router.init_storage", new_callable=AsyncMock)
 async def test_file_tools_skipped_when_no_storage(
     mock_init_storage: AsyncMock,
@@ -336,7 +336,7 @@ async def test_file_tools_skipped_when_no_storage(
     assert response.reply_text == "No file tools!"
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 @patch(
     "backend.app.media.pipeline.analyze_image",
     new_callable=AsyncMock,
@@ -396,7 +396,7 @@ async def test_pipeline_failure_note_mentions_vision(
 # ---------------------------------------------------------------------------
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_media_download_failure_adds_system_note_to_context(
     mock_amessages: object,
     test_user: User,
@@ -419,7 +419,7 @@ async def test_media_download_failure_adds_system_note_to_context(
     assert "couldn't download" in inbound_message.processed_context.lower()
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_media_pipeline_failure_retries_with_empty_media(
     mock_amessages: object,
     test_user: User,
@@ -469,7 +469,7 @@ async def test_media_pipeline_failure_retries_with_empty_media(
     assert second_call_args[0][1] == []  # second positional arg is empty media list
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 @patch("backend.app.agent.router.oauth_service.get_valid_token", new_callable=AsyncMock)
 @patch("backend.app.agent.router.settings")
 async def test_storage_exception_skips_file_tools(
@@ -501,7 +501,7 @@ async def test_storage_exception_skips_file_tools(
     mock_get_valid_token.assert_awaited()
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_agent_processing_failure_returns_fallback_reply(
     mock_amessages: object,
     test_user: User,
@@ -523,7 +523,7 @@ async def test_agent_processing_failure_returns_fallback_reply(
     assert "try again" in response.reply_text.lower()
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_agent_processing_failure_does_not_store_fallback(
     mock_amessages: object,
     test_user: User,
@@ -545,7 +545,7 @@ async def test_agent_processing_failure_does_not_store_fallback(
     assert len(outbound_msgs) == 0
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_agent_processing_failure_dispatches_fallback_via_bus(
     mock_amessages: object,
     test_user: User,
@@ -570,7 +570,7 @@ async def test_agent_processing_failure_dispatches_fallback_via_bus(
             break
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_outbound_message_is_persisted_in_session(
     mock_amessages: object,
     test_user: User,
@@ -596,7 +596,7 @@ async def test_outbound_message_is_persisted_in_session(
     assert outbound_msgs[-1].body == "Here is your reply!"
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_pipeline_failure_without_downloaded_media_skips_vision_note(
     mock_amessages: object,
     test_user: User,
@@ -638,7 +638,7 @@ async def test_pipeline_failure_without_downloaded_media_skips_vision_note(
     assert "Vision analysis was unavailable" not in inbound_message.processed_context
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_empty_to_address_returns_early(
     mock_amessages: object,
     conversation: SessionState,
@@ -670,7 +670,7 @@ async def test_empty_to_address_returns_early(
     mock_amessages.assert_not_called()  # type: ignore[union-attr]
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_send_media_reply_suppresses_duplicate_text(
     mock_amessages: object,
     test_user: User,
@@ -717,7 +717,7 @@ async def test_send_media_reply_suppresses_duplicate_text(
 # ---------------------------------------------------------------------------
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_typing_indicator_sent_before_agent_processing(
     mock_amessages: object,
     test_user: User,
@@ -748,7 +748,7 @@ async def test_typing_indicator_sent_before_agent_processing(
     assert found_reply
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_typing_indicator_failure_does_not_block_processing(
     mock_amessages: object,
     test_user: User,
@@ -786,7 +786,7 @@ async def test_typing_indicator_failure_does_not_block_processing(
 # ---------------------------------------------------------------------------
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_content_filter_error_returns_rephrasing_message(
     mock_amessages: AsyncMock,
     test_user: User,
@@ -814,7 +814,7 @@ async def test_content_filter_error_returns_rephrasing_message(
             break
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_authentication_error_returns_config_message(
     mock_amessages: AsyncMock,
     test_user: User,
@@ -841,7 +841,7 @@ async def test_authentication_error_returns_config_message(
             break
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_content_filter_error_does_not_store_outbound(
     mock_amessages: AsyncMock,
     test_user: User,
@@ -863,7 +863,7 @@ async def test_content_filter_error_does_not_store_outbound(
     assert len(outbound_msgs) == 0
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_authentication_error_does_not_store_outbound(
     mock_amessages: AsyncMock,
     test_user: User,
@@ -890,7 +890,7 @@ async def test_authentication_error_does_not_store_outbound(
 # ---------------------------------------------------------------------------
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_normal_response_still_stored_as_outbound(
     mock_amessages: object,
     test_user: User,
@@ -913,7 +913,7 @@ async def test_normal_response_still_stored_as_outbound(
     assert outbound_msgs[-1].body == "Here's your estimate!"
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_error_fallback_dispatched_but_not_stored(
     mock_amessages: object,
     test_user: User,
@@ -1074,7 +1074,7 @@ async def test_dispatch_reply_step_no_outbound_on_empty_reply_without_request_id
 # ---------------------------------------------------------------------------
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_error_stop_reason_not_persisted_to_session(
     mock_amessages: object,
     test_user: User,
@@ -1103,7 +1103,7 @@ async def test_error_stop_reason_not_persisted_to_session(
 # ---------------------------------------------------------------------------
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_to_address_uses_channel_specific_identifier(
     mock_amessages: object,
     test_user: User,
@@ -1183,7 +1183,7 @@ async def test_to_address_uses_channel_specific_identifier(
             break
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_error_stop_reason_still_dispatches_reply_to_user(
     mock_amessages: object,
     test_user: User,

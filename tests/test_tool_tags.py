@@ -123,7 +123,7 @@ def test_messaging_tools_have_sends_reply_tag() -> None:
 # --- Agent core integration ---
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_agent_tool_call_records_include_tags(
     mock_amessages: object, test_user: User
 ) -> None:
@@ -156,7 +156,7 @@ async def test_agent_tool_call_records_include_tags(
     assert ToolTags.SENDS_REPLY in response.tool_calls[0].tags
 
 
-@patch("backend.app.agent.core.amessages")
+@patch("backend.app.agent.core.amessages_streamed")
 async def test_agent_untagged_tool_has_empty_tags(mock_amessages: object, test_user: User) -> None:
     """Tool without tags should produce tool_call record with empty tags set."""
     tool_response = make_tool_call_response(

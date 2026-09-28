@@ -6,7 +6,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Any
 
 from any_llm import (
     AuthenticationError,
@@ -14,7 +14,6 @@ from any_llm import (
     ContextLengthExceededError,
     InvalidRequestError,
     RateLimitError,
-    amessages,
 )
 from any_llm.types.messages import MessageResponse
 from pydantic import ValidationError
@@ -113,6 +112,7 @@ from backend.app.services.llm_endpoints import resolve_target
 from backend.app.services.llm_service import (
     LLMTarget,
     UserLLMOverride,
+    amessages_streamed,
     apply_history_cache_breakpoint,
     apply_in_turn_cache_breakpoint,
     apply_tool_caching,
@@ -632,17 +632,18 @@ class ClawboltAgent:
         for attempt in range(LLM_MAX_RETRIES):
             try:
                 async with self._typing_keepalive():
-                    response = cast(
-                        MessageResponse,
-                        await amessages(
-                            **target.connection_kwargs(),
-                            system=system,
-                            messages=msg_dicts,
-                            tools=tool_schemas,
-                            tool_choice=tool_choice,
-                            max_tokens=effective_max_tokens,
-                            **reasoning,
-                        ),
+                    # Streamed: the Anthropic SDK refuses an unstreamed call
+                    # whose ``max_tokens`` could run past 10 minutes, which
+                    # every effort from ``high`` up reaches once
+                    # ``fit_max_tokens_to_reasoning`` makes room for thinking.
+                    response = await amessages_streamed(
+                        **target.connection_kwargs(),
+                        system=system,
+                        messages=msg_dicts,
+                        tools=tool_schemas,
+                        tool_choice=tool_choice,
+                        max_tokens=effective_max_tokens,
+                        **reasoning,
                     )
                 await self._emit_response(
                     response,
@@ -763,17 +764,14 @@ class ClawboltAgent:
             )
         )
         async with self._typing_keepalive():
-            followup_response = cast(
-                MessageResponse,
-                await amessages(
-                    **target.connection_kwargs(),
-                    system=system,
-                    messages=trimmed_dicts,
-                    tools=tool_schemas,
-                    tool_choice=tool_choice,
-                    max_tokens=effective_max_tokens,
-                    **target.reasoning_kwargs(settings.reasoning_effort),
-                ),
+            followup_response = await amessages_streamed(
+                **target.connection_kwargs(),
+                system=system,
+                messages=trimmed_dicts,
+                tools=tool_schemas,
+                tool_choice=tool_choice,
+                max_tokens=effective_max_tokens,
+                **target.reasoning_kwargs(settings.reasoning_effort),
             )
         await self._emit_response(
             followup_response,

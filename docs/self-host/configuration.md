@@ -247,6 +247,7 @@ Photos and files the user sends over a messaging channel are cached on disk whil
 | `MEMORY_RECALL_LIMIT` | `20` | Max memory facts recalled per query |
 | `COMPACTION_ENABLED` | `true` | Enable automatic conversation compaction |
 | `COMPACTION_MODEL` | (same as `LLM_MODEL`) | Model used for compaction |
+| `COMPACTION_REASONING_EFFORT` | (same as `REASONING_EFFORT`) | Reasoning effort for compaction |
 | `COMPACTION_PROVIDER` | (same as `LLM_PROVIDER`) | Provider used for compaction |
 | `COMPACTION_ENDPOINT` | (same as `LLM_ENDPOINT`) | Endpoint used for compaction |
 | `COMPACTION_MAX_TOKENS` | `16000` | Max tokens per compaction response |
@@ -270,6 +271,7 @@ Photos and files the user sends over a messaging channel are cached on disk whil
 | `HEARTBEAT_INTERVAL_MINUTES` | `30` | Minutes between heartbeat evaluation ticks |
 | `HEARTBEAT_MAX_DAILY_MESSAGES` | `5` | Max proactive messages per user per day |
 | `HEARTBEAT_MODEL` | (same as `LLM_MODEL`) | Model used for heartbeat messages |
+| `HEARTBEAT_REASONING_EFFORT` | (same as `REASONING_EFFORT`) | Reasoning effort for heartbeat checks |
 | `HEARTBEAT_PROVIDER` | (same as `LLM_PROVIDER`) | Provider used for heartbeat messages |
 | `HEARTBEAT_ENDPOINT` | (same as `LLM_ENDPOINT`) | Endpoint used for heartbeat messages |
 | `HEARTBEAT_CONCURRENCY` | `5` | Max concurrent user evaluations per tick |
