@@ -347,7 +347,7 @@ async def evaluate_heartbeat_need(
     recent_logs = await heartbeat_store.get_recent_logs(since)
     heartbeat_history = _format_heartbeat_history(recent_logs, user.timezone, now)
 
-    prompt = await build_heartbeat_system_prompt(
+    prompt, dynamic_context = await build_heartbeat_system_prompt(
         user, recent_text, heartbeat_md=heartbeat_md, heartbeat_history=heartbeat_history
     )
 
@@ -377,7 +377,7 @@ async def evaluate_heartbeat_need(
         {
             "role": "user",
             "content": (
-                f"{time_context}\n\n"
+                f"{dynamic_context}\n\n{time_context}\n\n"
                 "Review the context above and decide whether any tasks need attention."
             ),
         },

@@ -511,14 +511,19 @@ async def build_heartbeat_system_prompt(
     recent_messages: str,
     heartbeat_md: str = "",
     heartbeat_history: str = "",
-) -> str:
-    """Assemble the system prompt for the heartbeat evaluator.
+) -> tuple[str, str]:
+    """Assemble the ``(stable, dynamic)`` prompt for the heartbeat evaluator.
 
     When *heartbeat_md* is provided, the raw HEARTBEAT.md content is
     included as a dedicated section so the LLM can evaluate which tasks
     need attention.  When *heartbeat_history* is provided, it shows when
     heartbeat messages were previously sent so the evaluator can reason
     about timing and avoid duplicates or missed sends.
+
+    Recent conversation and heartbeat history change on every tick (the
+    history's skip count alone does), so they are dynamic: the caller
+    sends them in the user message and the system block stays cacheable
+    across ticks.
     """
     builder = SystemPromptBuilder()
     builder.set_preamble(load_prompt("heartbeat_preamble"))
@@ -536,6 +541,7 @@ async def build_heartbeat_system_prompt(
     builder.add_section(
         "Recent conversation (last 5 messages)",
         recent_messages or "(no recent messages)",
+        dynamic=True,
     )
 
     builder.add_section(
@@ -549,8 +555,9 @@ async def build_heartbeat_system_prompt(
         builder.add_section(
             "Recent heartbeat activity (timing reference only, not tasks to re-run)",
             heartbeat_history,
+            dynamic=True,
         )
 
     builder.add_section("Rules", load_prompt("heartbeat_rules"))
 
-    return builder.build()
+    return builder.build_parts()
