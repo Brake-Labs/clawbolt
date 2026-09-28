@@ -728,7 +728,9 @@ class TestAgentPromptIncludesLiveIntegrationStatus:
                 return_value="Connected: google_calendar\nNot connected: google_drive",
             ),
         ):
-            prompt = await build_heartbeat_system_prompt(user, recent_messages="(none)")
+            prompt = "\n\n".join(
+                await build_heartbeat_system_prompt(user, recent_messages="(none)")
+            )
 
         assert "## Connected Integrations" in prompt
         assert "Connected: google_calendar" in prompt
@@ -755,6 +757,8 @@ class TestAgentPromptIncludesLiveIntegrationStatus:
                 return_value="",
             ),
         ):
-            prompt = await build_heartbeat_system_prompt(user, recent_messages="(none)")
+            prompt = "\n\n".join(
+                await build_heartbeat_system_prompt(user, recent_messages="(none)")
+            )
 
         assert "## Connected Integrations" not in prompt

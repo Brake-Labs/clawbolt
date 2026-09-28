@@ -561,7 +561,7 @@ class TestEvaluateHeartbeatNeed:
         mock_hb_store.get_recent_logs = AsyncMock(return_value=[])
         mock_heartbeat_store_cls.return_value = mock_hb_store
 
-        mock_build_prompt.return_value = "system prompt"
+        mock_build_prompt.return_value = ("system prompt", "")
 
     @patch("backend.app.agent.heartbeat.log_llm_usage")
     @patch("backend.app.agent.heartbeat.build_heartbeat_system_prompt", new_callable=AsyncMock)
@@ -2989,7 +2989,7 @@ class TestEvaluateHeartbeatNeedPassesHistory:
         )
         mock_heartbeat_store_cls.return_value = mock_hb_store
 
-        mock_build_prompt.return_value = "system prompt"
+        mock_build_prompt.return_value = ("system prompt", "")
         mock_llm.return_value = _make_decision_tool_call(action="skip", tasks="", reasoning="test")
 
         await evaluate_heartbeat_need(user)
@@ -3039,7 +3039,7 @@ class TestEvaluateHeartbeatNeedPassesHistory:
         mock_hb_store.get_recent_logs = AsyncMock(return_value=[])
         mock_heartbeat_store_cls.return_value = mock_hb_store
 
-        mock_build_prompt.return_value = "system prompt"
+        mock_build_prompt.return_value = ("system prompt", "")
         mock_llm.return_value = _make_decision_tool_call(action="skip", tasks="", reasoning="test")
 
         await evaluate_heartbeat_need(user)
@@ -3098,7 +3098,7 @@ class TestRecentMessagesIncludeTimestamps:
         mock_hb_store.get_recent_logs = AsyncMock(return_value=[])
         mock_heartbeat_store_cls.return_value = mock_hb_store
 
-        mock_build_prompt.return_value = "system prompt"
+        mock_build_prompt.return_value = ("system prompt", "")
         mock_llm.return_value = _make_decision_tool_call(action="skip", tasks="", reasoning="ok")
 
         await evaluate_heartbeat_need(user)
@@ -3154,7 +3154,7 @@ class TestRecentMessagesIncludeTimestamps:
         mock_hb_store.get_recent_logs = AsyncMock(return_value=[])
         mock_heartbeat_store_cls.return_value = mock_hb_store
 
-        mock_build_prompt.return_value = "system prompt"
+        mock_build_prompt.return_value = ("system prompt", "")
         mock_llm.return_value = _make_decision_tool_call(action="skip", tasks="", reasoning="ok")
 
         await evaluate_heartbeat_need(user)
@@ -3186,13 +3186,15 @@ class TestHeartbeatPromptAlwaysIncludesSection:
 
         mock_memory.return_value = ""
 
-        prompt = await build_heartbeat_system_prompt(
-            user,
-            recent_messages="(no recent messages)",
-            heartbeat_md="",
-            heartbeat_history=(
-                '- Monday, 2026-03-23 09:00 AM (4 days ago) | tasks: "Check weather"'
-            ),
+        prompt = "\n\n".join(
+            await build_heartbeat_system_prompt(
+                user,
+                recent_messages="(no recent messages)",
+                heartbeat_md="",
+                heartbeat_history=(
+                    '- Monday, 2026-03-23 09:00 AM (4 days ago) | tasks: "Check weather"'
+                ),
+            )
         )
 
         # The heartbeat section must appear even when empty
@@ -3211,10 +3213,12 @@ class TestHeartbeatPromptAlwaysIncludesSection:
 
         mock_memory.return_value = ""
 
-        prompt = await build_heartbeat_system_prompt(
-            user,
-            recent_messages="(no recent messages)",
-            heartbeat_md="- Check weather for outdoor jobs",
+        prompt = "\n\n".join(
+            await build_heartbeat_system_prompt(
+                user,
+                recent_messages="(no recent messages)",
+                heartbeat_md="- Check weather for outdoor jobs",
+            )
         )
 
         assert "Check weather for outdoor jobs" in prompt
@@ -3237,17 +3241,48 @@ class TestHeartbeatPromptAlwaysIncludesSection:
 
         mock_memory.return_value = ""
 
-        prompt = await build_heartbeat_system_prompt(
-            user,
-            recent_messages="(no recent messages)",
-            heartbeat_md="- Active check",
-            heartbeat_history=(
-                '- Monday, 2026-03-23 09:00 AM (4 days ago) | tasks: "Old removed task"'
-            ),
+        prompt = "\n\n".join(
+            await build_heartbeat_system_prompt(
+                user,
+                recent_messages="(no recent messages)",
+                heartbeat_md="- Active check",
+                heartbeat_history=(
+                    '- Monday, 2026-03-23 09:00 AM (4 days ago) | tasks: "Old removed task"'
+                ),
+            )
         )
 
         assert "timing reference only" in prompt
         assert "not tasks to re-run" in prompt
+
+    @patch("backend.app.agent.system_prompt.build_memory_section", new_callable=AsyncMock)
+    async def test_per_tick_sections_stay_out_of_cached_system_block(
+        self,
+        mock_memory: AsyncMock,
+        user: User,
+    ) -> None:
+        """Recent messages and history change every tick, so they must not bust the system cache."""
+        from backend.app.agent.system_prompt import build_heartbeat_system_prompt
+
+        mock_memory.return_value = ""
+
+        first_system, _ = await build_heartbeat_system_prompt(
+            user,
+            recent_messages="[User] first",
+            heartbeat_md="- Active check",
+            heartbeat_history="- 09:00 AM to 09:30 AM (today) [2 checks, no action taken]",
+        )
+        second_system, second_dynamic = await build_heartbeat_system_prompt(
+            user,
+            recent_messages="[User] second",
+            heartbeat_md="- Active check",
+            heartbeat_history="- 09:00 AM to 10:00 AM (today) [3 checks, no action taken]",
+        )
+
+        assert first_system == second_system
+        assert "Active check" in first_system
+        assert "[User] second" in second_dynamic
+        assert "3 checks" in second_dynamic
 
 
 class TestSkipEmptyHeartbeatText:
@@ -4028,7 +4063,7 @@ class TestHeartbeatThinkingBudgetFits:
         mock_hb_store.read_heartbeat_md_async = AsyncMock(return_value="")
         mock_hb_store.get_recent_logs = AsyncMock(return_value=[])
         mock_heartbeat_store_cls.return_value = mock_hb_store
-        mock_build_prompt.return_value = "system prompt"
+        mock_build_prompt.return_value = ("system prompt", "")
         mock_llm.return_value = _make_decision_tool_call(action="skip", tasks="", reasoning="test")
 
         await evaluate_heartbeat_need(user)
