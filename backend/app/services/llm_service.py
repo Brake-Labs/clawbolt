@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -64,6 +65,32 @@ def reasoning_effort_to_thinking(effort: str) -> dict[str, Any] | None:
     return None
 
 
+# Claude models from 4.6 on take ``thinking: {"type": "adaptive"}`` with the
+# effort in ``output_config``, and from 4.8 on they reject a
+# ``budget_tokens`` request (and ``{"type": "disabled"}``) outright. Haiku 4.5 is the reverse: budgets only.
+# Matched on the model id after any gateway prefix (``gateway:claude-...``);
+# a name this does not recognize keeps the budget shape it always had.
+_ADAPTIVE_THINKING_MODEL = re.compile(
+    r"claude-(?:opus|sonnet|fable|mythos)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?$"
+)
+_ADAPTIVE_SINCE = (4, 6)
+_EFFORT_TO_ADAPTIVE = {
+    "minimal": "low",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+}
+
+
+def uses_adaptive_thinking(model: str) -> bool:
+    """Whether *model* takes adaptive thinking rather than a token budget."""
+    match = _ADAPTIVE_THINKING_MODEL.search(model.rsplit(":", 1)[-1].rsplit("/", 1)[-1])
+    if match is None:
+        return False
+    return (int(match.group(1)), int(match.group(2) or 0)) >= _ADAPTIVE_SINCE
+
+
 # Output tokens a thinking model is left for its reply once its budget is spent.
 # Anthropic rejects a request whose ``thinking.budget_tokens`` is not below
 # ``max_tokens``, and a gateway that maps the budget to a scalar effort counts
@@ -82,9 +109,17 @@ def fit_max_tokens_to_reasoning(max_tokens: int, reasoning: dict[str, Any]) -> i
     says.
     """
     thinking = reasoning.get("thinking")
-    if not isinstance(thinking, dict) or thinking.get("type") != "enabled":
+    if not isinstance(thinking, dict):
         return max_tokens
-    budget = thinking.get("budget_tokens")
+    if thinking.get("type") == "adaptive":
+        # Adaptive thinking states no budget but still spends ``max_tokens``,
+        # so it gets the room the same effort's budget would have had.
+        effort = reasoning.get("output_config", {}).get("effort", "")
+        budget = _EFFORT_TO_BUDGET.get(effort)
+    elif thinking.get("type") == "enabled":
+        budget = thinking.get("budget_tokens")
+    else:
+        return max_tokens
     if not isinstance(budget, int) or budget < max_tokens:
         return max_tokens
     return budget + THINKING_REPLY_ALLOWANCE
@@ -199,6 +234,13 @@ class LLMTarget:
             return {}
         if self.reasoning_style is ReasoningStyle.EFFORT:
             return {"reasoning_effort": effort}
+        if uses_adaptive_thinking(self.model):
+            # These models also reject ``{"type": "disabled"}``, so "none"
+            # omits the parameter: the least reasoning they can be asked for.
+            adaptive_effort = _EFFORT_TO_ADAPTIVE.get(effort)
+            if adaptive_effort is None:
+                return {}
+            return {"thinking": {"type": "adaptive"}, "output_config": {"effort": adaptive_effort}}
         thinking = reasoning_effort_to_thinking(effort)
         return {"thinking": thinking} if thinking is not None else {}
 

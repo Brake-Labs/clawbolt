@@ -33,6 +33,7 @@ from pydantic import ValidationError
 from backend.app.agent.llm_parsing import get_response_text, parse_tool_calls
 from backend.app.config import Settings, log_config_warnings
 from backend.app.services.llm_service import (
+    THINKING_REPLY_ALLOWANCE,
     LLMTarget,
     UserLLMOverride,
     _cache_control,
@@ -40,11 +41,13 @@ from backend.app.services.llm_service import (
     apply_history_cache_breakpoint,
     apply_in_turn_cache_breakpoint,
     apply_tool_caching,
+    fit_max_tokens_to_reasoning,
     get_models,
     prepare_system_with_caching,
     provider_honors_cache_control,
     resolve_user_llm_override,
     set_user_llm_resolver,
+    uses_adaptive_thinking,
 )
 
 
@@ -1172,3 +1175,56 @@ class TestStreamedMessagesOverTheWire:
         # the output count. A merge that takes one clobbers the other.
         assert result.usage.input_tokens == 4321
         assert result.usage.output_tokens == 12000
+
+
+class TestAdaptiveThinking:
+    """Claude 4.8 and later reject a thinking budget; Haiku 4.5 rejects adaptive."""
+
+    @pytest.mark.parametrize(
+        ("model", "adaptive"),
+        [
+            ("claude-opus-5-5", True),
+            ("claude-sonnet-5-5", True),
+            ("claude-opus-5", True),
+            ("claude-sonnet-5", True),
+            ("claude-opus-4-8", True),
+            ("claude-sonnet-4-6", True),
+            ("claude-fable-5-1", True),
+            ("gateway:claude-sonnet-5-5", True),
+            ("anthropic/claude-opus-5-5", True),
+            ("claude-sonnet-4-5-20250929", False),
+            ("claude-opus-4-5-20251101", False),
+            ("claude-haiku-4-5-20251001", False),
+            ("gateway:claude-haiku-4-5-20251001", False),
+            ("clawbolt-prod", False),
+            ("gpt-5.5", False),
+        ],
+    )
+    def test_model_family_picks_the_shape(self, model: str, adaptive: bool) -> None:
+        assert uses_adaptive_thinking(model) is adaptive
+
+    def test_adaptive_model_gets_effort_not_a_budget(self) -> None:
+        target = LLMTarget(provider="anthropic", model="gateway:claude-sonnet-5-5")
+        assert target.reasoning_kwargs("xhigh") == {
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "xhigh"},
+        }
+
+    def test_budget_model_keeps_the_budget(self) -> None:
+        target = LLMTarget(provider="anthropic", model="claude-haiku-4-5-20251001")
+        assert target.reasoning_kwargs("high") == {
+            "thinking": {"type": "enabled", "budget_tokens": 24576}
+        }
+
+    def test_none_omits_thinking_on_an_adaptive_model(self) -> None:
+        """Regression: Opus 5.5 rejects ``disabled``, which vision always sent."""
+        target = LLMTarget(provider="anthropic", model="claude-opus-5-5")
+        assert target.reasoning_kwargs("none") == {}
+
+    def test_none_still_disables_thinking_on_a_budget_model(self) -> None:
+        target = LLMTarget(provider="anthropic", model="claude-haiku-4-5-20251001")
+        assert target.reasoning_kwargs("none") == {"thinking": {"type": "disabled"}}
+
+    def test_adaptive_thinking_gets_the_room_its_effort_budget_had(self) -> None:
+        reasoning = {"thinking": {"type": "adaptive"}, "output_config": {"effort": "xhigh"}}
+        assert fit_max_tokens_to_reasoning(8192, reasoning) == 32768 + THINKING_REPLY_ALLOWANCE
