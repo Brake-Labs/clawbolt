@@ -74,7 +74,11 @@ from backend.app.agent.observer import (
     emit_llm_request,
     emit_llm_response,
 )
-from backend.app.agent.prompt_epoch import PromptEpoch, remember_workspace_snapshot
+from backend.app.agent.prompt_epoch import (
+    HistoryShedder,
+    PromptEpoch,
+    remember_workspace_snapshot,
+)
 from backend.app.agent.skills.loader import (
     extract_delivered_skills,
     get_skill_instructions,
@@ -104,7 +108,13 @@ from backend.app.agent.tools.base import (
     tool_to_function_schema,
 )
 from backend.app.agent.tools.registry import ToolContext, ToolRegistry
-from backend.app.agent.trimming import trim_messages
+from backend.app.agent.trimming import (
+    TrimBudget,
+    TrimResult,
+    attach_summary,
+    summarize_dropped_messages,
+    trim_messages,
+)
 from backend.app.config import settings
 from backend.app.logging_utils import mask_pii
 from backend.app.models import User
@@ -1374,6 +1384,7 @@ class ClawboltAgent:
         deterministic_trim: bool = False,
         now: datetime | None = None,
         epoch: PromptEpoch | None = None,
+        shed_history: HistoryShedder | None = None,
     ) -> AssembledPrompt:
         """Build the exact message list a turn sends to the LLM, pre-flight.
 
@@ -1399,6 +1410,13 @@ class ClawboltAgent:
         ``epoch`` is the prompt-cache epoch the turn belongs to, from the
         history renderer (``prompt_epoch``). It selects the workspace snapshot
         in the system block. None renders the workspace as it stands.
+
+        ``shed_history`` is the history renderer's hook for the trim
+        (``prompt_epoch.EpochHistoryRenderer.shed``). When the prompt is over
+        the trim trigger it is asked first: it stubs old read results, and
+        drops the oldest turns only if that is not enough, storing what it did
+        so later turns render the same history. Without it (or when it has
+        nothing to shed) the trim drops whole turns as before.
 
         Side effect: seeds ``self._delivered_skill_categories`` from the tool
         results that survived trimming, so first-use SKILL.md injection does
@@ -1455,13 +1473,15 @@ class ClawboltAgent:
             if deterministic_trim or rebuilt
             else (self._last_input_tokens or _recall_input_tokens(self.user.id))
         )
-        trim_result = trim_messages(
-            messages,
-            target_tokens=settings.context_trim_target_tokens,
-            target_turns=settings.context_trim_target_turns,
-            trigger_tokens=settings.context_trim_trigger_tokens,
-            input_tokens=input_tokens,
-        )
+        trim_result = await self._shed_history(messages, shed_history, input_tokens)
+        if trim_result is None:
+            trim_result = trim_messages(
+                messages,
+                target_tokens=settings.context_trim_target_tokens,
+                target_turns=settings.context_trim_target_turns,
+                trigger_tokens=settings.context_trim_trigger_tokens,
+                input_tokens=input_tokens,
+            )
         messages = trim_result.messages
         # Seed skill-delivery state from what actually survived trimming:
         # a marker present in a reloaded tool result means that category's
@@ -1486,6 +1506,41 @@ class ClawboltAgent:
             dropped=list(trim_result.dropped),
             trimmed_count=trimmed_count,
         )
+
+    async def _shed_history(
+        self,
+        messages: list[AgentMessage],
+        shed_history: HistoryShedder | None,
+        input_tokens: int | None,
+    ) -> TrimResult | None:
+        """The trim by shedding history, or None to leave it to ``trim_messages``.
+
+        *messages* is the system prompt, the rendered history, and the current
+        turn. The shedder's history is measured against the same budget the
+        trim would use, with the system prompt and current turn around it.
+        Turns it drops are already compacted by the renderer, so they are not
+        returned as dropped; the note summarizing them still rides the
+        current turn, as the trim's does.
+        """
+        if shed_history is None:
+            return None
+        budget = TrimBudget.for_prompt(
+            messages,
+            target_tokens=settings.context_trim_target_tokens,
+            target_turns=settings.context_trim_target_turns,
+            trigger_tokens=settings.context_trim_trigger_tokens,
+            input_tokens=input_tokens,
+        )
+        if not budget.over_trigger(messages):
+            return None
+        system, current = messages[0], messages[-1]
+        shed = await shed_history(lambda history: budget.fits([system, *history, current]))
+        if shed is None:
+            return None
+        result: list[AgentMessage] = [system, *shed.messages, current]
+        if shed.dropped:
+            attach_summary(result, summarize_dropped_messages(shed.dropped))
+        return TrimResult(messages=result)
 
     async def _fold_pending_inbound(self, messages: list[AgentMessage]) -> int:
         """Append user messages that arrived mid-turn; return how many.
@@ -1512,6 +1567,7 @@ class ClawboltAgent:
         *,
         wrap_up_on_max_rounds: bool = True,
         prompt_epoch: PromptEpoch | None = None,
+        shed_history: HistoryShedder | None = None,
     ) -> AgentResponse:
         """Process a message through the agent loop.
 
@@ -1519,8 +1575,8 @@ class ClawboltAgent:
         (heartbeats), where running out of rounds must stay silent rather
         than send an unprompted "ran out of steps" message.
 
-        *prompt_epoch* is the cache epoch the history renderer found; see
-        :meth:`assemble_prompt`.
+        *prompt_epoch* is the cache epoch the history renderer found, and
+        *shed_history* its trim hook; see :meth:`assemble_prompt`.
         """
         agent_start_time = time.monotonic()
         logger.debug(
@@ -1534,6 +1590,7 @@ class ClawboltAgent:
             conversation_history,
             system_prompt_override,
             epoch=prompt_epoch,
+            shed_history=shed_history,
         )
         system_prompt = assembled.system_prompt
         messages = assembled.messages

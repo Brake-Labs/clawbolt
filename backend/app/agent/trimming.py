@@ -110,6 +110,73 @@ def _content_length(msgs: list[AgentMessage]) -> int:
     return total
 
 
+@dataclass(frozen=True)
+class TrimBudget:
+    """When the trim fires on a prompt, and what it must shrink the prompt to.
+
+    Tokens are measured the way :func:`trim_messages` always has: the known
+    size of the whole prompt (*input_tokens*, or a character estimate),
+    scaled by each candidate's share of the prompt's characters. Shared with
+    the history shedding in ``core.assemble_prompt`` so both measure alike.
+    """
+
+    target_tokens: int
+    target_turns: int | None
+    trigger_tokens: int
+    trigger_turns: int | None
+    input_tokens: int
+    prompt_chars: int
+
+    @classmethod
+    def for_prompt(
+        cls,
+        messages: list[AgentMessage],
+        target_tokens: int = CONTEXT_TRIM_TARGET_TOKENS,
+        target_turns: int | None = CONTEXT_TRIM_TARGET_TURNS,
+        trigger_turns: int | None = CONTEXT_TRIM_TRIGGER_TURNS,
+        trigger_tokens: int | None = None,
+        input_tokens: int | None = None,
+    ) -> TrimBudget:
+        """Resolve the thresholds for *messages* (see :func:`trim_messages`)."""
+        effective_trigger_turns: int | None
+        if trigger_turns is not None:
+            effective_trigger_turns = trigger_turns
+        elif target_turns is not None:
+            effective_trigger_turns = target_turns + _DEFAULT_TRIGGER_BUFFER_TURNS
+        else:
+            effective_trigger_turns = None
+        if input_tokens is None:
+            # Estimate tokens from character count for first-call-in-session
+            input_tokens = _content_length(messages) // _CHARS_PER_TOKEN + _OVERHEAD_TOKEN_ESTIMATE
+        return cls(
+            target_tokens=target_tokens,
+            target_turns=target_turns,
+            # Token trigger defaults to the target (no hysteresis) when unset.
+            trigger_tokens=trigger_tokens if trigger_tokens is not None else target_tokens,
+            trigger_turns=effective_trigger_turns,
+            input_tokens=input_tokens,
+            prompt_chars=_content_length(messages) or 1,
+        )
+
+    def tokens(self, msgs: list[AgentMessage]) -> int:
+        """Scale the known input_tokens by the content-length ratio."""
+        return int(self.input_tokens * _content_length(msgs) / self.prompt_chars)
+
+    def over_trigger(self, msgs: list[AgentMessage]) -> bool:
+        """Whether *msgs* is big enough for the trim to fire."""
+        if len(msgs) <= 2:
+            return False
+        if self.tokens(msgs) > self.trigger_tokens:
+            return True
+        return self.trigger_turns is not None and _count_user_turns(msgs) > self.trigger_turns
+
+    def fits(self, msgs: list[AgentMessage]) -> bool:
+        """Whether *msgs* is within the target the trim shrinks to."""
+        if self.tokens(msgs) > self.target_tokens:
+            return False
+        return not (self.target_turns is not None and _count_user_turns(msgs) > self.target_turns)
+
+
 def trim_messages(
     messages: list[AgentMessage],
     target_tokens: int = CONTEXT_TRIM_TARGET_TOKENS,
@@ -154,47 +221,22 @@ def trim_messages(
     vice-versa).
 
     Dropped messages are summarized and the note is prepended to the
-    newest user turn (see :func:`_attach_summary`), so the LLM retains
+    newest user turn (see :func:`attach_summary`), so the LLM retains
     awareness of what was discussed without changing the kept history.
 
     Returns a ``TrimResult`` containing the (possibly trimmed) message
     list and the list of dropped messages.
     """
-    if len(messages) <= 2:
-        return TrimResult(messages=messages)
-
-    # Resolve the trigger thresholds. Hysteresis = trigger - target.
-    # Token trigger defaults to the target (no hysteresis) when unset.
-    effective_trigger_tokens = trigger_tokens if trigger_tokens is not None else target_tokens
-
-    effective_trigger_turns: int | None
-    if trigger_turns is not None:
-        effective_trigger_turns = trigger_turns
-    elif target_turns is not None:
-        effective_trigger_turns = target_turns + _DEFAULT_TRIGGER_BUFFER_TURNS
-    else:
-        effective_trigger_turns = None
-
-    actual_input_tokens: int
-    if input_tokens is not None:
-        actual_input_tokens = input_tokens
-    else:
-        # Estimate tokens from character count for first-call-in-session
-        actual_input_tokens = (
-            _content_length(messages) // _CHARS_PER_TOKEN + _OVERHEAD_TOKEN_ESTIMATE
-        )
-
-    def _tokens_for(msgs: list[AgentMessage]) -> int:
-        """Scale the known input_tokens by the content-length ratio."""
-        orig_len = _content_length(messages) or 1
-        return int(actual_input_tokens * _content_length(msgs) / orig_len)
-
-    over_token_budget = _tokens_for(messages) > effective_trigger_tokens
-    over_turn_budget = (
-        effective_trigger_turns is not None
-        and _count_user_turns(messages) > effective_trigger_turns
+    # Hysteresis = trigger - target.
+    budget = TrimBudget.for_prompt(
+        messages,
+        target_tokens=target_tokens,
+        target_turns=target_turns,
+        trigger_turns=trigger_turns,
+        trigger_tokens=trigger_tokens,
+        input_tokens=input_tokens,
     )
-    if not over_token_budget and not over_turn_budget:
+    if not budget.over_trigger(messages):
         return TrimResult(messages=messages)
 
     system = messages[0]
@@ -239,11 +281,6 @@ def trim_messages(
             blocks.append([msg])
             i += 1
 
-    def _fits(remaining: list[AgentMessage]) -> bool:
-        if _tokens_for(remaining) > target_tokens:
-            return False
-        return not (target_turns is not None and _count_user_turns(remaining) > target_turns)
-
     # Remove blocks from the front (oldest) until both budgets are
     # satisfied, but always keep at least the last block.
     dropped: list[AgentMessage] = []
@@ -251,7 +288,7 @@ def trim_messages(
         remaining: list[AgentMessage] = [system]
         for blk in blocks:
             remaining.extend(blk)
-        if _fits(remaining):
+        if budget.fits(remaining):
             break
         removed_block = blocks.pop(0)
         dropped.extend(removed_block)
@@ -260,11 +297,11 @@ def trim_messages(
     for blk in blocks:
         result.extend(blk)
     if dropped:
-        _attach_summary(result, summarize_dropped_messages(dropped))
+        attach_summary(result, summarize_dropped_messages(dropped))
     return TrimResult(messages=result, dropped=dropped)
 
 
-def _attach_summary(messages: list[AgentMessage], summary: str) -> None:
+def attach_summary(messages: list[AgentMessage], summary: str) -> None:
     """Put the dropped-history *summary* on the newest user turn, in place.
 
     The kept history must match, byte for byte, what the next turn reloads

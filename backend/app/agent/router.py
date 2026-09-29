@@ -34,7 +34,7 @@ from backend.app.agent.onboarding import (
     build_onboarding_system_prompt,
     is_onboarding_needed,
 )
-from backend.app.agent.prompt_epoch import EpochHistoryRenderer, PromptEpoch
+from backend.app.agent.prompt_epoch import EpochHistoryRenderer, HistoryShedder, PromptEpoch
 from backend.app.agent.session_db import get_session_store
 from backend.app.agent.skills.loader import load_all_skills
 from backend.app.agent.stores import ToolConfigStore
@@ -114,6 +114,9 @@ class PipelineContext:
     combined_context: str = ""
     conversation_history: list[AgentMessage] = field(default_factory=list)
     prompt_epoch: PromptEpoch | None = None
+    # The history renderer's trim hook, when it compacts (see
+    # ``prompt_epoch.EpochHistoryRenderer.shed``).
+    shed_history: HistoryShedder | None = None
     # Assembled ahead of the agent step when the history renderer needs to
     # classify tool calls (see ``load_history_step``); ``run_agent`` reuses it.
     turn_tools: TurnTools | None = None
@@ -355,6 +358,7 @@ async def run_agent(
     drain_inbound: Callable[[], Awaitable[list[UserMessage]]] | None = None,
     prompt_epoch: PromptEpoch | None = None,
     turn_tools: TurnTools | None = None,
+    shed_history: HistoryShedder | None = None,
 ) -> AgentResponse:
     """Initialize agent with tools and process the message.
 
@@ -429,6 +433,7 @@ async def run_agent(
             conversation_history=conversation_history,
             system_prompt_override=system_prompt_override,
             prompt_epoch=prompt_epoch,
+            shed_history=shed_history,
         )
     except ContentFilterError:
         logger.warning(
@@ -563,8 +568,12 @@ async def load_history_step(ctx: PipelineContext) -> PipelineContext:
             channel=ctx.channel,
         )
         renderer = EpochHistoryRenderer(
-            ctx.user.id, compact=True, tools_by_name=ctx.turn_tools.by_name
+            ctx.user.id,
+            compact=True,
+            tools_by_name=ctx.turn_tools.by_name,
+            stub_before=history_session.history_stub_seq,
         )
+        ctx.shed_history = renderer.shed
     elif settings.prompt_stable_prefix_enabled:
         renderer = EpochHistoryRenderer(ctx.user.id, compact=False)
     ctx.conversation_history = await load_conversation_history(
@@ -692,6 +701,7 @@ async def run_agent_step(ctx: PipelineContext) -> PipelineContext:
         drain_inbound=_make_inbound_drain(ctx),
         prompt_epoch=ctx.prompt_epoch,
         turn_tools=ctx.turn_tools,
+        shed_history=ctx.shed_history,
     )
     return ctx
 

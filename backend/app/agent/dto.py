@@ -86,6 +86,10 @@ class SessionState(BaseModel):
     # rolled-up turns are not re-fed to the agent on subsequent inbounds.
     # ``None`` means nothing has been trimmed yet (no filter applied).
     last_trim_seq: int | None = None
+    # First ``messages.seq`` whose tool results a mid-session trim left
+    # verbatim; read results below it render as stubs. ``None`` when no
+    # trim has stubbed anything. See ``prompt_epoch.shed_history_view``.
+    history_stub_seq: int | None = None
 
 
 class HeartbeatLogEntry(BaseModel):

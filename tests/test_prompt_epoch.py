@@ -13,6 +13,7 @@ The properties that matter, each of which saves money only if it holds:
 
 from __future__ import annotations
 
+import asyncio
 import datetime as _dt
 import json
 from collections.abc import Iterator
@@ -21,7 +22,9 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from pydantic import BaseModel
+from sqlalchemy import select
 
+from backend.app.agent import context as context_module
 from backend.app.agent.context import (
     _stored_messages_to_agent_messages,
     load_conversation_history,
@@ -33,6 +36,7 @@ from backend.app.agent.messages import (
     AgentMessage,
     AssistantMessage,
     ToolResultMessage,
+    UserMessage,
     messages_to_messages_api,
 )
 from backend.app.agent.prompt_epoch import (
@@ -56,7 +60,8 @@ from backend.app.agent.system_prompt import WorkspaceSnapshot, render_workspace_
 from backend.app.agent.tools.base import Tool, ToolResult, ToolTags
 from backend.app.agent.tools.registry import SubToolInfo, ToolRegistry
 from backend.app.config import settings
-from backend.app.models import User
+from backend.app.database import db_session_async
+from backend.app.models import ChatSession, Message, User
 from backend.app.services.model_comparison.sampling import ReplayFixture, assemble_for_sample
 from backend.app.services.model_comparison.types import HistoryMode, ReplaySample
 from tests.conftest import create_test_session
@@ -1042,3 +1047,194 @@ async def test_stripped_guidance_is_delivered_again_once(
             "one more", warm_view.messages, prompt_epoch=warm_view.epoch
         )
     assert again.tool_calls[0].result == "ok"
+
+
+# -- the mid-session trim sheds stale reads first ------------------------------
+
+# Sized so the history dominates the prompt whatever the system prompt weighs.
+HUGE = "r" * 50_000
+HUGE_WRITE = "Created invoice 643. " + "w" * 20_000
+
+
+async def _append_rows(user_id: str, rows: list[StoredMessage]) -> None:
+    """Persist *rows* at their own timestamps (``add_message`` stamps now)."""
+    async with db_session_async() as db:
+        cs = (await db.execute(select(ChatSession).filter_by(user_id=user_id))).scalar_one()
+        for row in rows:
+            db.add(
+                Message(
+                    session_id=cs.id,
+                    seq=row.seq,
+                    direction=row.direction,
+                    body=row.body,
+                    processed_context=row.processed_context,
+                    tool_interactions_json=row.tool_interactions_json,
+                    timestamp=_dt.datetime.fromisoformat(row.timestamp),
+                )
+            )
+        await db.commit()
+
+
+def _without_cache_markers(value: Any) -> Any:
+    """*value* with ``cache_control`` removed: the breakpoint moves every turn."""
+    if isinstance(value, dict):
+        return {k: _without_cache_markers(v) for k, v in value.items() if k != "cache_control"}
+    if isinstance(value, list):
+        return [_without_cache_markers(v) for v in value]
+    return value
+
+
+async def _live_turn(user: User) -> list[dict[str, Any]]:
+    """Run the live pipeline's history and agent steps; return what was sent."""
+    state, _ = await get_session_store(user.id).get_or_create_session()
+    ctx = PipelineContext(user=user, session=state, message=state.messages[-1], media_urls=[])
+    with patch(
+        "backend.app.agent.core.amessages_streamed",
+        new_callable=AsyncMock,
+        return_value=make_text_response("Done."),
+    ) as llm:
+        ctx = await load_history_step(ctx)
+        ctx = await run_agent_step(ctx)
+    assert ctx.response is not None and ctx.response.reply_text == "Done."
+    await asyncio.gather(*context_module._background_tasks)
+    return _without_cache_markers(llm.call_args.kwargs["messages"])
+
+
+@pytest.fixture()
+def trim_settings(one_hour_cache: None) -> Iterator[AsyncMock]:
+    """Compaction on, a two-turn verbatim window, and a trim at 90k down to 50k.
+
+    The trimmer estimates from characters (no recalled API count), so the
+    thresholds read the bytes the test builds. Yields the compaction mock.
+    """
+    with (
+        patch.object(settings, "cold_start_compaction_enabled", True),
+        patch.object(settings, "compaction_enabled", True),
+        patch.object(settings, "cold_start_verbatim_turns", 2),
+        patch.object(settings, "context_trim_target_tokens", 50_000),
+        patch.object(settings, "context_trim_trigger_tokens", 90_000),
+        patch("backend.app.agent.core._recall_input_tokens", return_value=None),
+        patch(
+            "backend.app.agent.router.assemble_turn_tools",
+            AsyncMock(return_value=(list(TOOLS.values()), {})),
+        ),
+        patch(
+            "backend.app.agent.context.compact_session",
+            new_callable=AsyncMock,
+            return_value=("", False),
+        ) as compact,
+    ):
+        yield compact
+
+
+def _results_by_id(messages: list[dict[str, Any]]) -> dict[str, str]:
+    return {
+        block["tool_use_id"]: block["content"]
+        for msg in messages
+        if isinstance(msg.get("content"), list)
+        for block in msg["content"]
+        if block.get("type") == "tool_result"
+    }
+
+
+def _read_and_write_turns(write_result: str) -> _Rows:
+    """Eight turns, each a big lookup and a write, then an unanswered ask."""
+    t = _Rows()
+    for i in range(8):
+        _calls_turn(
+            t,
+            i * 5,
+            f"ask {i}",
+            [
+                ("web_search", {"query": f"q{i}"}, HUGE, False),
+                ("qb_create", {"query": f"invoice {i}"}, write_result, False),
+            ],
+        )
+    t.ask(40, "what now?")
+    return t
+
+
+async def _next_turn(user: User, t: _Rows, minute: float) -> None:
+    """Persist the reply to the last ask and a new ask, both inside the epoch."""
+    reply = StoredMessage(
+        direction="outbound", body="Done.", timestamp=_at(minute), seq=len(t.rows) + 1
+    )
+    t.rows.append(reply)
+    ask = t.ask(minute + 4, "and next?")
+    await _append_rows(user.id, [reply, ask])
+
+
+async def test_trim_stubs_old_reads_and_the_next_turn_renders_the_same_bytes(
+    test_user: User, trim_settings: AsyncMock
+) -> None:
+    """Over the trigger, stubbing old reads is enough: writes and the verbatim
+    window stay whole, no turn is dropped, nothing is compacted, and the next
+    turn sends the trimmed history byte for byte without trimming again."""
+    t = _read_and_write_turns(WRITE_RESULT)
+    await create_test_session(test_user.id, messages=t.rows)
+
+    first = await _live_turn(test_user)
+
+    results = _results_by_id(first)
+    stub = elided_result_stub("web_search", len(HUGE))
+    # Turn i is seqs 2i+1 and 2i+2; the last two turns are the verbatim window.
+    assert [results[f"call_{2 * i + 1}_0"] == stub for i in range(8)] == [True] * 6 + [False] * 2
+    assert results["call_15_0"] == HUGE
+    assert all(results[f"call_{2 * i + 1}_1"] == WRITE_RESULT for i in range(8))
+    # Every turn is still there, the oldest first, with no summary note.
+    assert "ask 0" in json.dumps(first[0])
+    assert "Summary of earlier conversation" not in json.dumps(first)
+    state, _ = await get_session_store(test_user.id).get_or_create_session()
+    assert state.last_trim_seq is None
+    assert state.history_stub_seq == 13
+    assert trim_settings.await_count == 0
+
+    await _next_turn(test_user, t, 42)
+    second = await _live_turn(test_user)
+
+    assert second[: len(first) - 1] == first[:-1]
+    state, _ = await get_session_store(test_user.id).get_or_create_session()
+    assert state.history_stub_seq == 13
+    assert state.last_trim_seq is None
+    assert trim_settings.await_count == 0
+
+
+async def test_trim_drops_the_oldest_turns_when_stubs_are_not_enough(
+    test_user: User, trim_settings: AsyncMock
+) -> None:
+    """Write results are never stubbed, so when they alone are over target the
+    oldest turns go whole: compacted from their full rows, the watermark past
+    them, and the next turn renders what this one sent."""
+    t = _read_and_write_turns(HUGE_WRITE)
+    await create_test_session(test_user.id, messages=t.rows)
+
+    first = await _live_turn(test_user)
+
+    state, _ = await get_session_store(test_user.id).get_or_create_session()
+    assert state.last_trim_seq is not None
+    dropped_turns = state.last_trim_seq // 2
+    assert 1 <= dropped_turns < 8
+    assert state.last_trim_seq == 2 * dropped_turns
+    assert "ask 0" not in json.dumps(first[0])
+    assert "Summary of earlier conversation" in json.dumps(first[-1])
+    results = _results_by_id(first)
+    # Kept writes are whole; kept reads outside the window are stubs.
+    assert sum(r == HUGE_WRITE for r in results.values()) == 8 - dropped_turns
+    assert results["call_15_0"] == HUGE
+    assert dropped_turns < 6
+    assert results[f"call_{2 * dropped_turns + 1}_0"] == elided_result_stub("web_search", len(HUGE))
+    # One compaction, over the dropped rows as stored: reads unstubbed.
+    assert trim_settings.await_count == 1
+    compacted = trim_settings.await_args.args[1]
+    assert HUGE in [m.content for m in compacted if isinstance(m, ToolResultMessage)]
+    seqs = {m.seq for m in compacted if isinstance(m, UserMessage | AssistantMessage)}
+    assert seqs == set(range(1, state.last_trim_seq + 1))
+
+    await _next_turn(test_user, t, 42)
+    second = await _live_turn(test_user)
+
+    assert second[: len(first) - 1] == first[:-1]
+    assert trim_settings.await_count == 1
+    again, _ = await get_session_store(test_user.id).get_or_create_session()
+    assert again.last_trim_seq == state.last_trim_seq
+    assert again.history_stub_seq == state.history_stub_seq
