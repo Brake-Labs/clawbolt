@@ -47,6 +47,7 @@ from backend.app.agent.prompt_epoch import (
     elided_result_stub,
     find_epoch,
     is_cold_gap,
+    shed_history_view,
 )
 from backend.app.agent.router import PipelineContext, load_history_step, run_agent_step
 from backend.app.agent.session_db import get_session_store
@@ -1053,7 +1054,8 @@ async def test_stripped_guidance_is_delivered_again_once(
 
 # Sized so the history dominates the prompt whatever the system prompt weighs.
 HUGE = "r" * 50_000
-HUGE_WRITE = "Created invoice 643. " + "w" * 20_000
+# Eight of these are over the trim target on their own.
+HUGE_WRITE = "Created invoice 643. " + "w" * 30_000
 
 
 async def _append_rows(user_id: str, rows: list[StoredMessage]) -> None:
@@ -1202,9 +1204,10 @@ async def test_trim_stubs_old_reads_and_the_next_turn_renders_the_same_bytes(
 async def test_trim_drops_the_oldest_turns_when_stubs_are_not_enough(
     test_user: User, trim_settings: AsyncMock
 ) -> None:
-    """Write results are never stubbed, so when they alone are over target the
-    oldest turns go whole: compacted from their full rows, the watermark past
-    them, and the next turn renders what this one sent."""
+    """Write results are never stubbed, so when they alone are over target,
+    with every read stubbed (the verbatim window included), the oldest turns
+    go whole: compacted from their full rows, the watermark past them, and
+    the next turn renders what this one sent."""
     t = _read_and_write_turns(HUGE_WRITE)
     await create_test_session(test_user.id, messages=t.rows)
 
@@ -1218,13 +1221,16 @@ async def test_trim_drops_the_oldest_turns_when_stubs_are_not_enough(
     assert "ask 0" not in json.dumps(first[0])
     assert "Summary of earlier conversation" in json.dumps(first[-1])
     results = _results_by_id(first)
-    # Kept writes are whole; kept reads outside the window are stubs.
+    # Kept writes are whole. Every kept read is a stub: the verbatim window
+    # shrank to nothing before any turn was dropped, and the turns kept leave
+    # no room to widen it again for a read this size.
     assert sum(r == HUGE_WRITE for r in results.values()) == 8 - dropped_turns
-    assert results["call_15_0"] == HUGE
-    assert dropped_turns < 6
-    assert results[f"call_{2 * dropped_turns + 1}_0"] == elided_result_stub("web_search", len(HUGE))
+    stub = elided_result_stub("web_search", len(HUGE))
+    assert all(results[f"call_{2 * i + 1}_0"] == stub for i in range(dropped_turns, 8))
+    assert state.history_stub_seq == 17
     # One compaction, over the dropped rows as stored: reads unstubbed.
     assert trim_settings.await_count == 1
+    assert trim_settings.await_args is not None
     compacted = trim_settings.await_args.args[1]
     assert HUGE in [m.content for m in compacted if isinstance(m, ToolResultMessage)]
     seqs = {m.seq for m in compacted if isinstance(m, UserMessage | AssistantMessage)}
@@ -1238,3 +1244,81 @@ async def test_trim_drops_the_oldest_turns_when_stubs_are_not_enough(
     again, _ = await get_session_store(test_user.id).get_or_create_session()
     assert again.last_trim_seq == state.last_trim_seq
     assert again.history_stub_seq == state.history_stub_seq
+
+
+def _chars(messages: list[AgentMessage]) -> int:
+    return sum(len(m.content) for m in messages if isinstance(m.content, str))
+
+
+def _writes_then_reads() -> tuple[_Rows, StoredMessage]:
+    """Six turns that each write, then two that each read a huge result."""
+    t = _Rows()
+    for i in range(6):
+        _calls_turn(t, i * 5, f"ask {i}", [("qb_create", {"query": f"inv {i}"}, HUGE_WRITE, False)])
+    for i in range(6, 8):
+        _calls_turn(t, i * 5, f"ask {i}", [("web_search", {"query": f"q{i}"}, HUGE, False)])
+    return t, t.ask(40, "what now?")
+
+
+@pytest.mark.parametrize(
+    ("limit", "verbatim_reads"),
+    [
+        # Stubbing both reads is the only way under: the window goes to zero.
+        (200_000, 0),
+        # One read fits beside the writes: the window keeps the newest turn.
+        (245_000, 1),
+    ],
+)
+def test_shed_shrinks_the_verbatim_window_before_dropping_a_turn(
+    limit: int, verbatim_reads: int
+) -> None:
+    """Recent reads can be fetched again; prose and write results cannot. So
+    the shed stubs reads inside the verbatim window before it drops a turn."""
+    t, current = _writes_then_reads()
+    rows = t.rows[:-1]
+
+    with patch.object(settings, "cold_start_verbatim_turns", 2):
+        shed = shed_history_view(
+            rows,
+            current,
+            "",
+            tools_by_name=TOOLS,
+            fits=lambda messages: _chars(messages) <= limit,
+        )
+
+    assert shed.view.dropped_rows == []
+    results = [m.content for m in shed.view.messages if isinstance(m, ToolResultMessage)]
+    assert results[:6] == [HUGE_WRITE] * 6
+    stub = elided_result_stub("web_search", len(HUGE))
+    assert results[6:] == [stub] * (2 - verbatim_reads) + [HUGE] * verbatim_reads
+    # The stub seq is the first verbatim row, or the current turn with none.
+    assert shed.stub_before == (rows[-2].seq if verbatim_reads else current.seq)
+
+
+async def test_replay_over_the_trigger_sheds_as_live_does_and_writes_nothing(
+    test_user: User, trim_settings: AsyncMock
+) -> None:
+    """The comparison replay of a turn over the trim trigger stubs the same
+    reads the live trim does, and leaves the session as it found it."""
+    t = _read_and_write_turns(WRITE_RESULT)
+    await create_test_session(test_user.id, messages=t.rows)
+    current = t.rows[-1]
+    fixture = ReplayFixture(user=test_user, rows=t.rows, tools_by_name=dict(TOOLS))
+    sample = ReplaySample(
+        seq=current.seq, timestamp=current.timestamp, message_context=current.body
+    )
+
+    replayed = await assemble_for_sample(fixture, sample, HistoryMode.COLD_START_COMPACTION)
+
+    state, _ = await get_session_store(test_user.id).get_or_create_session()
+    assert state.history_stub_seq is None
+    assert state.last_trim_seq is None
+    assert trim_settings.await_count == 0
+
+    live = _results_by_id(await _live_turn(test_user))
+    replay = {
+        m.tool_call_id: m.content for m in replayed.messages if isinstance(m, ToolResultMessage)
+    }
+    stub = elided_result_stub("web_search", len(HUGE))
+    assert sum(r == stub for r in replay.values()) == 6
+    assert replay == live

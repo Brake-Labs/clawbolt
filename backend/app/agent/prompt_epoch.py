@@ -31,8 +31,10 @@ later render applies. See :func:`shed_history_view`.
 
 The definition of a cold start lives in one place, :func:`is_cold_gap`, and
 is computed from message timestamps rather than from process state. That is
-what lets the model-comparison replay rebuild the exact history a live turn
-would have seen, from the transcript alone.
+what lets the model-comparison replay rebuild the cold-start history a live
+turn would have seen from the transcript alone. The trim's stub seq is the
+exception: it is session state written by an earlier turn, and the replay
+does not reconstruct it (see ``model_comparison.sampling``).
 """
 
 from __future__ import annotations
@@ -486,29 +488,39 @@ def shed_history_view(
     The trim in ``core.assemble_prompt`` calls this when the prompt crosses
     ``context_trim_trigger_tokens``, instead of dropping whole turns first.
     *fits* is the trimmer's test of whether a rendered history brings the
-    prompt within its target.
+    prompt within its target. The steps mirror the cold-start rebuild's
+    (:func:`build_history_view`), with *fits* as the budget:
 
     1. Read results in turns older than the last ``cold_start_verbatim_turns``
-       become stubs and lose their SKILL.md guidance, as in a cold-start
-       rebuild. Write results stay verbatim. That line is the returned
-       ``stub_before``, which the caller persists.
-    2. Only if that does not fit are the oldest turns dropped, as few as
-       fit (the newest is always kept). The caller compacts them into memory
-       and advances the trim watermark past them.
+       become stubs and lose their SKILL.md guidance. Write results stay
+       verbatim.
+    2. While that does not fit, the verbatim window shrinks, one turn at a
+       time, to nothing. Read results can be fetched again; prose and write
+       results cannot.
+    3. Only if every read result is a stub and it still does not fit are the
+       oldest turns dropped, as few as fit (the newest is always kept), and
+       the verbatim window then widens again as far as *fits* allows. The
+       caller compacts the dropped turns into memory and advances the trim
+       watermark past them.
 
-    Every candidate is rendered by :func:`build_history_view` with the new
+    The first row of the verbatim window (or *current*, with no window) is
+    the returned ``stub_before``, which the caller persists. It never moves
+    back past the *stub_before* given.
+
+    Every candidate is rendered by :func:`build_history_view` with its
     ``stub_before`` and the rows that would remain, which is the call every
     later turn makes once the stub seq and the watermark are stored. So the
     history this returns is the one the next turns render, byte for byte,
     and they grow it only by appending.
     """
     groups = _group_turns(rows)
-    verbatim = min(settings.cold_start_verbatim_turns, len(groups))
-    new_stub = groups[len(groups) - verbatim][0].seq if verbatim else current.seq
-    if stub_before is not None:
-        new_stub = max(new_stub, stub_before)
 
-    def render(start: int) -> HistoryView:
+    def stub_line(start: int, verbatim: int) -> int:
+        """The stub seq that leaves the last *verbatim* of ``groups[start:]`` whole."""
+        line = groups[len(groups) - verbatim][0].seq if verbatim else current.seq
+        return line if stub_before is None else max(line, stub_before)
+
+    def render(start: int, verbatim: int) -> HistoryView:
         dropped = [row for group in groups[:start] for row in group]
         view = build_history_view(
             [row for group in groups[start:] for row in group],
@@ -517,26 +529,41 @@ def shed_history_view(
             compact=True,
             tools_by_name=tools_by_name,
             preceding=[*preceding, *dropped],
-            stub_before=new_stub,
+            stub_before=stub_line(start, verbatim),
         )
         # A cold-start rebuild inside the render may drop more from the front.
         view.dropped_rows = [*dropped, *view.dropped_rows]
         return view
 
-    view = render(0)
+    def widest(start: int) -> tuple[HistoryView, int] | None:
+        """Steps 1 and 2 over ``groups[start:]``: the widest window that fits."""
+        for verbatim in range(min(settings.cold_start_verbatim_turns, len(groups) - start), -1, -1):
+            view = render(start, verbatim)
+            if fits(view.messages):
+                return view, stub_line(start, verbatim)
+        return None
+
+    found = widest(0)
     last = len(groups) - 1
-    if last >= 1 and not fits(view.messages):
-        # Fewer turns never render longer, so search for the fewest drops that
-        # fit rather than re-rendering the whole window once per turn.
-        # If even the newest turn alone does not fit, it is what is kept.
+    if found is None and last >= 1:
+        # Step 3. Fewer turns never render longer, so search for the fewest
+        # drops that fit with every read stubbed, rather than re-rendering
+        # the whole window once per turn.
         low, high = 1, last
         while low < high:
             middle = (low + high) // 2
-            if fits(render(middle).messages):
+            if fits(render(middle, 0).messages):
                 high = middle
             else:
                 low = middle + 1
-        view = render(low)
+        found = widest(low)
+        if found is None:
+            # Even the newest turn alone does not fit: it is what is kept.
+            found = render(low, 0), stub_line(low, 0)
+    if found is None:
+        # A single turn that does not fit even with its reads stubbed.
+        found = render(0, 0), stub_line(0, 0)
+    view, new_stub = found
     return ShedView(view=view, stub_before=new_stub)
 
 
@@ -561,6 +588,11 @@ class EpochHistoryRenderer:
     selection (the trim watermark, the window limit, overflow compaction)
     stays where it is and only the rendering changes. A compacting renderer
     also serves the turn's trim: see :meth:`shed`.
+
+    With *persist* False it renders and sheds exactly as the live loop does
+    but writes nothing: no compaction, no watermark, no stub seq. That is the
+    model-comparison replay's renderer, which must not change the session it
+    reads.
     """
 
     def __init__(
@@ -570,6 +602,7 @@ class EpochHistoryRenderer:
         compact: bool,
         tools_by_name: Mapping[str, Tool] | None = None,
         stub_before: int | None = None,
+        persist: bool = True,
     ) -> None:
         # The rebuild needs the turn's tools to tell reads from writes. Without
         # them every call would count as a write and nothing would be elided,
@@ -581,6 +614,7 @@ class EpochHistoryRenderer:
         self._tools_by_name: Mapping[str, Tool] = tools_by_name or {}
         # ``sessions.history_stub_seq`` as the turn loaded it.
         self._stub_before = stub_before
+        self._persist = persist
         self.epoch: PromptEpoch | None = None
         # What the last render kept: rows, current row, timezone, and the
         # rows ahead of them (dropped ones included). :meth:`shed` starts here.
@@ -623,9 +657,9 @@ class EpochHistoryRenderer:
         """Shed the rendered history for a trim (:func:`shed_history_view`).
 
         Stores the new stub seq and compacts the dropped turns before
-        returning, so the next turn loads what this one sends. None when the
-        renderer does not compact or has nothing to shed; the caller falls
-        back to the plain trim.
+        returning (unless the renderer does not persist), so the next turn
+        loads what this one sends. None when the renderer does not compact or
+        has nothing to shed; the caller falls back to the plain trim.
         """
         if not self._compact or self._rendered is None or not self._rendered[0]:
             return None
@@ -639,7 +673,8 @@ class EpochHistoryRenderer:
             preceding=preceding,
             stub_before=self._stub_before,
         )
-        await _set_history_stub_seq(self._user_id, shed.stub_before)
+        if self._persist:
+            await _set_history_stub_seq(self._user_id, shed.stub_before)
         self._stub_before = shed.stub_before
         dropped_rows = shed.view.dropped_rows
         dropped = await self._compact_dropped(dropped_rows, tz_name, preceding)
@@ -660,15 +695,23 @@ class EpochHistoryRenderer:
         """Compact *dropped_rows* into memory and move the watermark past them.
 
         Returns them rendered in full, results unstubbed, which is what the
-        compaction reads. With compaction off the watermark stays put: after
-        a cold-start drop the next turn loads the same rows, drops the same
-        ones, and renders the same bytes. After a trim's drop it loads them
-        again and the trim fires again, as the plain trim always has.
+        compaction reads.
+
+        With compaction off the watermark stays put, as it does for the plain
+        trim (``context.trigger_compaction_for_dropped`` is a no-op then).
+        After a cold-start drop the next turn loads the same rows, drops the
+        same ones, and renders the same bytes. After a trim's drop it is not
+        a fixed point: the next turn loads the dropped rows again, rendered
+        with the stored stub seq, so their read results are stubs. If that
+        history is under the trigger it is sent whole, dropped turns
+        included, and the prefix the trim turn cached is not read; if it is
+        over, the trim sheds again. The plain trim with compaction off does
+        the same: it reloads the dropped rows and trims afresh every turn.
         """
         dropped = _stored_messages_to_agent_messages(
             dropped_rows, tz_name=tz_name, preceding=preceding
         )
-        if not dropped_rows or not settings.compaction_enabled:
+        if not dropped_rows or not self._persist or not settings.compaction_enabled:
             return dropped
         await trigger_compaction_for_dropped(self._user_id, dropped)
         # The compaction event's range ends at the last row that renders

@@ -1473,15 +1473,7 @@ class ClawboltAgent:
             if deterministic_trim or rebuilt
             else (self._last_input_tokens or _recall_input_tokens(self.user.id))
         )
-        trim_result = await self._shed_history(messages, shed_history, input_tokens)
-        if trim_result is None:
-            trim_result = trim_messages(
-                messages,
-                target_tokens=settings.context_trim_target_tokens,
-                target_turns=settings.context_trim_target_turns,
-                trigger_tokens=settings.context_trim_trigger_tokens,
-                input_tokens=input_tokens,
-            )
+        trim_result = await self._trim_history(messages, shed_history, input_tokens)
         messages = trim_result.messages
         # Seed skill-delivery state from what actually survived trimming:
         # a marker present in a reloaded tool result means that category's
@@ -1507,7 +1499,35 @@ class ClawboltAgent:
             trimmed_count=trimmed_count,
         )
 
-    async def _shed_history(
+    async def _trim_history(
+        self,
+        messages: list[AgentMessage],
+        shed_history: HistoryShedder | None,
+        input_tokens: int | None,
+    ) -> TrimResult:
+        """Decide the history this turn sends: shed, trimmed, or as rendered.
+
+        This is the one place the turn's final history is chosen. Anything
+        that rewrites the history the turn sends must apply to the returned
+        messages, after this decision, so the trim measures what the renderer
+        produced and every later turn renders the same bytes.
+
+        *messages* is the system prompt, the rendered history, and the current
+        turn. The shedder is asked first (:meth:`_shed`); without one, or when
+        it has nothing to shed, ``trim_messages`` drops whole turns.
+        """
+        shed = await self._shed(messages, shed_history, input_tokens)
+        if shed is not None:
+            return shed
+        return trim_messages(
+            messages,
+            target_tokens=settings.context_trim_target_tokens,
+            target_turns=settings.context_trim_target_turns,
+            trigger_tokens=settings.context_trim_trigger_tokens,
+            input_tokens=input_tokens,
+        )
+
+    async def _shed(
         self,
         messages: list[AgentMessage],
         shed_history: HistoryShedder | None,
@@ -1515,8 +1535,7 @@ class ClawboltAgent:
     ) -> TrimResult | None:
         """The trim by shedding history, or None to leave it to ``trim_messages``.
 
-        *messages* is the system prompt, the rendered history, and the current
-        turn. The shedder's history is measured against the same budget the
+        The shedder's history is measured against the same budget the
         trim would use, with the system prompt and current turn around it.
         Turns it drops are already compacted by the renderer, so they are not
         returned as dropped; the note summarizing them still rides the

@@ -17,11 +17,14 @@ day. See ``assemble_for_sample``.
 The history for a turn is the window of rows immediately preceding it,
 bounded by ``conversation_history_limit``, rendered by the live loop's
 ``prompt_epoch.build_history_view`` (with the cold-start rebuild on or off,
-per the run's ``HistoryMode``), and then trimmed by the same
-``trim_messages`` governor the live loop uses. The session's current
-``last_trim_seq`` watermark is deliberately *not* applied: it describes
-what is visible today, and applying it would erase the history that older
-samples actually ran with.
+per the run's ``HistoryMode``), and then trimmed the way the live loop
+trims. In ``COLD_START_COMPACTION`` mode that includes the trim's history
+shedding (``prompt_epoch.shed_history_view``), through a renderer that
+writes nothing. The session's current ``last_trim_seq`` watermark is
+deliberately *not* applied: it describes what is visible today, and
+applying it would erase the history that older samples actually ran with.
+Its ``history_stub_seq`` is not applied either, for the same reason; see
+``assemble_for_sample`` for what that costs.
 """
 
 from __future__ import annotations
@@ -37,7 +40,12 @@ from backend.app.agent.context import (
 from backend.app.agent.core import AssembledPrompt, ClawboltAgent
 from backend.app.agent.dto import StoredMessage
 from backend.app.agent.messages import AgentMessage
-from backend.app.agent.prompt_epoch import build_history_view, find_epoch
+from backend.app.agent.prompt_epoch import (
+    EpochHistoryRenderer,
+    HistoryShedder,
+    build_history_view,
+    find_epoch,
+)
 from backend.app.agent.router import init_storage
 from backend.app.agent.session_db import get_session_store
 from backend.app.agent.stores import ToolConfigStore
@@ -438,26 +446,57 @@ def _history_for(
 
     Rendered by the function the live loop's history renderer calls, so the
     cold-start rebuild reads the same row timestamps and makes the same cut.
-    The one thing a replay cannot do is advance the trim watermark: rows a
-    live cold start would have dropped and compacted are dropped here too,
-    but their facts are not in today's memory unless production compacted
-    them itself.
+    A replay cannot advance the trim watermark: rows a live cold start would
+    have dropped and compacted are dropped here too, but their facts are not
+    in today's memory unless production compacted them itself. Nor does it
+    apply a stub seq left by an earlier trim (see ``assemble_for_sample``).
     """
-    preceding = [r for r in fixture.rows if r.seq < sample.seq]
-    window_start = max(len(preceding) - settings.conversation_history_limit, 0)
-    current = next((r for r in fixture.rows if r.seq == sample.seq), None)
+    window, current, preceding = _history_window(fixture, sample)
     return build_history_view(
-        preceding[window_start:],
+        window,
         current,
         fixture.tz_name,
         compact=history_mode == HistoryMode.COLD_START_COMPACTION,
         # The rebuild keeps write results verbatim and reads this schema to
         # tell them from reads, as the live renderer reads the turn's tools.
         tools_by_name=fixture.tools_by_name,
-        # The rows above the window seed the first row's time marker, as
-        # ``load_conversation_history`` does for the live turn.
-        preceding=preceding[:window_start],
+        preceding=preceding,
     ).messages
+
+
+def _history_window(
+    fixture: ReplayFixture, sample: ReplaySample
+) -> tuple[list[StoredMessage], StoredMessage | None, list[StoredMessage]]:
+    """The rows *sample*'s history renders, its own row, and the rows above them.
+
+    The rows above the window seed the first row's time marker, as
+    ``load_conversation_history`` does for the live turn.
+    """
+    preceding = [r for r in fixture.rows if r.seq < sample.seq]
+    window_start = max(len(preceding) - settings.conversation_history_limit, 0)
+    current = next((r for r in fixture.rows if r.seq == sample.seq), None)
+    return preceding[window_start:], current, preceding[:window_start]
+
+
+async def _replay_history(
+    fixture: ReplayFixture, sample: ReplaySample, history_mode: HistoryMode
+) -> tuple[list[AgentMessage], HistoryShedder | None]:
+    """*sample*'s history and, when the rebuild is on, the trim's shed hook.
+
+    ``COLD_START_COMPACTION`` renders through the live loop's
+    ``EpochHistoryRenderer`` with ``persist=False``, so a turn over the trim
+    trigger sheds as live does (stubs reads before dropping turns) without
+    writing a stub seq, a watermark, or a compaction to the user's session.
+    It renders the same bytes as :func:`_history_for`.
+    """
+    if history_mode != HistoryMode.COLD_START_COMPACTION:
+        return _history_for(fixture, sample, history_mode), None
+    window, current, preceding = _history_window(fixture, sample)
+    renderer = EpochHistoryRenderer(
+        fixture.user.id, compact=True, tools_by_name=fixture.tools_by_name, persist=False
+    )
+    history = await renderer(window, current, fixture.tz_name, preceding)
+    return history, renderer.shed
 
 
 def sample_clock(sample: ReplaySample) -> datetime | None:
@@ -497,15 +536,31 @@ async def assemble_for_sample(
     No cache epoch is passed, so the system block carries today's workspace
     documents whole, which is what a live turn shows whenever nothing changed
     mid-epoch. A replay must not read or write the live snapshot store.
+
+    In ``COLD_START_COMPACTION`` mode the trim sheds history as the live
+    trim does, from the replayed window, and stores nothing. What it cannot
+    reconstruct is a stub seq carried over from a trim on an *earlier* turn:
+    live, every turn after a trim renders read results below
+    ``sessions.history_stub_seq`` as stubs, but that value is session state
+    (today's value is the latest trim's, not the one in force when the
+    sample ran), so the replay starts every turn with no stub seq. On the
+    turn a trim fires, the replay matches live. On a later turn in the same
+    session it renders those old reads verbatim: if that lands under the
+    trigger it sends a longer history than production did, and if over, it
+    sheds afresh from its own verbatim window, which can stub a different
+    set of reads than the live stub seq did. Turns the live trim dropped
+    are likewise reloaded (the watermark is not applied) and shed again.
     """
     agent = ClawboltAgent(user=fixture.user)
     agent.register_tools(fixture.tools)
     # Reproducibility: without this the trim decision reads a process-local
     # estimate written by live traffic, so the same run can build a different
     # prompt on a worker that recently served this user.
+    history, shed_history = await _replay_history(fixture, sample, history_mode)
     return await agent.assemble_prompt(
         sample.message_context,
-        _history_for(fixture, sample, history_mode),
+        history,
         deterministic_trim=True,
         now=sample_clock(sample),
+        shed_history=shed_history,
     )
