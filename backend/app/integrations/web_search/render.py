@@ -12,11 +12,13 @@ is ever cut short. The only skip is a key whose value is null or an empty
 string, which carries nothing the model could use.
 
 Shaping belongs to the provider, which knows its own field names. Brave's
-(``brave.py``) strips ``<strong>`` markup, drops a short denylist of
-presentation-only keys (image and favicon URLs, site chrome, display flags),
-and caps a few repeated lists with a ``<key>_not_shown`` count. That is a
-denylist, not an allowlist, so the failure above cannot recur: a field nobody
-named, ``product.price`` included, still passes through.
+(``brave.py``) strips ``<strong>`` markup, drops a short denylist of keys
+(image and favicon URLs, site chrome, display flags, barcodes, ratings), drops
+values the record already states elsewhere (repeated snippets, a nested url
+equal to the result url), and caps a few repeated lists with a
+``<key>_not_shown`` count. That is a denylist and a dedup, not an allowlist, so
+the failure above cannot recur: a field nobody named, ``product.price``
+included, still passes through.
 
 The size of a response is therefore set by the result count and the provider's
 trim, not by a character budget hidden in here. ``WEB_SEARCH_MAX_RESULTS`` sets

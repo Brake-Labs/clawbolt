@@ -86,8 +86,9 @@ class WebSearchParams(BaseModel):
     max_results: int | None = Field(
         default=None,
         description=(
-            "Results to return, 1 to 20. Omit for the default. Fewer to check one "
-            "fact, more to compare prices or options across suppliers."
+            "Results to return, 1 to 20. Omit for the default. At most 5 even for "
+            "prices; more only to compare many products or suppliers side by side. "
+            "Every result stays in the conversation."
         ),
     )
     freshness: Literal["pd", "pw", "pm", "py"] | None = Field(

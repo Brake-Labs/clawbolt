@@ -374,7 +374,7 @@ The agent gets one specialist tool here: `web_search`, which takes a natural-lan
 
 Two optional parameters are chosen per call by the agent rather than fixed by configuration, because both depend on the question rather than the deployment:
 
-- `max_results` (1 to 20) trades cost against breadth. Checking one fact needs fewer results than comparing prices across suppliers. Values outside the range are clamped rather than rejected, since a rejected call costs a turn and teaches the agent nothing.
+- `max_results` (1 to 20) trades cost against breadth. The tool steers the agent to 5 or fewer, even for prices, and higher only when comparing many products or suppliers side by side. Values outside the range are clamped rather than rejected, since a rejected call costs a turn and teaches the agent nothing.
 - `freshness` (`pd`, `pw`, `pm`, `py` for past day/week/month/year) restricts results by age. A material price wants the past month; a 2023 code requirement wants no filter at all, because the correct answer is years old and filtering would hide it. Omitted by default.
 
 Without a freshness filter most results carry no publication date at all, so the agent cannot tell a page from last week from one from 2019. Asking for `pm` on a price query is the difference between an undated snippet and one stamped `3 weeks ago`.
@@ -385,11 +385,13 @@ Results are search snippets and can be stale. The agent is instructed to cite th
 
 ### Result size
 
-Results are passed through as the provider returned them. Nothing is truncated and no fields are dropped, because a search tool that quietly serves half a result is indistinguishable from one that is broken, and the field most likely to go missing is the one a specific answer depends on. An earlier revision of this integration mapped results onto a fixed set of fields and silently discarded the structured product price, which is exactly that failure.
+No value is truncated, and fields are removed only by name or because the record already states them elsewhere, never by an allowlist. A search tool that quietly serves half a result is indistinguishable from one that is broken, and the field most likely to go missing is the one a specific answer depends on. An earlier revision of this integration mapped results onto a fixed set of fields and silently discarded the structured product price, which is that failure.
 
-The cost is real and worth knowing before tuning. Measured against Brave, a single search renders to roughly 2,600 tokens at three results and 4,000 at five, rising to about 16,000 at the ceiling of twenty. A request that fans out across many items multiplies accordingly.
+What the Brave provider does remove: presentation chrome (images, favicons, site names, display flags), barcodes, currency codes, a rating's scale and review count (the score stays), extra snippets that repeat the description or another snippet, snippets that are a site's navigation menu, a nested url equal to the result's own, an offer that only repeats its product's price, and `page_age` when `age` is present. It keeps one extra snippet per result and caps other repeated lists, noting how many were cut. Titles, urls, descriptions, product names, and prices always pass through.
 
-If that is too much for your deployment, lower `WEB_SEARCH_MAX_RESULTS`. That trades away whole results, which the agent can see and reason about, rather than trimming fields out of the ones it keeps. Note that the agent can request more than the default on a given call, so this sets the usual case rather than a hard budget.
+Every result stays in the conversation history for the rest of the session, so each later reply re-reads it. On a realistic ten-result product search this trimming takes the rendered result from about 18,000 characters to about 7,700.
+
+If that is still too much for your deployment, lower `WEB_SEARCH_MAX_RESULTS`. That trades away whole results, which the agent can see and reason about, rather than trimming fields out of the ones it keeps. Note that the agent can request more than the default on a given call, so this sets the usual case rather than a hard budget.
 
 ### Swapping the search provider
 
