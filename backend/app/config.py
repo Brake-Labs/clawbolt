@@ -385,6 +385,11 @@ class Settings(BaseSettings):
     heartbeat_recent_messages_count: int = Field(default=5, ge=1)
     # Skip heartbeat evaluation during an active conversation. Zero disables.
     heartbeat_user_quiet_period_minutes: int = Field(default=5, ge=0)
+    # Overnight window, in whole hours of the user's local time, when no
+    # heartbeat check runs. A start equal to the end disables it. Users with
+    # no timezone on file are never held, since their night is unknown.
+    heartbeat_quiet_hours_start: int = Field(default=21, ge=0, le=23)
+    heartbeat_quiet_hours_end: int = Field(default=7, ge=0, le=23)
     # Let queued inbound work settle before the first post-start heartbeat tick.
     heartbeat_startup_warmup_seconds: int = Field(default=60, ge=0)
 

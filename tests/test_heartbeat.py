@@ -27,6 +27,7 @@ from backend.app.agent.heartbeat import (
     evaluate_heartbeat_need,
     execute_heartbeat_tasks,
     get_daily_heartbeat_count,
+    in_quiet_hours,
     register_heartbeat_usage_hook,
     run_heartbeat_for_user,
 )
@@ -40,6 +41,7 @@ from backend.app.agent.heartbeat_types import (
     HeartbeatDecisionParams,
 )
 from backend.app.agent.system_prompt import to_local_time
+from backend.app.config import settings
 from backend.app.database import db_session_async
 from backend.app.models import ChannelRoute, ChatSession, Message, User
 from tests.mocks.llm import (
@@ -870,6 +872,27 @@ class TestRunHeartbeatForUser:
         # Quiet-period must run BEFORE any LLM evaluation. Asserting the
         # evaluator was never awaited makes the gate's ordering explicit
         # and would catch a regression that re-arranged the gates.
+        mock_eval.assert_not_awaited()
+
+    @patch("backend.app.agent.heartbeat.evaluate_heartbeat_need")
+    @patch("backend.app.agent.heartbeat._user_messaged_within")
+    @patch("backend.app.agent.heartbeat.get_daily_heartbeat_count")
+    async def test_skip_inside_overnight_quiet_hours(
+        self,
+        mock_count: AsyncMock,
+        mock_recent: MagicMock,
+        mock_eval: AsyncMock,
+        user_with_timezone: User,
+    ) -> None:
+        """Regression: the decision model ran a check at 4:45 AM and texted the user."""
+        mock_count.return_value = 0
+        mock_recent.return_value = False
+        with (
+            patch.object(settings, "heartbeat_quiet_hours_start", 0),
+            patch.object(settings, "heartbeat_quiet_hours_end", 23),
+        ):
+            result = await run_heartbeat_for_user(user_with_timezone, "telegram", "+15550000000", 5)
+        assert result is None
         mock_eval.assert_not_awaited()
 
     @patch("backend.app.agent.heartbeat.HeartbeatStore")
@@ -4080,3 +4103,41 @@ class TestHeartbeatThinkingBudgetFits:
         else:
             assert "thinking" not in kwargs
             assert kwargs["max_tokens"] == 256
+
+
+class TestInQuietHours:
+    """The overnight window in the user's own timezone, wrapping past midnight."""
+
+    @pytest.mark.parametrize(
+        ("utc_hour", "quiet"),
+        [
+            (8, True),  # 4 AM New York
+            (0, False),  # 8 PM New York, before quiet hours
+            (1, True),  # 9 PM New York, the first quiet hour
+            (11, False),  # 7 AM New York, quiet hours over
+            (16, False),  # noon New York
+        ],
+    )
+    def test_window_wraps_midnight(self, utc_hour: int, quiet: bool) -> None:
+        now = datetime.datetime(2026, 9, 29, utc_hour, 30, tzinfo=datetime.UTC)
+        with (
+            patch.object(settings, "heartbeat_quiet_hours_start", 21),
+            patch.object(settings, "heartbeat_quiet_hours_end", 7),
+        ):
+            assert in_quiet_hours("America/New_York", now) is quiet
+
+    def test_no_timezone_is_never_held(self) -> None:
+        now = datetime.datetime(2026, 9, 29, 8, 30, tzinfo=datetime.UTC)
+        with (
+            patch.object(settings, "heartbeat_quiet_hours_start", 21),
+            patch.object(settings, "heartbeat_quiet_hours_end", 7),
+        ):
+            assert in_quiet_hours("", now) is False
+
+    def test_equal_bounds_disable_the_window(self) -> None:
+        now = datetime.datetime(2026, 9, 29, 8, 30, tzinfo=datetime.UTC)
+        with (
+            patch.object(settings, "heartbeat_quiet_hours_start", 7),
+            patch.object(settings, "heartbeat_quiet_hours_end", 7),
+        ):
+            assert in_quiet_hours("America/New_York", now) is False
