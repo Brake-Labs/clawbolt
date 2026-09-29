@@ -256,9 +256,13 @@ async def capture_workspace(user: User) -> WorkspaceSnapshot:
 
 _DELTA_CONTEXT_LINES = 2
 
+# The section a mid-epoch change rides, on the current turn and, in later
+# histories of the epoch, on the turn it was delivered on.
+WORKSPACE_UPDATES_HEADING = "Workspace Updates"
 
-def _describe_change(heading: str, filename: str, old: str, new: str) -> str:
-    """Tell the model how *filename* differs from its copy under *heading*.
+
+def _describe_change(filename: str, old: str, new: str) -> str:
+    """Tell the model how *filename* differs from the copy it last saw.
 
     A unified diff with the unchanged lines around each change, or the whole
     current file when that is shorter. The context is what places an edit:
@@ -274,31 +278,46 @@ def _describe_change(heading: str, filename: str, old: str, new: str) -> str:
     # Markdown rule ("---" becomes "----").
     body = "\n".join(lines[2:])
     delta = (
-        f'{filename} changed after "{heading}" above was captured. Apply this'
+        f"{filename} changed since it was last shown above. Apply this"
         ' diff to it ("-" removed, "+" added, " " unchanged context):\n' + body
     )
     if len(delta) < len(new):
         return delta
-    return f'{filename} changed after "{heading}" above was captured. It now reads:\n{new}'
+    return f"{filename} changed since it was last shown above. It now reads:\n{new}"
 
 
-def render_workspace_updates(snapshot: WorkspaceSnapshot, live: WorkspaceSnapshot) -> str:
-    """What changed in the workspace documents since *snapshot*, or "".
+def render_workspace_updates(shown: WorkspaceSnapshot, live: WorkspaceSnapshot) -> str:
+    """What changed in the workspace documents since *shown*, or "".
 
-    The system block carries the snapshot for the whole cache epoch; this
-    rides the current turn so an edit reaches the model on the next turn
-    without rewriting the cached prefix.
+    *shown* is the documents as the model already has them: the snapshot in
+    the system block, plus any update delivered earlier in the epoch (see
+    ``prompt_epoch.WorkspaceTurn``). This rides the current turn so an edit
+    reaches the model on the next turn without rewriting the cached prefix.
     """
     changes = [
-        _describe_change(heading, filename, old, new)
-        for heading, filename, old, new in (
-            ("About You", "SOUL.md", snapshot.soul, live.soul),
-            ("About Your User", "USER.md", snapshot.user, live.user),
-            ("Your Memory", "MEMORY.md", snapshot.memory, live.memory),
+        _describe_change(filename, old, new)
+        for filename, old, new in (
+            ("SOUL.md", shown.soul, live.soul),
+            ("USER.md", shown.user, live.user),
+            ("MEMORY.md", shown.memory, live.memory),
         )
         if old != new
     ]
     return "\n\n".join(changes)
+
+
+def append_workspace_updates(text: str, updates: str) -> str:
+    """*text* followed by *updates* as a "Workspace Updates" section.
+
+    The same bytes the prompt builder gives the section, so a dynamic half
+    built without it and extended here reads as one built with it. Used on
+    the current turn's dynamic half and on the history message a delivered
+    update stays on.
+    """
+    if not updates:
+        return text
+    section = f"## {WORKSPACE_UPDATES_HEADING}\n{updates}"
+    return f"{text}\n\n{section}" if text else section
 
 
 def build_instructions_section() -> str:
@@ -395,6 +414,7 @@ async def _build_agent_prompt_builder(
     *,
     live: WorkspaceSnapshot | None = None,
     snapshot: WorkspaceSnapshot | None = None,
+    workspace_updates: bool = True,
 ) -> SystemPromptBuilder:
     """Assemble the composable builder for the main agent loop.
 
@@ -406,8 +426,10 @@ async def _build_agent_prompt_builder(
     given. With ``prompt_stable_prefix_enabled`` the stable half carries
     *snapshot* (the copy taken when the cache epoch opened, see
     ``prompt_epoch``) or *live* when there is none, and the dynamic half
-    carries whatever changed since. With the setting off, memory and tool
-    guidelines ride the dynamic half as before.
+    ends with whatever changed since the snapshot, unless *workspace_updates*
+    is False: the agent loop adds that section itself, once the trim has
+    decided the history (see ``prompt_epoch.WorkspaceTurn``). With the
+    setting off, memory and tool guidelines ride the dynamic half as before.
     """
     stable_prefix = settings.prompt_stable_prefix_enabled
     live = live or await capture_workspace(user)
@@ -442,11 +464,7 @@ async def _build_agent_prompt_builder(
     if integration_status:
         builder.add_section("Connected Integrations", integration_status, dynamic=True)
 
-    if stable_prefix:
-        updates = render_workspace_updates(shown, live)
-        if updates:
-            builder.add_section("Workspace Updates", updates, dynamic=True)
-    else:
+    if not stable_prefix:
         builder.add_section("Your Memory", live.memory, dynamic=True)
 
     # Continuity cover for the trim-to-compaction window (issue #1432):
@@ -465,6 +483,13 @@ async def _build_agent_prompt_builder(
             pending_note,
             dynamic=True,
         )
+
+    # Last, so a caller that lays the updates out itself
+    # (:func:`append_workspace_updates`) produces the same bytes.
+    if stable_prefix and workspace_updates:
+        updates = render_workspace_updates(shown, live)
+        if updates:
+            builder.add_section(WORKSPACE_UPDATES_HEADING, updates, dynamic=True)
 
     return builder
 
@@ -491,17 +516,23 @@ async def build_agent_system_prompt_parts(
     *,
     live: WorkspaceSnapshot | None = None,
     snapshot: WorkspaceSnapshot | None = None,
+    workspace_updates: bool = True,
 ) -> tuple[str, str]:
     """Assemble the agent system prompt as ``(stable, dynamic)`` halves.
 
     The agent loop sends *stable* in the cacheable ``system`` param and
     appends *dynamic* (integration status, workspace updates) to the current
     user turn, so nothing that changes mid-epoch invalidates the cached
-    prefix. See :func:`_build_agent_prompt_builder` for *live* and
-    *snapshot*.
+    prefix. See :func:`_build_agent_prompt_builder` for *live*, *snapshot*
+    and *workspace_updates*.
     """
     builder = await _build_agent_prompt_builder(
-        user, tools, message_context, live=live, snapshot=snapshot
+        user,
+        tools,
+        message_context,
+        live=live,
+        snapshot=snapshot,
+        workspace_updates=workspace_updates,
     )
     return builder.build_parts()
 

@@ -11,9 +11,10 @@ Two things are keyed to epochs, each behind its own setting:
 - ``prompt_stable_prefix_enabled``: the workspace documents in the system
   block (SOUL.md, USER.md, MEMORY.md) are a snapshot taken when the epoch
   opens, so the system block stays byte-identical for every turn in it. An
-  edit made mid-epoch reaches the model as a delta on the current turn
-  (``system_prompt.render_workspace_updates``) and folds into the snapshot at
-  the next cold start. See :func:`remember_workspace_snapshot`.
+  edit made mid-epoch reaches the model once, as a delta on the current turn
+  (``system_prompt.render_workspace_updates``), and stays on that turn's
+  message in every later history of the epoch, where it is cached. It folds
+  into the snapshot at the next cold start. See :class:`WorkspaceTurn`.
 - ``cold_start_compaction_enabled``: the history before the epoch's first
   message is rebuilt to a budget, once, when the epoch opens. Old results lose
   any SKILL.md guidance delivered on them, old results of calls that only
@@ -44,7 +45,7 @@ import json
 import logging
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from backend.app.agent.context import (
@@ -62,7 +63,11 @@ from backend.app.agent.messages import (
     UserMessage,
 )
 from backend.app.agent.skills.loader import strip_skill_guidance
-from backend.app.agent.system_prompt import WorkspaceSnapshot
+from backend.app.agent.system_prompt import (
+    WorkspaceSnapshot,
+    append_workspace_updates,
+    render_workspace_updates,
+)
 from backend.app.agent.tools.base import Tool, is_mutating_call
 from backend.app.config import settings
 from backend.app.enums import MessageDirection
@@ -147,11 +152,15 @@ class PromptEpoch:
 
     ``key`` is the seq of the row that opened it and is the same for every
     turn in the epoch. ``cold_start`` is True for the turn that opened it,
-    which is the turn that pays for rewriting the prefix.
+    which is the turn that pays for rewriting the prefix. ``turn_seq`` is
+    the seq of the row the turn answers, where a workspace update delivered
+    on this turn is kept (see :class:`WorkspaceTurn`). It is about the turn,
+    not the epoch, so it takes no part in equality.
     """
 
     key: int
     cold_start: bool
+    turn_seq: int | None = field(default=None, compare=False)
 
 
 def find_epoch(rows: list[StoredMessage], current: StoredMessage) -> tuple[PromptEpoch, int]:
@@ -189,7 +198,10 @@ def find_epoch(rows: list[StoredMessage], current: StoredMessage) -> tuple[Promp
     cold_start = all(
         seq[index].direction == MessageDirection.INBOUND for index in range(boundary, len(seq))
     )
-    return PromptEpoch(key=seq[boundary].seq, cold_start=cold_start), boundary
+    return (
+        PromptEpoch(key=seq[boundary].seq, cold_start=cold_start, turn_seq=current.seq),
+        boundary,
+    )
 
 
 @dataclass
@@ -722,34 +734,144 @@ class EpochHistoryRenderer:
         return dropped
 
 
-# Snapshot of the workspace documents per user, keyed by epoch. Process-local
-# on purpose: after a restart the next turn takes a fresh snapshot, which is
-# byte-identical to the lost one unless a document changed mid-epoch, so the
-# worst case is one early cache rewrite.
-_SNAPSHOTS: OrderedDict[str, tuple[int, WorkspaceSnapshot]] = OrderedDict()
+@dataclass(frozen=True)
+class _Delivery:
+    """A workspace update delivered on the turn answering row *seq*."""
+
+    seq: int
+    text: str
+    # The documents as the model has them once it has read *text*.
+    shown: WorkspaceSnapshot
 
 
-def remember_workspace_snapshot(
-    user_id: str, epoch: PromptEpoch, live: WorkspaceSnapshot
-) -> WorkspaceSnapshot:
-    """The snapshot for *epoch*, taking *live* as it when the epoch is new.
+@dataclass
+class _EpochWorkspace:
+    key: int
+    snapshot: WorkspaceSnapshot
+    deliveries: list[_Delivery] = field(default_factory=list)
 
-    Only a cold start takes a new snapshot. A warm turn whose key moved (a
-    trim or window overflow advanced the watermark past the row that opened
-    the epoch, so ``find_epoch`` keys on the first row left) is still inside
-    the same cached prefix: it keeps the stored snapshot, and any edit since
-    rides the current turn as a delta.
+
+# The workspace per user, keyed by epoch: the snapshot and the updates
+# delivered since. Process-local on purpose: after a restart the next turn
+# takes a fresh snapshot, which is byte-identical to the lost one unless a
+# document changed mid-epoch, so the worst case is one early cache rewrite.
+_SNAPSHOTS: OrderedDict[str, _EpochWorkspace] = OrderedDict()
+
+
+def _remember(user_id: str, epoch: PromptEpoch, live: WorkspaceSnapshot) -> _EpochWorkspace:
+    """The workspace entry for *epoch*, taking *live* as its snapshot when new.
+
+    Only a cold start takes a new snapshot, and drops the updates delivered in
+    the epoch before. A warm turn whose key moved (a trim or window overflow
+    advanced the watermark past the row that opened the epoch, so
+    ``find_epoch`` keys on the first row left) is still inside the same cached
+    prefix: it keeps the stored entry.
     """
     stored = _SNAPSHOTS.get(user_id)
-    if stored is not None and (stored[0] == epoch.key or not epoch.cold_start):
-        _SNAPSHOTS[user_id] = (epoch.key, stored[1])
-        _SNAPSHOTS.move_to_end(user_id)
-        return stored[1]
-    _SNAPSHOTS[user_id] = (epoch.key, live)
+    if stored is not None and (stored.key == epoch.key or not epoch.cold_start):
+        stored.key = epoch.key
+    else:
+        stored = _EpochWorkspace(key=epoch.key, snapshot=live)
+        _SNAPSHOTS[user_id] = stored
     _SNAPSHOTS.move_to_end(user_id)
     while len(_SNAPSHOTS) > _SNAPSHOT_STORE_MAX:
         _SNAPSHOTS.popitem(last=False)
-    return live
+    return stored
+
+
+@dataclass(frozen=True)
+class WorkspaceView:
+    """What one turn shows of the workspace documents, around its history."""
+
+    # The history, with each earlier update on the turn it was delivered on.
+    history: list[AgentMessage]
+    # For the current turn: what changed since the model last saw it, or "".
+    updates: str
+
+
+class WorkspaceTurn:
+    """One turn's view of the workspace documents in a cache epoch.
+
+    ``snapshot`` goes in the system block: the copy taken when the epoch
+    opened. :meth:`apply` lays the updates delivered since onto the history
+    the turn sends, and returns the one the current turn carries.
+
+    An update is delivered once. The turn it first rides records it against
+    the row it answers (``epoch.turn_seq``), and every later turn of the epoch
+    appends it to that row's message in the history. The history cache then
+    holds it, so a large change (a compaction rewriting MEMORY.md) is sent
+    uncached once rather than on every turn until the next cold start. A
+    later change is diffed against what the model last saw, not the snapshot.
+
+    :meth:`apply` takes the history after the trim has decided which rows
+    survive (``core.ClawboltAgent._trim_history``), never before: a shed
+    re-renders the history from the stored rows, and the trim and compaction
+    must see those rows as stored.
+    """
+
+    def __init__(self, user_id: str, epoch: PromptEpoch, live: WorkspaceSnapshot) -> None:
+        self._entry = _remember(user_id, epoch, live)
+        self._live = live
+        self._turn_seq = epoch.turn_seq
+
+    @property
+    def snapshot(self) -> WorkspaceSnapshot:
+        return self._entry.snapshot
+
+    def _seen(self, history: Sequence[AgentMessage]) -> int:
+        """How many of the recorded deliveries the model sees in *history*.
+
+        An update counts as seen only while its row is in *history*, along
+        with the rows of every update before it (each is a diff on the one
+        before). The current turn's own delivery, recorded by an earlier
+        :meth:`apply` of the same turn, never is: its row is the current turn.
+        """
+        present = {m.seq for m in history if isinstance(m, UserMessage) and m.seq is not None}
+        seen = 0
+        deliveries = self._entry.deliveries
+        while seen < len(deliveries) and deliveries[seen].seq in present:
+            seen += 1
+        return seen
+
+    def _updates(self, seen: int) -> str:
+        deliveries = self._entry.deliveries
+        shown = deliveries[seen - 1].shown if seen else self._entry.snapshot
+        return render_workspace_updates(shown, self._live)
+
+    def preview(self, history: Sequence[AgentMessage]) -> str:
+        """The update the current turn would carry after *history*, recording nothing.
+
+        What the trim measures the current turn with, before it has decided
+        the history :meth:`apply` then takes.
+        """
+        return self._updates(self._seen(history))
+
+    def apply(self, history: Sequence[AgentMessage]) -> WorkspaceView:
+        """Lay earlier updates onto *history*, and record the current turn's.
+
+        From the first delivery whose row is missing from *history* (dropped
+        or shed by a trim, or a row that renders nothing, as an approval reply
+        does) the deliveries are forgotten, and the current turn carries the
+        change against the last one still visible. A turn with no
+        ``turn_seq`` records nothing, so every turn sends the change afresh.
+        Calling it again in the same turn (the overflow retry's trim) replaces
+        what the first call recorded.
+        """
+        seen = self._seen(history)
+        del self._entry.deliveries[seen:]
+        updates = self._updates(seen)
+        by_seq = {d.seq: d.text for d in self._entry.deliveries}
+        view_history = [
+            replace(m, content=append_workspace_updates(m.content, by_seq[m.seq]))
+            if isinstance(m, UserMessage) and m.seq in by_seq
+            else m
+            for m in history
+        ]
+        if updates and self._turn_seq is not None:
+            self._entry.deliveries.append(
+                _Delivery(seq=self._turn_seq, text=updates, shown=self._live)
+            )
+        return WorkspaceView(history=view_history, updates=updates)
 
 
 def reset_workspace_snapshots() -> None:
