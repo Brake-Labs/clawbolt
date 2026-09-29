@@ -21,6 +21,12 @@ from backend.app.integrations.quickbooks.merge import (
     describe_line,
     describe_merged_update,
 )
+from backend.app.integrations.quickbooks.payments import (
+    AppliedInvoice,
+    PaymentRejected,
+    check_payment,
+    describe_payment,
+)
 from backend.app.integrations.quickbooks.service import (
     QuickBooksOnlineService,
     QuickBooksService,
@@ -46,6 +52,7 @@ _QUERYABLE_ENTITIES = {
     "CUSTOMER",
     "ITEM",
     "PAYMENT",
+    "PAYMENTMETHOD",
     "BILL",
     "VENDOR",
     "SALESRECEIPT",
@@ -64,6 +71,7 @@ _ENTITY_LABELS: dict[str, str] = {
     "CUSTOMER": "customers",
     "ITEM": "items",
     "PAYMENT": "payments",
+    "PAYMENTMETHOD": "payment methods",
     "BILL": "bills",
     "VENDOR": "vendors",
     "SALESRECEIPT": "sales receipts",
@@ -76,7 +84,7 @@ _ENTITY_LABELS: dict[str, str] = {
 }
 
 # Entity types that qb_create is allowed to create.
-_CREATABLE_ENTITIES = {"Customer", "Estimate", "Invoice", "Item"}
+_CREATABLE_ENTITIES = {"Customer", "Estimate", "Invoice", "Item", "Payment"}
 
 # Keys that identify an existing record; never valid on a create.
 _RECORD_IDENTITY_KEYS = frozenset({"Id", "SyncToken", "sparse", "MetaData", "domain"})
@@ -304,7 +312,7 @@ def _coerce_data_to_dict(value: Any) -> Any:
 class QBCreateParams(BaseModel):
     """Parameters for the qb_create tool."""
 
-    entity_type: str = Field(description="Customer, Estimate, Invoice, or Item.")
+    entity_type: str = Field(description="Customer, Estimate, Invoice, Item, or Payment.")
     data: dict[str, Any] = Field(description="QBO API payload as a JSON object.")
 
     _coerce_data = field_validator("data", mode="before")(_coerce_data_to_dict)
@@ -727,6 +735,7 @@ def _describe_qb_update_request(args: dict[str, Any]) -> str:
 # Entity types that have a public QBO web UI page we can deep-link to.
 _WEB_LINKABLE_ENTITIES: dict[str, str] = {
     "Invoice": "invoice",
+    "Payment": "recvpayment",
     "Estimate": "estimate",
     "Customer": "customerdetail",
 }
@@ -773,10 +782,23 @@ def _receipt_target(entity_type: str, result: dict[str, Any]) -> str:
         return ", ".join(bits)
     if entity_type == "Customer":
         return name or f"ID {entity_id}"
+    if entity_type == "Payment":
+        customer_ref = result.get("CustomerRef") or {}
+        customer = customer_ref.get("name", "") if isinstance(customer_ref, dict) else ""
+        amount = f"${total:,.2f}" if total is not None else ""
+        return ", ".join(bit for bit in (customer, amount) if bit) or f"ID {entity_id}"
     if entity_type == "Item":
         item_name = result.get("Name") or ""
         return item_name or f"ID {entity_id}"
     return name or doc_num or f"ID {entity_id}"
+
+
+def _describe_qb_create(args: dict[str, Any]) -> str:
+    """Approval text for qb_create from the request alone."""
+    data = args.get("data")
+    if args.get("entity_type") == "Payment" and isinstance(data, dict):
+        return describe_payment(data, None)
+    return _format_qb_write_approval_description("Create", args)
 
 
 def _extract_send_email(args: dict[str, Any]) -> str | None:
@@ -872,6 +894,26 @@ def create_quickbooks_tools(
         # overwrite whichever invoice shares its Id. Strip the identity.
         data = {k: v for k, v in data.items() if k not in _RECORD_IDENTITY_KEYS}
 
+        applied: list[AppliedInvoice] = []
+        if entity_type == "Payment":
+            try:
+                applied = await check_payment(qb_service, data)
+            except PaymentRejected as exc:
+                return ToolResult(
+                    content=f"Did not record the payment: {exc}",
+                    is_error=True,
+                    error_kind=ToolErrorKind.VALIDATION,
+                )
+            except Exception as exc:
+                if isinstance(exc, TokenRefreshUnavailable):
+                    return _refresh_unavailable_result("record a payment")
+                _log_tool_failure(exc, "QB payment check failed")
+                return ToolResult(
+                    content=f"Could not check the invoices before recording the payment: {exc}",
+                    is_error=True,
+                    error_kind=_fault_error_kind(exc),
+                )
+
         lines = data.get("Line")
         if isinstance(lines, list):
             # Lines copied from a queried record (estimate to invoice) carry
@@ -922,11 +964,19 @@ def create_quickbooks_tools(
             parts.append(f"Name: {display_name}")
         if not display_name and item_name:
             parts.append(f"Name: {item_name}")
+        parts.extend(
+            f"Invoice {inv.doc_number} balance: ${max(inv.balance_after, 0):,.2f}"
+            for inv in applied
+        )
 
         return ToolResult(
             content=" | ".join(parts),
             receipt=ToolReceipt(
-                action=f"Created QuickBooks {entity_type.lower()} for",
+                action=(
+                    "Recorded QuickBooks payment from"
+                    if entity_type == "Payment"
+                    else f"Created QuickBooks {entity_type.lower()} for"
+                ),
                 target=_receipt_target(entity_type, result),
                 url=_build_qbo_url(qb_service, entity_type, str(entity_id)),
             ),
@@ -1014,6 +1064,22 @@ def create_quickbooks_tools(
                 url=_build_qbo_url(qb_service, entity_type, str(entity_id)),
             ),
         )
+
+    async def preview_qb_create(args: dict[str, Any]) -> str | None:
+        """Approval text for a Payment, with each invoice's balance before and after.
+
+        ``None`` for other entity types, and when the check fails (the tool
+        will refuse the call anyway), falls back to the description builder.
+        """
+        data = args.get("data")
+        if args.get("entity_type") != "Payment" or not isinstance(data, dict):
+            return None
+        try:
+            applied = await check_payment(qb_service, data)
+        except Exception:
+            logger.info("qb_create payment preview unavailable", exc_info=True)
+            return None
+        return describe_payment(data, applied)
 
     async def preview_qb_update(args: dict[str, Any]) -> str | None:
         """Approval text for qb_update against the stored record.
@@ -1121,8 +1187,9 @@ def create_quickbooks_tools(
         Tool(
             name=ToolName.QB_CREATE,
             description=(
-                "Create a Customer, Estimate, Invoice, or Item in QuickBooks Online "
-                "from a QBO API payload built as the QuickBooks skill describes."
+                "Create a Customer, Estimate, Invoice, or Item in QuickBooks Online, or "
+                "record a customer Payment against invoices, from a QBO API payload "
+                "built as the QuickBooks skill describes."
             ),
             function=qb_create,
             params_model=QBCreateParams,
@@ -1130,9 +1197,8 @@ def create_quickbooks_tools(
             approval_policy=ApprovalPolicy(
                 default_level=PermissionLevel.ASK,
                 resource_extractor=_extract_entity_type,
-                description_builder=lambda args: _format_qb_write_approval_description(
-                    "Create", args
-                ),
+                description_builder=_describe_qb_create,
+                preview_builder=preview_qb_create,
             ),
         ),
         Tool(
