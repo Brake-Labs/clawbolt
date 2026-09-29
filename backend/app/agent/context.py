@@ -831,24 +831,25 @@ async def _advance_trim_watermark_only(user_id: str, max_seq: int) -> None:
 
 
 async def hygiene_compact_memory(user_id: str) -> tuple[str, bool]:
-    """Re-audit the user's MEMORY.md against the Do-Not-Include list.
+    """Re-audit and consolidate the user's MEMORY.md with no new conversation.
 
-    Runs the compaction LLM with *hygiene_only* mode so the compliance
-    audit executes even when there is no new conversation content. The
-    model reads the current MEMORY.md and removes every line that
-    violates the exclusion list, then returns the cleaned version.
+    Runs the compaction LLM in *hygiene_only* mode, which applies the same
+    MEMORY.md rules as a trim-driven compaction to the existing file: the
+    exclusion list (integration-owned values, transient state, resolved
+    dated notes, general tool or integration behavior), merging duplicates,
+    keeping the newer of two conflicting entries, and shrinking toward
+    ``settings.compaction_memory_budget_chars``.
 
-    This is the "clean my memory now" operation: it does not require
-    untrimmed conversation messages and does not advance any watermark.
-    Useful for scrubbing pre-existing violations that were written
-    before the compliance rule existed or under the old relevance-framed
-    prompt.
+    This is the "clean my memory now" operation for a bloated or stale
+    file: it does not require untrimmed conversation messages, does not
+    advance any watermark, and never rewrites USER.md or SOUL.md. The
+    rewrite goes through the same compare-and-swap and byte cap as any
+    compaction, and the before/after lands in ``compaction_events``.
 
     Returns:
         A tuple of (memory_update, changed) where memory_update is the
         new MEMORY.md content (empty string if nothing changed) and
-        changed is True when at least one exclusion-list violation was
-        removed.
+        changed is True when the rewrite was persisted.
     """
     if not settings.compaction_enabled:
         return "", False

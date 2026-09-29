@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -10,14 +11,18 @@ from sqlalchemy import select
 
 from backend.app.agent.compaction import (
     COMPACTION_SYSTEM_PROMPT,
+    HYGIENE_RUN_MARKER,
     _build_snapshot_pairs,
     _format_messages_for_compaction,
+    _log_memory_over_budget,
+    _memory_budget_line,
     _parse_compaction_response,
     _serialize_snapshot,
     compact_session,
 )
 from backend.app.agent.context import (
     admin_compact_visible_messages,
+    hygiene_compact_memory,
     load_conversation_history,
     trigger_compaction_for_dropped,
 )
@@ -838,6 +843,7 @@ async def test_compact_session_uses_configured_model(test_user: UserData) -> Non
         mock_settings.compaction_model = "test-compact-model"
         mock_settings.compaction_provider = "test-provider"
         mock_settings.compaction_max_tokens = 300
+        mock_settings.compaction_memory_budget_chars = 8_000
         mock_settings.compaction_event_snapshot_max_bytes_per_file = 100_000
         mock_settings.llm_model = "test-model"
         mock_settings.llm_provider = "test-provider"
@@ -869,6 +875,7 @@ async def test_compact_session_falls_back_to_llm_model(test_user: UserData) -> N
         mock_settings.compaction_model = ""
         mock_settings.compaction_provider = ""
         mock_settings.compaction_max_tokens = 500
+        mock_settings.compaction_memory_budget_chars = 8_000
         mock_settings.compaction_event_snapshot_max_bytes_per_file = 100_000
         mock_settings.llm_model = "test-model"
         mock_settings.llm_provider = "test-provider"
@@ -902,6 +909,7 @@ async def test_compact_session_logs_llm_usage(test_user: UserData) -> None:
         mock_settings.compaction_model = "test-compact-model"
         mock_settings.compaction_provider = "test-provider"
         mock_settings.compaction_max_tokens = 300
+        mock_settings.compaction_memory_budget_chars = 8_000
         mock_settings.compaction_event_snapshot_max_bytes_per_file = 100_000
         mock_settings.llm_model = "test-model"
         mock_settings.llm_provider = "test-provider"
@@ -2602,6 +2610,7 @@ async def test_compaction_max_tokens_makes_room_for_the_thinking_budget(
         mock_settings.compaction_model = ""
         mock_settings.compaction_provider = ""
         mock_settings.compaction_max_tokens = 300
+        mock_settings.compaction_memory_budget_chars = 8_000
         mock_settings.compaction_event_snapshot_max_bytes_per_file = 100_000
         mock_settings.llm_model = "claude-sonnet-4-5"
         mock_settings.llm_provider = "anthropic"
@@ -2620,3 +2629,154 @@ async def test_compaction_max_tokens_makes_room_for_the_thinking_budget(
     else:
         assert "thinking" not in kwargs
         assert kwargs["max_tokens"] == 300
+
+
+# --- Memory growth: soft budget and consolidation (hygiene uses the same rules) ---
+
+
+def test_system_prompt_names_budget_tag_and_hygiene_marker() -> None:
+    """The prompt keys its budget rule and hygiene branch off strings the code
+    emits; a rename on either side silently disables them."""
+    assert "<memory_budget>" in COMPACTION_SYSTEM_PROMPT
+    assert HYGIENE_RUN_MARKER in COMPACTION_SYSTEM_PROMPT
+
+
+def test_memory_budget_line_reports_size_and_budget() -> None:
+    assert _memory_budget_line("x" * 120, 8_000) == "MEMORY.md is 120 of 8000 characters."
+    assert _memory_budget_line("", 500) == "MEMORY.md is 0 of 500 characters."
+
+
+def test_log_memory_over_budget_only_past_budget(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING, logger="backend.app.agent.compaction"):
+        assert _log_memory_over_budget("u1", "x" * 100, 100, hygiene=False) is False
+        assert _log_memory_over_budget("u1", "x" * 101, 100, hygiene=True) is True
+    lines = [r.getMessage() for r in caplog.records if "memory_over_budget" in r.getMessage()]
+    assert lines == [
+        "compaction.memory_over_budget user=u1 memory_chars=101 budget_chars=100 hygiene=True"
+    ]
+
+
+async def test_compact_session_sends_memory_budget(
+    test_user: UserData, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The configured budget and the current MEMORY.md size reach the model in
+    their own tag, outside the cached system prompt."""
+    monkeypatch.setattr(settings, "compaction_memory_budget_chars", 1_234)
+    existing = "## Pricing\n- Deck: $45/sqft"
+    await get_memory_store(test_user.id).write_memory_async(existing)
+    mock_response = make_text_response(json.dumps({"memory_update": existing, "summary": ""}))
+
+    with patch(
+        "backend.app.agent.compaction.amessages_streamed", return_value=mock_response
+    ) as mock_llm:
+        await compact_session(test_user.id, [UserMessage(content="hello")])
+
+    kwargs = mock_llm.call_args.kwargs
+    assert extract_system_text(kwargs["system"]) == COMPACTION_SYSTEM_PROMPT
+    user_content = kwargs["messages"][0]["content"]
+    start = user_content.index("<memory_budget>")
+    end = user_content.index("</memory_budget>")
+    assert user_content[start:end].strip() == (
+        f"<memory_budget>\nMEMORY.md is {len(existing)} of 1234 characters."
+    )
+
+
+async def test_compact_session_logs_but_keeps_over_budget_rewrite(
+    test_user: UserData, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A rewrite past the soft budget is persisted whole and logged; the budget
+    never truncates user memory."""
+    monkeypatch.setattr(settings, "compaction_memory_budget_chars", 500)
+    rewrite = "## Notes\n" + "\n".join(f"- fact {i}: keep" for i in range(60))
+    assert len(rewrite) > 500
+    mock_response = make_text_response(json.dumps({"memory_update": rewrite, "summary": ""}))
+
+    with (
+        patch("backend.app.agent.compaction.amessages_streamed", return_value=mock_response),
+        caplog.at_level(logging.WARNING, logger="backend.app.agent.compaction"),
+    ):
+        memory_update, _ = await compact_session(test_user.id, [UserMessage(content="hi")])
+
+    assert memory_update == rewrite
+    assert await get_memory_store(test_user.id).read_memory_async() == rewrite
+    lines = [r.getMessage() for r in caplog.records if "memory_over_budget" in r.getMessage()]
+    assert lines == [
+        f"compaction.memory_over_budget user={test_user.id} memory_chars={len(rewrite)}"
+        " budget_chars=500 hygiene=False"
+    ]
+
+
+async def test_compact_session_no_budget_warning_under_budget(
+    test_user: UserData, caplog: pytest.LogCaptureFixture
+) -> None:
+    mock_response = make_text_response(
+        json.dumps({"memory_update": "## Pricing\n- Deck: $45/sqft", "summary": ""})
+    )
+    with (
+        patch("backend.app.agent.compaction.amessages_streamed", return_value=mock_response),
+        caplog.at_level(logging.WARNING, logger="backend.app.agent.compaction"),
+    ):
+        await compact_session(test_user.id, [UserMessage(content="hi")])
+
+    assert not [r for r in caplog.records if "memory_over_budget" in r.getMessage()]
+
+
+async def test_hygiene_run_sends_marker_and_only_rewrites_memory(
+    test_user: UserData, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The admin hygiene action goes through the compaction prompt with the
+    hygiene marker as the whole conversation, rewrites MEMORY.md only, and
+    still reports a file the model could not bring under budget."""
+    monkeypatch.setattr(settings, "compaction_memory_budget_chars", 500)
+    store = get_memory_store(test_user.id)
+    bloated = (
+        (
+            "## Integration Notes\n"
+            "- Acme Books cannot attach photos to invoices; send them separately\n"
+            "## Pricing\n- Day rate: $500\n- Day rate: $600 (raised)\n"
+            "## Payment Tracking Gap (2026-01-05)\n- Resolved: payments now sync\n"
+        )
+        + "## Filler\n"
+        + "\n".join(f"- note {i}" for i in range(80))
+    )
+    await store.write_memory_async(bloated)
+    await store.write_user_async("- Name: Test User")
+    await store.write_soul_async("Be brief.")
+    cleaned = "## Pricing\n- Day rate: $600\n" + "\n".join(f"- note {i}" for i in range(80))
+    mock_response = make_text_response(
+        json.dumps(
+            {
+                "memory_update": cleaned,
+                "summary": "",
+                "user_profile_update": "- Name: Changed",
+                "soul_update": "Be verbose.",
+            }
+        )
+    )
+
+    with (
+        patch(
+            "backend.app.agent.compaction.amessages_streamed", return_value=mock_response
+        ) as mock_llm,
+        caplog.at_level(logging.WARNING, logger="backend.app.agent.compaction"),
+    ):
+        memory_text, changed = await hygiene_compact_memory(test_user.id)
+
+    assert changed is True
+    assert memory_text == cleaned
+    user_content = mock_llm.call_args.kwargs["messages"][0]["content"]
+    conv = user_content[
+        user_content.index("<conversation>") + len("<conversation>") : user_content.index(
+            "</conversation>"
+        )
+    ]
+    assert conv.strip() == HYGIENE_RUN_MARKER
+    assert f"MEMORY.md is {len(bloated)} of 500 characters." in user_content
+
+    assert await store.read_memory_async() == cleaned
+    assert await store.read_user_async() == "- Name: Test User"
+    assert await store.read_soul_async() == "Be brief."
+    assert any(
+        "memory_over_budget" in r.getMessage() and "hygiene=True" in r.getMessage()
+        for r in caplog.records
+    )
