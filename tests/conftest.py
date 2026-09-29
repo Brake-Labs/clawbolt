@@ -470,6 +470,19 @@ async def create_test_session(
 
 
 @pytest.fixture(autouse=True)
+def _no_heartbeat_quiet_hours() -> Generator[None]:
+    """Disable overnight quiet hours so heartbeat tests do not depend on the wall clock.
+
+    Tests of the gate itself set the window explicitly.
+    """
+    with (
+        patch.object(settings, "heartbeat_quiet_hours_start", 0),
+        patch.object(settings, "heartbeat_quiet_hours_end", 0),
+    ):
+        yield
+
+
+@pytest.fixture(autouse=True)
 def _reset_bus_queues() -> Generator[None]:
     """Reset bus queues between tests so messages don't leak."""
     message_bus.reset()

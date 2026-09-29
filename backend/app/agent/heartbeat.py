@@ -781,6 +781,23 @@ async def _user_messaged_within(user_id: str, minutes: int) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def in_quiet_hours(tz_name: str, now: datetime.datetime) -> bool:
+    """Whether *now* falls in the user's overnight heartbeat quiet hours.
+
+    Enforced in code rather than left to the heartbeat rules, because the
+    decision model can argue itself past a prompt ("7:30 is within the
+    business day") and text someone at 4 AM.
+    """
+    start = settings.heartbeat_quiet_hours_start
+    end = settings.heartbeat_quiet_hours_end
+    if not tz_name or start == end:
+        return False
+    hour = to_local_time(now, tz_name).hour
+    if start < end:
+        return start <= hour < end
+    return hour >= start or hour < end
+
+
 async def run_heartbeat_for_user(
     user: User,
     channel: str,
@@ -826,6 +843,12 @@ async def run_heartbeat_for_user(
             user.id,
             quiet_minutes,
         )
+        return None
+
+    # Gate: overnight quiet hours. Ahead of the LLM call, so the night costs
+    # nothing and no typing indicator shows on the user's phone either.
+    if in_quiet_hours(user.timezone, datetime.datetime.now(datetime.UTC)):
+        logger.debug("Heartbeat skip user %s: inside quiet hours", user.id)
         return None
 
     # Skip empty and heading-only heartbeat files so they cannot trigger work.
