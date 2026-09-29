@@ -7,7 +7,7 @@ QuickBooks Online stores customers, items, estimates, invoices, bills, and payme
 | Tool | Purpose |
 |------|---------|
 | `qb_query` | Run read-only queries using QBO query language |
-| `qb_create` | Create a Customer, Estimate, Invoice, or Item |
+| `qb_create` | Create a Customer, Estimate, Invoice, or Item, or record a Payment |
 | `qb_update` | Update an existing Customer, Estimate, Invoice, or Item |
 | `qb_send` | Email an invoice or estimate to a customer |
 
@@ -19,6 +19,7 @@ QuickBooks Online stores customers, items, estimates, invoices, bills, and payme
 - Customer: Id, SyncToken, DisplayName, CompanyName, PrimaryEmailAddr, PrimaryPhone, BillAddr, Balance, BalanceWithJobs, Active, Notes, ParentRef, Job
 - Item: Id, Name, FullyQualifiedName, Sku, Description, UnitPrice, Type, Active, IncomeAccountRef, ParentRef, QtyOnHand
 - Payment: Id, CustomerRef, TotalAmt, TxnDate, PaymentMethodRef, PaymentRefNum, UnappliedAmt, Line
+- PaymentMethod: Id, Name, Type, Active
 - Bill: Id, VendorRef, DocNumber, TotalAmt, Balance, DueDate, TxnDate, Line, PrivateNote
 
 `BillEmail`, `BillEmailCc`, `BillEmailBcc` are shaped `{"Address": "..."}` (the recipient email recorded on the invoice or estimate). SyncToken is returned in query results; you need it when updating an entity with `qb_update`.
@@ -52,7 +53,7 @@ query for it directly; do not recite numbers remembered from an earlier turn.
 
 ## Creating Entities (qb_create)
 
-Pass `entity_type` (Customer, Estimate, Invoice, or Item) and `data` (the QBO API payload).
+Pass `entity_type` (Customer, Estimate, Invoice, Item, or Payment) and `data` (the QBO API payload).
 
 ### Customer payload
 
@@ -181,6 +182,30 @@ Memo changed, line 2 to 12 hours, a permit line added, line 3 removed:
   "delete_line_ids": ["3"]
 }
 ```
+
+## Recording a Payment (qb_create)
+
+An invoice has no paid status to set. It is paid when a Payment is linked to it and brings its Balance to 0. Record one when the user says a customer paid ("Tammy paid, check 1234").
+
+1. `qb_query` the customer's open invoices: `SELECT * FROM Invoice WHERE CustomerRef = '<id>' AND Balance > '0'`. If more than one could match the amount, ask which.
+2. For a method the user named (check, cash, Zelle), `qb_query` `SELECT * FROM PaymentMethod` for its Id. Leave `PaymentMethodRef` out if none matches.
+3. `qb_create` Payment. One Line per invoice paid; `TotalAmt` must equal the line amounts. The payment is deposited straight to the bank account: leave `DepositToAccountRef` out and the tool uses the company's bank account. If it has several, the tool lists them; ask the user which, pass `DepositToAccountRef` `{"value": "<Id>"}`, and save the answer to memory.
+
+```json
+{
+  "entity_type": "Payment",
+  "data": {
+    "CustomerRef": {"value": "20"},
+    "TotalAmt": 4824.53,
+    "TxnDate": "2026-09-29",
+    "PaymentMethodRef": {"value": "2", "name": "Check"},
+    "PaymentRefNum": "1234",
+    "Line": [{"Amount": 4824.53, "LinkedTxn": [{"TxnId": "644", "TxnType": "Invoice"}]}]
+  }
+}
+```
+
+The tool refuses a payment for another customer's invoice, more than an invoice's open balance, an invoice already paid, or a `PaymentRefNum` already recorded for the customer. Report the new balance the result gives. A partial payment leaves the invoice open. If the user matches bank deposits in QuickBooks, remind them once to Match the deposit to this payment rather than Add it, or it counts twice.
 
 ## Sending Invoices and Estimates (qb_send)
 

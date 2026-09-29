@@ -371,7 +371,7 @@ async def test_qb_create_rejects_disallowed_entity() -> None:
     tools = create_quickbooks_tools(svc)
     fn = _get_tool(tools, "qb_create")
 
-    result = await fn(entity_type="Payment", data={"TotalAmt": 100})
+    result = await fn(entity_type="Bill", data={"TotalAmt": 100})
 
     assert result.is_error is True
     assert "not allowed" in result.content
