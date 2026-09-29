@@ -38,6 +38,15 @@ class AppliedInvoice:
         return round(self.balance - self.amount, 2)
 
 
+@dataclass(frozen=True)
+class PaymentPlan:
+    """What a checked payment will do: the invoices it pays and where it lands."""
+
+    applied: list[AppliedInvoice]
+    deposit_account_id: str
+    deposit_account_name: str
+
+
 def _ref_value(ref: Any) -> str:
     if isinstance(ref, dict):
         return str(ref.get("value") or "").strip()
@@ -85,16 +94,50 @@ def _invoice_links(data: dict[str, Any]) -> list[tuple[str, float]]:
     return links
 
 
-async def check_payment(
-    qb_service: QuickBooksService, data: dict[str, Any]
-) -> list[AppliedInvoice]:
+async def _deposit_account(qb_service: QuickBooksService, data: dict[str, Any]) -> tuple[str, str]:
+    """The bank account the payment is deposited to, as ``(Id, Name)``.
+
+    Payments go straight to a bank account rather than Undeposited Funds,
+    which only makes sense for someone who batches deposits or matches a
+    bank feed. A named account must be an active bank account. With none
+    named, the company's only bank account is used; with several, the user
+    has to say which. Account balances never reach the model: only names
+    and Ids are returned, and ``Account`` stays out of ``qb_query``.
+    """
+    wanted = _ref_value(data.get("DepositToAccountRef"))
+    if wanted:
+        if not wanted.isdigit():
+            raise PaymentRejected('DepositToAccountRef must be {"value": "<numeric account Id>"}.')
+        account = await qb_service.read_entity("Account", wanted)
+        if account.get("AccountType") != "Bank" or account.get("Active") is False:
+            raise PaymentRejected(f"Account {wanted} is not an active bank account.")
+        return wanted, str(account.get("Name") or wanted)
+    banks = await qb_service.query(
+        "SELECT * FROM Account WHERE AccountType = 'Bank' AND Active = true MAXRESULTS 20"
+    )
+    if len(banks) == 1:
+        return str(banks[0].get("Id")), str(banks[0].get("Name") or "")
+    if not banks:
+        raise PaymentRejected(
+            "QuickBooks has no active bank account to deposit the payment into. "
+            "Tell the user; one has to be set up in QuickBooks first."
+        )
+    options = "; ".join(f"Id {b.get('Id')}: {b.get('Name')}" for b in banks)
+    raise PaymentRejected(
+        f"QuickBooks has several bank accounts ({options}). Ask the user which one "
+        'this payment went into, then pass DepositToAccountRef {"value": "<Id>"}.'
+    )
+
+
+async def check_payment(qb_service: QuickBooksService, data: dict[str, Any]) -> PaymentPlan:
     """Validate a Payment payload against the invoices it pays.
 
-    Returns each invoice with its balance before and after, for the approval
-    prompt and the result. Raises ``PaymentRejected`` when the payment names
-    no customer, does not add up, pays an invoice of another customer, pays
-    more than an invoice's open balance, or reuses a reference number
-    already recorded for this customer.
+    Returns each invoice with its balance before and after, and the bank
+    account the payment lands in, for the approval prompt and the write.
+    Raises ``PaymentRejected`` when the payment names no customer, does not
+    add up, pays an invoice of another customer, pays more than an
+    invoice's open balance, has no bank account to land in, or reuses a
+    reference number already recorded for this customer.
     """
     customer_id = _ref_value(data.get("CustomerRef"))
     if not customer_id.isdigit():
@@ -155,15 +198,19 @@ async def check_payment(
                     f"recorded for this customer (${float(payment.get('TotalAmt') or 0):,.2f} "
                     f"on {payment.get('TxnDate')}). Recording it again counts the money twice."
                 )
-    return applied
+    account_id, account_name = await _deposit_account(qb_service, data)
+    return PaymentPlan(
+        applied=applied, deposit_account_id=account_id, deposit_account_name=account_name
+    )
 
 
-def describe_payment(data: dict[str, Any], applied: list[AppliedInvoice] | None) -> str:
-    """Approval text: who paid, how, and what each invoice's balance becomes.
+def describe_payment(data: dict[str, Any], plan: PaymentPlan | None) -> str:
+    """Approval text: who paid, how, where it lands, and each invoice's new balance.
 
-    Without *applied* (the invoices could not be read), lists the invoices by
-    the Ids the request names and states no balances.
+    Without *plan* (the check could not run), lists the invoices by the Ids
+    the request names and states no balances.
     """
+    applied = plan.applied if plan else None
     try:
         total = f" for ${float(data.get('TotalAmt') or 0):,.2f}"
     except (TypeError, ValueError):
@@ -188,6 +235,8 @@ def describe_payment(data: dict[str, Any], applied: list[AppliedInvoice] | None)
         how.append(f"ref {data['PaymentRefNum']}")
     if how:
         rows.append("  " + ", ".join(how))
+    if plan:
+        rows.append(f"  Deposit to: {plan.deposit_account_name}")
     if applied:
         for invoice in applied:
             status = "paid in full" if invoice.balance_after <= 0 else "partly paid"

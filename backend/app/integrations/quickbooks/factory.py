@@ -897,7 +897,7 @@ def create_quickbooks_tools(
         applied: list[AppliedInvoice] = []
         if entity_type == "Payment":
             try:
-                applied = await check_payment(qb_service, data)
+                plan = await check_payment(qb_service, data)
             except PaymentRejected as exc:
                 return ToolResult(
                     content=f"Did not record the payment: {exc}",
@@ -913,6 +913,14 @@ def create_quickbooks_tools(
                     is_error=True,
                     error_kind=_fault_error_kind(exc),
                 )
+            applied = plan.applied
+            data = {
+                **data,
+                "DepositToAccountRef": {
+                    "value": plan.deposit_account_id,
+                    "name": plan.deposit_account_name,
+                },
+            }
 
         lines = data.get("Line")
         if isinstance(lines, list):
@@ -1075,11 +1083,11 @@ def create_quickbooks_tools(
         if args.get("entity_type") != "Payment" or not isinstance(data, dict):
             return None
         try:
-            applied = await check_payment(qb_service, data)
+            plan = await check_payment(qb_service, data)
         except Exception:
             logger.info("qb_create payment preview unavailable", exc_info=True)
             return None
-        return describe_payment(data, applied)
+        return describe_payment(data, plan)
 
     async def preview_qb_update(args: dict[str, Any]) -> str | None:
         """Approval text for qb_update against the stored record.

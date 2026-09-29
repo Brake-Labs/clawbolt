@@ -189,7 +189,7 @@ An invoice has no paid status to set. It is paid when a Payment is linked to it 
 
 1. `qb_query` the customer's open invoices: `SELECT * FROM Invoice WHERE CustomerRef = '<id>' AND Balance > '0'`. If more than one could match the amount, ask which.
 2. For a method the user named (check, cash, Zelle), `qb_query` `SELECT * FROM PaymentMethod` for its Id. Leave `PaymentMethodRef` out if none matches.
-3. `qb_create` Payment. One Line per invoice paid; `TotalAmt` must equal the line amounts. Leave `DepositToAccountRef` out: QuickBooks puts the payment in Undeposited Funds.
+3. `qb_create` Payment. One Line per invoice paid; `TotalAmt` must equal the line amounts. The payment is deposited straight to the bank account: leave `DepositToAccountRef` out and the tool uses the company's bank account. If it has several, the tool lists them; ask the user which, pass `DepositToAccountRef` `{"value": "<Id>"}`, and save the answer to memory.
 
 ```json
 {

@@ -21,7 +21,18 @@ class PaymentsFakeQB(FakeQBService):
     def __init__(self) -> None:
         super().__init__()
         self.payments: list[dict[str, Any]] = []
+        self.banks: list[dict[str, Any]] = [{"Id": "35", "Name": "Business Checking"}]
         self.queries: list[str] = []
+        self.records[("Account", "35")] = {
+            "Id": "35",
+            "Name": "Business Checking",
+            "AccountType": "Bank",
+        }
+        self.records[("Account", "4")] = {
+            "Id": "4",
+            "Name": "Undeposited Funds",
+            "AccountType": "Other Current Asset",
+        }
         self.records[("Invoice", "644")] = {
             "Id": "644",
             "DocNumber": "1044",
@@ -46,7 +57,7 @@ class PaymentsFakeQB(FakeQBService):
 
     async def query(self, query_str: str) -> list[dict[str, Any]]:
         self.queries.append(query_str)
-        return self.payments
+        return self.banks if "FROM Account" in query_str else self.payments
 
 
 def _tool(svc: FakeQBService, name: str = "qb_create") -> Any:
@@ -75,7 +86,8 @@ async def test_records_a_payment_that_pays_the_invoice_in_full() -> None:
 
     assert result.is_error is False
     assert "Invoice 1044 balance: $0.00" in result.content
-    assert svc.created == [("Payment", _payment())]
+    deposit = {"DepositToAccountRef": {"value": "35", "name": "Business Checking"}}
+    assert svc.created == [("Payment", {**_payment(), **deposit})]
     assert result.receipt is not None
     assert result.receipt.action == "Recorded QuickBooks payment from"
 
@@ -128,9 +140,9 @@ async def test_refuses_a_reference_number_already_recorded_for_the_customer() ->
     assert result.is_error is True
     assert "Payment 88 with reference 1234 is already recorded" in result.content
     assert svc.created == []
-    assert svc.queries == [
+    assert svc.queries[0] == (
         "SELECT * FROM Payment WHERE CustomerRef = '20' ORDERBY TxnDate DESC MAXRESULTS 100"
-    ]
+    )
 
 
 async def test_approval_preview_shows_each_invoice_balance_before_and_after() -> None:
@@ -143,6 +155,7 @@ async def test_approval_preview_shows_each_invoice_balance_before_and_after() ->
         "Record payment in QuickBooks for $4,824.53\n"
         "  From: Test Customer\n"
         "  received 2026-09-29, Check, ref 1234\n"
+        "  Deposit to: Business Checking\n"
         "  Invoice 1044: $4,824.53 applied, balance $4,824.53 -> $0.00 (paid in full)"
     )
 
@@ -171,3 +184,43 @@ async def test_payment_methods_are_queryable() -> None:
     svc = PaymentsFakeQB()
     result = await _tool(svc, "qb_query").function(query="SELECT * FROM PaymentMethod")
     assert result.is_error is False
+
+
+async def test_several_bank_accounts_means_asking_which() -> None:
+    svc = PaymentsFakeQB()
+    svc.banks = [{"Id": "35", "Name": "Business Checking"}, {"Id": "36", "Name": "Savings"}]
+    result = await _tool(svc).function(entity_type="Payment", data=_payment())
+
+    assert result.is_error is True
+    assert "Id 35: Business Checking; Id 36: Savings" in result.content
+    assert svc.created == []
+
+
+async def test_a_named_bank_account_is_used() -> None:
+    svc = PaymentsFakeQB()
+    svc.banks = [{"Id": "35", "Name": "Business Checking"}, {"Id": "36", "Name": "Savings"}]
+    data = {**_payment(), "DepositToAccountRef": {"value": "35"}}
+    result = await _tool(svc).function(entity_type="Payment", data=data)
+
+    assert result.is_error is False
+    assert svc.created[0][1]["DepositToAccountRef"] == {"value": "35", "name": "Business Checking"}
+
+
+async def test_refuses_to_deposit_anywhere_but_a_bank_account() -> None:
+    svc = PaymentsFakeQB()
+    data = {**_payment(), "DepositToAccountRef": {"value": "4"}}
+    result = await _tool(svc).function(entity_type="Payment", data=data)
+
+    assert result.is_error is True
+    assert "not an active bank account" in result.content
+    assert svc.created == []
+
+
+async def test_no_bank_account_means_nothing_is_recorded() -> None:
+    svc = PaymentsFakeQB()
+    svc.banks = []
+    result = await _tool(svc).function(entity_type="Payment", data=_payment())
+
+    assert result.is_error is True
+    assert "no active bank account" in result.content
+    assert svc.created == []
