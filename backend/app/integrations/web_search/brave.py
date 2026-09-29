@@ -52,7 +52,8 @@ _BACKOFF_BASE_SECONDS = 0.5
 # URLs, the site's display name and breadcrumb, schema type tags, boolean
 # display flags) and carry no fact the agent can quote. The rest is product
 # metadata no trade answer turns on: barcodes, a currency that is the
-# searcher's own, and star ratings. A denylist on purpose: an allowlist is what
+# searcher's own, and a rating's scale and review count (the score itself,
+# ``ratingValue``, stays for comparing products). A denylist on purpose: an allowlist is what
 # once dropped ``product.price``, and a field Brave adds later must still pass
 # through. Title, url, description, names, prices, offers, snippets, FAQ
 # answers and ages are never named here.
@@ -78,7 +79,9 @@ _DROPPED_KEYS = frozenset(
         "gtin13",
         "gtin14",
         "priceCurrency",
-        "rating",
+        "bestRating",
+        "worstRating",
+        "reviewCount",
     }
 )
 

@@ -274,12 +274,14 @@ class TestSlimming:
         assert trimmed["product"] == {
             "name": "4.5 Gal. Lightweight Joint Compound",
             "price": "24.98",
+            "rating": {"ratingValue": 4.7},
         }
 
     def test_drops_filler_fields(self) -> None:
         out = render_records([self._trimmed()])
-        for gone in ("gtin13", "priceCurrency", "rating", "reviewCount", "page_age", "offers"):
+        for gone in ("gtin13", "priceCurrency", "bestRating", "reviewCount", "page_age", "offers"):
             assert gone not in out, gone
+        assert "rating.ratingValue: 4.7" in out
         assert out.count("https://store.example.com/p/") == 1
 
     def test_keeps_one_new_snippet_and_skips_repeats_and_the_menu(self) -> None:
