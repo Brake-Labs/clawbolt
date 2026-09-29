@@ -308,6 +308,10 @@ class Settings(BaseSettings):
     # lets it compose new messages or thread replies on the user's behalf.
     gmail_client_id: str = ""
     gmail_client_secret: str = ""
+    # Cap on the body ``gmail_get_message`` returns after quoted replies,
+    # signature, and footer are trimmed. The result stays in the session
+    # history, so every later LLM call pays for it again.
+    gmail_body_max_chars: int = Field(default=6000, ge=500)
 
     # CompanyCam OAuth 2.0
     companycam_client_id: str = ""
