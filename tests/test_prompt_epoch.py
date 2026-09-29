@@ -21,6 +21,7 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from any_llm import ContextLengthExceededError
 from pydantic import BaseModel
 from sqlalchemy import select
 
@@ -29,7 +30,7 @@ from backend.app.agent.context import (
     _stored_messages_to_agent_messages,
     load_conversation_history,
 )
-from backend.app.agent.core import ClawboltAgent
+from backend.app.agent.core import AssembledPrompt, ClawboltAgent
 from backend.app.agent.dto import StoredMessage
 from backend.app.agent.memory_db import write_memory
 from backend.app.agent.messages import (
@@ -744,9 +745,7 @@ def test_a_change_larger_than_the_file_sends_the_file() -> None:
     old = WorkspaceSnapshot(soul="s", user="u", memory="- one")
     new = WorkspaceSnapshot(soul="s", user="u", memory="- two")
     updates = render_workspace_updates(old, new)
-    assert (
-        updates == 'MEMORY.md changed after "Your Memory" above was captured. It now reads:\n- two'
-    )
+    assert updates == "MEMORY.md changed since it was last shown above. It now reads:\n- two"
     assert render_workspace_updates(old, old) == ""
 
 
@@ -832,6 +831,328 @@ async def test_both_settings_off_keep_the_old_layout(
     assert "## Tool Guidelines" in current_turn
     assert "A fact" not in system
     assert "Tool Guidelines" not in system
+
+
+# -- a workspace update is delivered once -------------------------------------
+
+# A MEMORY.md a compaction has just rewritten: every line changed, so the
+# update is the whole file rather than a diff.
+_COMPACTED = "\n".join(
+    f"- Compacted fact {i}: the job at site {i} is scheduled" for i in range(400)
+)
+
+
+def _reply(t: _Rows, minute: float, text: str = "ok") -> None:
+    t.rows.append(
+        StoredMessage(
+            direction="outbound",
+            body=text,
+            llm_reply_text=text,
+            timestamp=_at(minute),
+            seq=len(t.rows) + 1,
+        )
+    )
+
+
+class _Session:
+    """Assembles one turn after another over a growing transcript."""
+
+    def __init__(self, user: User) -> None:
+        self.user = user
+        self.t = _Rows()
+
+    async def turn(self, minute: float, ask: str) -> AssembledPrompt:
+        current = self.t.ask(minute, ask)
+        view = build_history_view(self.t.rows[:-1], current, "", compact=False, tools_by_name={})
+        agent = ClawboltAgent(user=self.user)
+        agent.register_tools(_tools())
+        assembled = await agent.assemble_prompt(
+            ask, view.messages, epoch=view.epoch, deterministic_trim=True
+        )
+        _reply(self.t, minute + 1)
+        return assembled
+
+
+def _current(assembled: AssembledPrompt) -> str:
+    last = assembled.messages[-1]
+    assert isinstance(last, UserMessage)
+    return last.content
+
+
+def _prior(assembled: AssembledPrompt) -> list[dict[str, Any]]:
+    """Everything before the current turn: the part the cache can hold."""
+    return _api(assembled.messages[:-1])
+
+
+async def test_a_workspace_update_is_sent_once_then_read_from_the_cache(
+    test_user: User, one_hour_cache: None
+) -> None:
+    await write_memory(test_user.id, "- Customer prefers mornings")
+    s = _Session(test_user)
+    cold = await s.turn(0, "hi")
+    assert "Workspace Updates" not in _current(cold)
+
+    await write_memory(test_user.id, _COMPACTED)
+    first = await s.turn(5, "what is on today?")
+    assert "## Workspace Updates\nMEMORY.md changed" in _current(first)
+    assert _COMPACTED in _current(first)
+
+    second = await s.turn(10, "and tomorrow?")
+    third = await s.turn(15, "thanks")
+    for later in (second, third):
+        assert "Workspace Updates" not in _current(later)
+        assert _COMPACTED not in _current(later)
+        assert later.stable_system == cold.stable_system
+    # The model still has the file: on the turn it was delivered, in history.
+    delivered = [
+        m for m in second.messages if isinstance(m, UserMessage) and _COMPACTED in m.content
+    ]
+    assert len(delivered) == 1
+    assert "what is on today?\n\n## Workspace Updates\nMEMORY.md changed" in delivered[0].content
+    # The prefix only grows by appending, so the next turn reads it from cache.
+    assert _prior(third)[: len(_prior(second))] == _prior(second)
+
+
+async def test_a_second_change_is_a_diff_against_the_first(
+    test_user: User, one_hour_cache: None
+) -> None:
+    await write_memory(test_user.id, "- Customer prefers mornings")
+    s = _Session(test_user)
+    await s.turn(0, "hi")
+    await write_memory(test_user.id, _COMPACTED)
+    await s.turn(5, "what is on today?")
+    before = await s.turn(10, "ok")
+
+    await write_memory(test_user.id, _COMPACTED + "\n- Gate code is 4321")
+    changed = await s.turn(15, "remember the gate code")
+    update = _current(changed)
+    assert "MEMORY.md changed since it was last shown above. Apply this diff" in update
+    assert "+- Gate code is 4321" in update
+    assert "It now reads" not in update
+    assert len(update) < 1_000
+
+    after = await s.turn(20, "thanks")
+    assert "Workspace Updates" not in _current(after)
+    assert _prior(changed)[: len(_prior(before))] == _prior(before)
+    assert _prior(after)[: len(_prior(changed))] == _prior(changed)
+    carried = [m.content for m in after.messages[:-1] if isinstance(m, UserMessage)]
+    assert sum(_COMPACTED in c for c in carried) == 1
+    assert sum("+- Gate code is 4321" in c for c in carried) == 1
+
+
+async def test_the_next_cold_start_drops_the_delivered_updates(
+    test_user: User, one_hour_cache: None
+) -> None:
+    await write_memory(test_user.id, "- Customer prefers mornings")
+    s = _Session(test_user)
+    await s.turn(0, "hi")
+    await write_memory(test_user.id, _COMPACTED)
+    await s.turn(5, "what is on today?")
+    await s.turn(10, "ok")
+
+    cold = await s.turn(500, "back again")
+    assert f"## Your Memory\n{_COMPACTED}" in cold.stable_system
+    assert not any(
+        "Workspace Updates" in m.content for m in cold.messages if isinstance(m, UserMessage)
+    )
+    warm = await s.turn(505, "and now?")
+    assert warm.stable_system == cold.stable_system
+    assert _prior(warm)[: len(_prior(cold))] == _prior(cold)
+
+
+async def test_an_update_whose_turn_left_the_history_is_sent_again(
+    test_user: User, one_hour_cache: None
+) -> None:
+    """A trim that drops the delivering turn must not leave the model without the file."""
+    await write_memory(test_user.id, "- Customer prefers mornings")
+    s = _Session(test_user)
+    await s.turn(0, "hi")
+    await write_memory(test_user.id, _COMPACTED)
+    first = await s.turn(5, "what is on today?")
+    assert _COMPACTED in _current(first)
+
+    # The trim watermark moved past the delivering turn: the next load starts after it.
+    s.t.rows = s.t.rows[4:]
+    again = await s.turn(10, "and tomorrow?")
+    assert _COMPACTED in _current(again)
+    assert "Customer prefers mornings" in again.stable_system
+
+
+async def test_a_trim_in_the_same_turn_resends_the_update(
+    test_user: User, one_hour_cache: None
+) -> None:
+    await write_memory(test_user.id, "- Customer prefers mornings")
+    s = _Session(test_user)
+    await s.turn(0, "hi")
+    await write_memory(test_user.id, _COMPACTED)
+    await s.turn(5, "what is on today?")
+    for i in range(6):
+        await s.turn(10 + i * 5, f"filler {i}")
+    with (
+        patch.object(settings, "context_trim_target_tokens", 3_000),
+        patch.object(settings, "context_trim_trigger_tokens", 6_000),
+    ):
+        trimmed = await s.turn(60, "and now?")
+    assert trimmed.trimmed_count > 0
+    history = [m.content for m in trimmed.messages[1:-1] if isinstance(m, UserMessage)]
+    assert not any(_COMPACTED in c for c in history)
+    current = _current(trimmed)
+    assert current.startswith("[Summary of earlier conversation:")
+    assert f"MEMORY.md changed since it was last shown above. It now reads:\n{_COMPACTED}" in (
+        current
+    )
+    assert _COMPACTED in trimmed.dynamic_context
+    # The trim ran on the rows as stored: the delivering turn went to
+    # compaction without the update the view had appended to it.
+    dropped = [m.content for m in trimmed.dropped if isinstance(m, UserMessage)]
+    assert "what is on today?" in dropped
+    assert not any("Workspace Updates" in c for c in dropped)
+
+
+def _user_texts(messages: list[dict[str, Any]]) -> list[str]:
+    """The text of every user message sent, current turn included."""
+    texts = []
+    for msg in messages:
+        if msg["role"] != "user":
+            continue
+        content = msg["content"]
+        if isinstance(content, str):
+            texts.append(content)
+        else:
+            texts.extend(b["text"] for b in content if b.get("type") == "text")
+    return texts
+
+
+async def _delivered_then_grown(user: User, write_result: str) -> _Rows:
+    """A memory change delivered on a small turn, then eight big turns and an ask.
+
+    Returns the rows, all persisted, with the ask unanswered. The delivering
+    turn is the ask ``"what is on today?"`` (seq 5).
+    """
+    await write_memory(user.id, "- Customer prefers mornings")
+    t = _Rows()
+    t.turn(0, "hi", "hello")
+    t.ask(2, "first")
+    await create_test_session(user.id, messages=t.rows)
+    await _live_turn(user)
+
+    await write_memory(user.id, _COMPACTED)
+    reply = StoredMessage(direction="outbound", body="Done.", timestamp=_at(3), seq=4)
+    t.rows.append(reply)
+    ask = t.ask(4, "what is on today?")
+    await _append_rows(user.id, [reply, ask])
+    delivering = _user_texts(await _live_turn(user))[-1]
+    assert f"It now reads:\n{_COMPACTED}" in delivering
+
+    grown = _read_and_write_turns(write_result).rows[:-1]
+    reply = StoredMessage(direction="outbound", body="Done.", timestamp=_at(5), seq=6)
+    t.rows.append(reply)
+    base = len(t.rows)
+    for row in grown:
+        t.rows.append(
+            row.model_copy(
+                update={
+                    "seq": row.seq + base,
+                    "timestamp": _at(6 + row.seq),
+                }
+            )
+        )
+    t.ask(6 + len(grown) + 1, "what now?")
+    await _append_rows(user.id, t.rows[base - 1 :])
+    return t
+
+
+async def test_a_shed_keeps_a_delivered_update_and_the_next_turn_matches(
+    test_user: User, trim_settings: AsyncMock
+) -> None:
+    """The shed re-renders the history from the rows; the update delivered on
+    an earlier turn is laid onto the row it rode after that, so the model
+    still has it, the current turn does not repeat it, and the next turn
+    sends the shed turn's history byte for byte."""
+    t = await _delivered_then_grown(test_user, WRITE_RESULT)
+
+    first = await _live_turn(test_user)
+
+    state, _ = await get_session_store(test_user.id).get_or_create_session()
+    assert state.history_stub_seq is not None
+    assert state.last_trim_seq is None
+    stub = elided_result_stub("web_search", len(HUGE))
+    assert stub in _results_by_id(first).values()
+    texts = _user_texts(first)
+    assert sum(_COMPACTED in c for c in texts) == 1
+    carried = next(c for c in texts if _COMPACTED in c)
+    assert "what is on today?\n\n## Workspace Updates\nMEMORY.md changed" in carried
+    assert "Workspace Updates" not in texts[-1]
+
+    await _next_turn(test_user, t, 60)
+    second = await _live_turn(test_user)
+
+    assert second[: len(first) - 1] == first[:-1]
+    assert "Workspace Updates" not in _user_texts(second)[-1]
+
+
+async def test_a_shed_that_drops_the_delivering_turn_sends_the_update_again(
+    test_user: User, trim_settings: AsyncMock
+) -> None:
+    """Writes alone over target: the shed drops the oldest turns, the
+    delivering one among them. The current turn carries the change again,
+    and compaction reads the dropped turn as stored."""
+    await _delivered_then_grown(test_user, HUGE_WRITE)
+    trim_settings.reset_mock()
+
+    sent = await _live_turn(test_user)
+
+    state, _ = await get_session_store(test_user.id).get_or_create_session()
+    assert state.last_trim_seq is not None and state.last_trim_seq >= 5
+    texts = _user_texts(sent)
+    assert not any(_COMPACTED in c for c in texts[:-1])
+    assert f"It now reads:\n{_COMPACTED}" in texts[-1]
+    assert trim_settings.await_args is not None
+    compacted = [m.content for m in trim_settings.await_args.args[1] if isinstance(m, UserMessage)]
+    assert "what is on today?" in compacted
+    assert not any("Workspace Updates" in c for c in compacted)
+
+
+async def test_the_overflow_retry_resends_an_update_it_trims_away(
+    test_user: User, one_hour_cache: None
+) -> None:
+    """The provider refuses the prompt and the retry's trim drops the turn
+    that carried the update. The retry sends the change on the current turn,
+    and the dropped turn reaches compaction as stored."""
+    await write_memory(test_user.id, "- Customer prefers mornings")
+    s = _Session(test_user)
+    await s.turn(0, "hi")
+    await write_memory(test_user.id, _COMPACTED)
+    await s.turn(5, "what is on today?")
+    for i in range(3):
+        await s.turn(10 + i * 5, f"filler {i}")
+
+    current = s.t.ask(30, "and now?")
+    view = build_history_view(s.t.rows[:-1], current, "", compact=False, tools_by_name={})
+    agent = ClawboltAgent(user=test_user)
+    agent.register_tools(_tools())
+    with (
+        patch(
+            "backend.app.agent.core.amessages_streamed",
+            new_callable=AsyncMock,
+            side_effect=[ContextLengthExceededError("Input too long"), make_text_response("ok")],
+        ) as llm,
+        patch(
+            "backend.app.agent.core.trigger_compaction_for_dropped", new_callable=AsyncMock
+        ) as compact,
+    ):
+        await agent.process_message("and now?", view.messages, prompt_epoch=view.epoch)
+
+    refused, retried = (_user_texts(c.kwargs["messages"]) for c in llm.call_args_list)
+    assert sum(_COMPACTED in c for c in refused) == 1
+    assert "Workspace Updates" not in refused[-1]
+    assert not any(_COMPACTED in c for c in retried[:-1])
+    assert f"It now reads:\n{_COMPACTED}" in retried[-1]
+    assert retried[-1].startswith("[Summary of earlier conversation:")
+    assert compact.await_args is not None
+    dropped = [m.content for m in compact.await_args.args[1] if isinstance(m, UserMessage)]
+    assert "what is on today?" in dropped
+    assert not any("Workspace Updates" in c for c in dropped)
 
 
 # -- the comparison harness ---------------------------------------------------

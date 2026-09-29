@@ -4,7 +4,7 @@ import logging
 import random
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -77,7 +77,7 @@ from backend.app.agent.observer import (
 from backend.app.agent.prompt_epoch import (
     HistoryShedder,
     PromptEpoch,
-    remember_workspace_snapshot,
+    WorkspaceTurn,
 )
 from backend.app.agent.skills.loader import (
     extract_delivered_skills,
@@ -85,6 +85,7 @@ from backend.app.agent.skills.loader import (
     skill_guidance_block,
 )
 from backend.app.agent.system_prompt import (
+    append_workspace_updates,
     build_agent_system_prompt_parts,
     build_time_user_context,
     capture_workspace,
@@ -213,6 +214,103 @@ class AssembledPrompt:
     trimmed_count: int = 0
 
 
+class _WorkspaceLayout:
+    """Where one turn lays out the workspace updates, once its history is decided.
+
+    The trim (``ClawboltAgent._trim_history``) runs on the history as the
+    renderer produced it, because a shed re-renders it from the stored rows
+    and the next turn must render the same bytes. Only after it does
+    :meth:`apply` hand the surviving history to the :class:`WorkspaceTurn`,
+    which appends each earlier update to its row and says what the current
+    turn carries: the new change, plus any earlier one whose row did not
+    survive. The overflow retry trims again, so it strips what was laid out
+    (:meth:`strip`), trims the stored messages, and lays out afresh
+    (:meth:`reapply`). No trim hands compaction a message with an update
+    appended.
+    """
+
+    def __init__(self, turn: WorkspaceTurn, dynamic: str, body: Callable[[str], str]) -> None:
+        self._turn = turn
+        # The dynamic half without the updates, and the current turn's text
+        # for a given dynamic half.
+        self._dynamic = dynamic
+        self._body = body
+        # The current turn as the next trim is given it, and its text before
+        # any summary note the trim puts ahead of it.
+        self._anchor: UserMessage | None = None
+        self._anchor_body = ""
+        # Each message :meth:`apply` sent with an update, and the same
+        # message without it.
+        self._sent: list[tuple[AgentMessage, AgentMessage]] = []
+
+    def current_turn(self, history: list[AgentMessage]) -> UserMessage:
+        """The current turn the trim measures, with the update it would carry."""
+        dynamic = append_workspace_updates(self._dynamic, self._turn.preview(history))
+        self._anchor_body = self._body(dynamic)
+        self._anchor = UserMessage(content=self._anchor_body)
+        return self._anchor
+
+    def apply(self, messages: list[AgentMessage]) -> tuple[list[AgentMessage], str]:
+        """Lay the updates onto the trimmed *messages*; return them and the dynamic half."""
+        laid, dynamic, sent, plain = self._lay(messages)
+        self._sent = sent
+        if plain is not None:
+            self._anchor, self._anchor_body = plain, self._body(self._dynamic)
+        return laid, dynamic
+
+    def strip(self, messages: list[AgentMessage]) -> list[AgentMessage]:
+        """*messages* with what :meth:`apply` laid out taken off again."""
+        return [next((p for s, p in self._sent if s is m), m) for m in messages]
+
+    def reapply(self, messages: list[AgentMessage]) -> list[AgentMessage]:
+        """Lay the updates onto *messages*, stripped and trimmed again."""
+        return self._lay(messages)[0]
+
+    def _lay(
+        self, messages: list[AgentMessage]
+    ) -> tuple[
+        list[AgentMessage], str, list[tuple[AgentMessage, AgentMessage]], UserMessage | None
+    ]:
+        index = self._find_current(messages)
+        if index is None:
+            # The trim kept no current turn to carry the update. The rows
+            # still get theirs.
+            view = self._turn.apply(messages[1:])
+            laid = [messages[0], *view.history]
+            return laid, self._dynamic, self._pairs(view.history, messages[1:]), None
+        current = messages[index]
+        assert isinstance(current, UserMessage)
+        # A trim may have put its summary note ahead of the current turn.
+        note = current.content[: len(current.content) - len(self._anchor_body)]
+        view = self._turn.apply(messages[1:index])
+        dynamic = append_workspace_updates(self._dynamic, view.updates)
+        sent = replace(current, content=note + self._body(dynamic))
+        plain = replace(current, content=note + self._body(self._dynamic))
+        laid = [messages[0], *view.history, sent, *messages[index + 1 :]]
+        pairs = [*self._pairs(view.history, messages[1:index]), (sent, plain)]
+        return laid, dynamic, pairs, plain
+
+    def _find_current(self, messages: list[AgentMessage]) -> int | None:
+        for index in range(len(messages) - 1, 0, -1):
+            if messages[index] is self._anchor:
+                return index
+        for index in range(len(messages) - 1, 0, -1):
+            m = messages[index]
+            if (
+                isinstance(m, UserMessage)
+                and m.seq is None
+                and m.content.endswith(self._anchor_body)
+            ):
+                return index
+        return None
+
+    @staticmethod
+    def _pairs(
+        laid: list[AgentMessage], stored: list[AgentMessage]
+    ) -> list[tuple[AgentMessage, AgentMessage]]:
+        return [(v, m) for v, m in zip(laid, stored, strict=True) if v is not m]
+
+
 class ClawboltAgent:
     """Main agent that processes user messages and produces actions."""
 
@@ -259,6 +357,8 @@ class ClawboltAgent:
         # JSON schemas every turn.
         self._cached_tool_schemas: list[dict[str, Any]] | None = None
         self._reactive_trim_dropped: list[AgentMessage] = []
+        # How the turn laid out its workspace updates, for the overflow retry.
+        self._workspace_layout: _WorkspaceLayout | None = None
         # Remembers ASK decisions within a single agent run so the user is not
         # re-prompted for the same (tool, resource) if the LLM retries or
         # chains calls. ALWAYS_ALLOW is persisted to PERMISSIONS.json and does
@@ -466,27 +566,31 @@ class ClawboltAgent:
 
     async def _build_system_prompt(
         self, message_context: str, epoch: PromptEpoch | None = None
-    ) -> tuple[str, str]:
-        """Build the system prompt as ``(stable, dynamic)`` halves.
+    ) -> tuple[str, str, WorkspaceTurn | None]:
+        """Build the system prompt as ``(stable, dynamic)`` halves, and the workspace turn.
 
         *stable* goes in the cacheable ``system`` param; *dynamic* is appended
         to the current user turn so it does not invalidate the history cache
         (#1420). Under ``prompt_stable_prefix_enabled``, a turn that knows its
         cache *epoch* renders the workspace snapshot taken when the epoch
-        opened (see ``prompt_epoch``); one that does not, such as a heartbeat
-        or a replay, renders the workspace as it stands.
+        opened, and gets the :class:`WorkspaceTurn` that lays out the updates
+        since, once the trim has decided the history; *dynamic* leaves them
+        out. One that does not, such as a heartbeat or a replay, renders the
+        workspace as it stands and gets None.
         """
         live = await capture_workspace(self.user)
-        snapshot = None
+        workspace = None
         if settings.prompt_stable_prefix_enabled and epoch is not None:
-            snapshot = remember_workspace_snapshot(self.user.id, epoch, live)
-        return await build_agent_system_prompt_parts(
+            workspace = WorkspaceTurn(self.user.id, epoch, live)
+        stable, dynamic = await build_agent_system_prompt_parts(
             self.user,
             self.tools,
             message_context,
             live=live,
-            snapshot=snapshot,
+            snapshot=workspace.snapshot if workspace is not None else None,
+            workspace_updates=workspace is None,
         )
+        return stable, dynamic, workspace
 
     async def _emit_response(
         self,
@@ -735,17 +839,24 @@ class ClawboltAgent:
         propagates, because a loop here would re-trim toward an empty prompt while
         the user waits.
         """
+        # The trim runs on the messages as stored, so what it drops reaches
+        # compaction without workspace updates appended, and the updates are
+        # laid out again on what it keeps (see ``_WorkspaceLayout``).
+        layout = self._workspace_layout
         trim_result = trim_messages(
-            messages,
+            layout.strip(messages) if layout is not None else messages,
             input_tokens=self._last_input_tokens or MAX_INPUT_TOKENS,
         )
         self._reactive_trim_dropped.extend(trim_result.dropped)
+        retry_messages = (
+            layout.reapply(trim_result.messages) if layout is not None else trim_result.messages
+        )
         logger.warning(
             "Context length exceeded, trimmed from %d to %d messages and retrying",
             len(messages),
-            len(trim_result.messages),
+            len(retry_messages),
         )
-        retry_system_str, trimmed_dicts = messages_to_messages_api(trim_result.messages)
+        retry_system_str, trimmed_dicts = messages_to_messages_api(retry_messages)
         target = await self._resolve_target()
         trimmed_dicts = apply_history_cache_breakpoint(trimmed_dicts, target)
         trimmed_dicts = apply_in_turn_cache_breakpoint(trimmed_dicts, target)
@@ -769,7 +880,7 @@ class ClawboltAgent:
                 system=system,
                 messages=trimmed_dicts,
                 tools=tool_schemas,
-                min_message_seq_in_prompt=compute_min_message_seq(trim_result.messages),
+                min_message_seq_in_prompt=compute_min_message_seq(retry_messages),
                 started_at=followup_started_at,
             )
         )
@@ -1428,31 +1539,42 @@ class ClawboltAgent:
         # is appended to the current user turn rather than the system param
         # so a memory write does not invalidate the message-history cache
         # (#1420). An override (e.g. onboarding) is treated as fully stable.
+        workspace: WorkspaceTurn | None = None
         if system_prompt_override is not None:
             stable_system, dynamic_context = system_prompt_override, ""
         else:
-            stable_system, dynamic_context = await self._build_system_prompt(message_context, epoch)
-        # The full assembled prompt for observers / debugging. The dynamic
-        # half physically ships on the user turn now, but this field still
-        # reflects everything the model was given as instruction context.
-        system_prompt = (
-            f"{stable_system}\n\n{dynamic_context}" if dynamic_context else stable_system
-        )
-
-        messages: list[AgentMessage] = [SystemMessage(content=stable_system)]
-
-        if conversation_history:
-            messages.extend(conversation_history)
-
+            stable_system, dynamic_context, workspace = await self._build_system_prompt(
+                message_context, epoch
+            )
+        history = list(conversation_history or [])
         time_context = build_time_user_context(self.user, now)
-        # Order: time context, then dynamic context (memory, integrations,
-        # cross-session), then the user's actual message last so the model
-        # reads the ask after its context, mirroring how time is prepended.
-        current_turn_parts = [time_context]
-        if dynamic_context:
-            current_turn_parts.append(dynamic_context)
-        current_turn_parts.append(message_context)
-        messages.append(UserMessage(content="\n\n".join(current_turn_parts)))
+
+        def current_turn(dynamic: str) -> str:
+            # Order: time context, then dynamic context (memory, integrations,
+            # workspace updates), then the user's actual message last so the
+            # model reads the ask after its context.
+            parts = (
+                [time_context, dynamic, message_context]
+                if dynamic
+                else [time_context, message_context]
+            )
+            return "\n\n".join(parts)
+
+        # Mid-epoch workspace updates are laid out after the trim (see
+        # ``_WorkspaceLayout``). Until then the current turn carries the one
+        # it would with the whole history kept, so the trim measures it.
+        layout = (
+            _WorkspaceLayout(workspace, dynamic_context, current_turn)
+            if workspace is not None
+            else None
+        )
+        self._workspace_layout = layout
+        current = (
+            layout.current_turn(history)
+            if layout is not None
+            else UserMessage(content=current_turn(dynamic_context))
+        )
+        messages: list[AgentMessage] = [SystemMessage(content=stable_system), *history, current]
 
         # Trim oldest conversation history if content exceeds the limit.
         # Uses the block-based trimmer which preserves tool-call/result pairing
@@ -1475,6 +1597,14 @@ class ClawboltAgent:
         )
         trim_result = await self._trim_history(messages, shed_history, input_tokens)
         messages = trim_result.messages
+        if layout is not None:
+            messages, dynamic_context = layout.apply(messages)
+        # The full assembled prompt for observers / debugging. The dynamic
+        # half physically ships on the user turn now, but this field still
+        # reflects everything the model was given as instruction context.
+        system_prompt = (
+            f"{stable_system}\n\n{dynamic_context}" if dynamic_context else stable_system
+        )
         # Seed skill-delivery state from what actually survived trimming:
         # a marker present in a reloaded tool result means that category's
         # SKILL.md is in context and first-use injection must not repeat it.
