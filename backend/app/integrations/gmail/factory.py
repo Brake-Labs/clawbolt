@@ -20,8 +20,10 @@ Gmail OAuth client, matching the Calendar pattern.
 from __future__ import annotations
 
 import contextlib
+import html
 import logging
 import mimetypes
+from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING
 
 import httpx
@@ -41,7 +43,9 @@ from backend.app.integrations._google_errors import (
     format_google_api_message,
     parse_google_api_error,
 )
+from backend.app.integrations.gmail.body_trim import clean_text, trim_email_body
 from backend.app.integrations.gmail.service import (
+    MAX_FULL_BODY_CHARS,
     GmailAttachment,
     GmailAttachmentInfo,
     GmailMessage,
@@ -100,6 +104,13 @@ class GmailGetMessageParams(BaseModel):
     message_id: str = Field(
         description="Gmail message ID from gmail_search or gmail_list_recent.",
     )
+    full_body: bool = Field(
+        default=False,
+        description=(
+            "Return the body untrimmed, with quoted replies, signature, and footer. "
+            "Only when the trimmed body lacks something you need."
+        ),
+    )
 
 
 class GmailOpenAttachmentParams(BaseModel):
@@ -157,18 +168,36 @@ class GmailSendParams(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+# A search hit is a pointer for choosing what to open, and every hit stays in
+# the session history, so its snippet is kept to a line.
+_MAX_SNIPPET_CHARS = 100
+
+
+def _compact_date(raw: str) -> str:
+    """``Tue, 06 Jan 2026 15:14:07 -0800 (PST)`` to ``2026-01-06 15:14 -0800``."""
+    try:
+        parsed = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return raw
+    offset = parsed.strftime("%z")
+    return parsed.strftime("%Y-%m-%d %H:%M") + (f" {offset}" if offset else "")
+
+
+def _compact_snippet(raw: str) -> str:
+    # Gmail returns snippets HTML-escaped ("&#39;") and marketing preheaders
+    # padded with invisible characters; both cost tokens and say nothing.
+    snippet = " ".join(clean_text(html.unescape(raw)).split())
+    if len(snippet) > _MAX_SNIPPET_CHARS:
+        snippet = snippet[:_MAX_SNIPPET_CHARS].rstrip() + "..."
+    return snippet
+
+
 def _format_summary(s: GmailMessageSummary) -> str:
-    parts = [s.sender or "(unknown sender)"]
-    if s.subject:
-        parts.append(s.subject)
-    else:
-        parts.append("(no subject)")
+    parts = [s.sender or "(unknown sender)", s.subject or "(no subject)"]
     if s.date:
-        parts.append(s.date)
-    if s.snippet:
-        snippet = s.snippet[:140]
-        if len(s.snippet) > 140:
-            snippet += "..."
+        parts.append(_compact_date(s.date))
+    snippet = _compact_snippet(s.snippet)
+    if snippet:
         parts.append(snippet)
     parts.append(f"[id: {s.id}]")
     return " | ".join(parts)
@@ -221,7 +250,37 @@ def _describe_gmail_open_attachment(args: dict[str, object]) -> str:
     return f"Open attachment {label} from Gmail message {args.get('message_id', '')}"
 
 
-def _format_message(m: GmailMessage) -> str:
+def _render_body(m: GmailMessage, full_body: bool) -> list[str]:
+    """Return the body lines: the text, then a note for anything left out.
+
+    By default quoted replies, the signature, and the footer are trimmed and
+    the rest is capped at ``gmail_body_max_chars``. ``full_body`` skips the
+    trim and raises the cap to ``MAX_FULL_BODY_CHARS``.
+    """
+    if not m.body.strip():
+        return ["(empty body)"]
+    notes: list[str] = []
+    full_cap = max(settings.gmail_body_max_chars, MAX_FULL_BODY_CHARS)
+    if full_body:
+        text = m.body
+        cap = full_cap
+    else:
+        trimmed = trim_email_body(m.body, m.subject)
+        text = trimmed.text
+        cap = settings.gmail_body_max_chars
+        if trimmed.removed:
+            notes.append(
+                f"[Removed {' and '.join(trimmed.removed)}: {len(m.body) - len(text):,} of "
+                f"{len(m.body):,} chars. full_body=true returns them.]"
+            )
+    if len(text) > cap:
+        more = "" if cap == full_cap else f" full_body=true returns up to {full_cap:,}."
+        notes.append(f"[Cut at {cap:,} of {len(text):,} chars.{more}]")
+        text = text[:cap]
+    return [text, *notes]
+
+
+def _format_message(m: GmailMessage, full_body: bool = False) -> str:
     lines = [
         f"From: {m.sender or '(unknown)'}",
         f"To: {', '.join(m.recipients) or '(none)'}",
@@ -244,7 +303,7 @@ def _format_message(m: GmailMessage) -> str:
             lines.append(f"  - {_format_attachment(a)}")
     lines.append("")
     lines.append("Body:")
-    lines.append(m.body or "(empty body)")
+    lines.extend(_render_body(m, full_body))
     return "\n".join(lines)
 
 
@@ -518,7 +577,7 @@ def create_gmail_tools(
     async def gmail_search(query: str, max_results: int = 10) -> ToolResult:
         return await _run_search(query, max_results, f"No messages match '{query}'.")
 
-    async def gmail_get_message(message_id: str) -> ToolResult:
+    async def gmail_get_message(message_id: str, full_body: bool = False) -> ToolResult:
         try:
             msg = await service.get_message(message_id)
         except ReconnectRequired as exc:
@@ -538,7 +597,7 @@ def create_gmail_tools(
                 is_error=True,
                 error_kind=ToolErrorKind.SERVICE,
             )
-        return ToolResult(content=_format_message(msg))
+        return ToolResult(content=_format_message(msg, full_body))
 
     async def gmail_open_attachment(
         message_id: str, attachment_id: str, filename: str
@@ -756,7 +815,8 @@ def create_gmail_tools(
             description=(
                 "Fetch one Gmail message: headers, plain-text body, attachments "
                 "(filename, type, size, attachment_id), and a deduplicated 'links' "
-                "list, the fastest way to find a magic link or unsubscribe URL."
+                "list, the fastest way to find a magic link or unsubscribe URL. "
+                "The body omits quoted replies, signature, and footer."
             ),
             function=gmail_get_message,
             params_model=GmailGetMessageParams,

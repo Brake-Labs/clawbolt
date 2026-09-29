@@ -27,10 +27,10 @@ from backend.app.services.oauth import RefreshLockContended, TokenRefreshUnavail
 logger = logging.getLogger(__name__)
 
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1"
-# Cap the body slice we surface to the LLM so a marketing newsletter doesn't
-# eat the context window. Callers asking for "the magic link" only need the
-# first chunk; full retrieval of long bodies is intentionally out of scope.
-_MAX_BODY_CHARS = 16_000
+# The most body the LLM ever sees, even with ``full_body=True``, so a
+# marketing newsletter doesn't eat the context window. Links are collected
+# from the same slice.
+MAX_FULL_BODY_CHARS = 16_000
 
 # A Gmail search returning thousands of message IDs would be useless to the
 # LLM and expensive to fetch. Hard ceiling at the API's per-page max of 500.
@@ -271,10 +271,10 @@ class GmailService:
         )
         payload = data.get("payload", {})
         headers = _index_headers(payload.get("headers", []))
+        # The body is returned whole; the tool layer trims and caps what the
+        # LLM sees, and needs the full length to say how much it cut.
         body = _extract_body(payload)
-        if len(body) > _MAX_BODY_CHARS:
-            body = body[:_MAX_BODY_CHARS] + "\n[...truncated]"
-        links = _extract_links(body)
+        links = _extract_links(body[:MAX_FULL_BODY_CHARS])
         return GmailMessage(
             id=data.get("id", ""),
             thread_id=data.get("threadId", ""),
@@ -565,6 +565,7 @@ def _build_rfc822(
 
 
 __all__ = [
+    "MAX_FULL_BODY_CHARS",
     "GmailAttachment",
     "GmailAttachmentInfo",
     "GmailMessage",
