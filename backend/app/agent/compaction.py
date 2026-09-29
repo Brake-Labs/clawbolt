@@ -104,6 +104,37 @@ def _line_diff_counts(before: str, after: str) -> tuple[int, int]:
     return added, removed
 
 
+def _memory_budget_line(memory: str, budget_chars: int) -> str:
+    """Render the ``<memory_budget>`` body the compaction model sees.
+
+    Soft target only: the prompt asks the model to stay within it, and
+    ``_log_memory_over_budget`` records a miss. Nothing truncates the file.
+    """
+    return f"MEMORY.md is {len(memory)} of {budget_chars} characters."
+
+
+def _log_memory_over_budget(user_id: str, memory: str, budget_chars: int, *, hygiene: bool) -> bool:
+    """Log a warning when *memory* is past the soft budget. Returns True if so.
+
+    Runs on the MEMORY.md this compaction left in place (rewritten or not),
+    so a file the model could not shrink keeps surfacing in the logs.
+    """
+    size = len(memory)
+    if size <= budget_chars:
+        return False
+    logger.warning(
+        "compaction.memory_over_budget user=%s memory_chars=%d budget_chars=%d hygiene=%s",
+        user_id,
+        size,
+        budget_chars,
+        hygiene,
+    )
+    return True
+
+
+# Marker ``compaction.md`` recognizes as a run with no conversation.
+HYGIENE_RUN_MARKER = "[hygiene run]"
+
 _URL_RE = re.compile(r"https?://\S+")
 
 
@@ -283,9 +314,10 @@ async def compact_session(
             Has no effect on the trim-driven hot path, which leaves it
             unset.
         hygiene_only: When True, skip the conversation-message requirement
-            and instead run the compliance audit only. The LLM re-audits
-            the existing MEMORY.md against the Do-Not-Include list without
-            needing new conversation content. ``trimmed_messages`` is
+            and run the prompt's Step 1 only: the LLM re-audits and
+            consolidates the existing MEMORY.md (exclusion list, superseded
+            and resolved entries, integration behavior, the soft budget)
+            without new conversation content. ``trimmed_messages`` is
             ignored in this mode.
 
     Returns:
@@ -306,14 +338,10 @@ async def compact_session(
         if not current_memory_check or not current_memory_check.strip():
             return "", None
 
-        # Build a minimal conversation block that triggers the compliance
-        # audit in Step 1 of the prompt without providing actual messages.
-        # The model reads this and performs the compliance audit on the
-        # existing MEMORY.md, then merges nothing because there are no
-        # new facts.
-        conversation_text = (
-            "[compliance audit: re-audit existing MEMORY.md against the Do-Not-Include list]"
-        )
+        # The prompt reads this marker as "no conversation": it runs the
+        # Step 1 audit and consolidation on the existing MEMORY.md and
+        # leaves every other file alone.
+        conversation_text = HYGIENE_RUN_MARKER
         _trimmed_count = 0
         _input_chars = 0
     else:
@@ -340,10 +368,15 @@ async def compact_session(
     heartbeat_store = HeartbeatStore(user_id)
     current_heartbeat = await heartbeat_store.read_heartbeat_md_async()
 
+    budget_chars = settings.compaction_memory_budget_chars
     user_prompt_parts = [
         "<current_memory>",
         current_memory or "(empty)",
         "</current_memory>",
+        "",
+        "<memory_budget>",
+        _memory_budget_line(current_memory or "", budget_chars),
+        "</memory_budget>",
         "",
         "<user_profile>",
         current_user_profile or "(empty)",
@@ -463,6 +496,10 @@ async def compact_session(
     soul_changed = (
         bool(result.soul_update) and result.soul_update.strip() != (current_soul or "").strip()
     )
+    if hygiene_only:
+        # A hygiene run has no conversation to learn a profile or
+        # personality change from, so it only ever rewrites MEMORY.md.
+        user_changed = soul_changed = False
 
     # Track the post-append HISTORY text for the audit snapshot. Stays
     # equal to ``current_history`` when no entry was appended this event.
@@ -602,6 +639,7 @@ async def compact_session(
     # Build audit snapshots from this task's writes. A re-read could capture a
     # concurrent compaction and record the wrong "after" value.
     new_memory = result.memory_update if memory_changed else current_memory
+    _log_memory_over_budget(user_id, new_memory or "", budget_chars, hygiene=hygiene_only)
     new_user = result.user_profile_update if user_changed else current_user_profile
     new_soul = result.soul_update if soul_changed else current_soul
 

@@ -251,6 +251,7 @@ Photos and files the user sends over a messaging channel are cached on disk whil
 | `COMPACTION_PROVIDER` | (same as `LLM_PROVIDER`) | Provider used for compaction |
 | `COMPACTION_ENDPOINT` | (same as `LLM_ENDPOINT`) | Endpoint used for compaction |
 | `COMPACTION_MAX_TOKENS` | `16000` | Max tokens per compaction response |
+| `COMPACTION_MEMORY_BUDGET_CHARS` | `8000` | Soft MEMORY.md size target given to compaction. Exceeding it is logged, not truncated |
 
 ## Rate limiting
 

@@ -888,8 +888,7 @@ export interface paths {
          *       publish hook (currently ``send_media_reply``,
          *       ``upload_to_storage``, and ``move_file``) are filtered out
          *       by the registry's dependency gates because the preview can't
-         *       safely construct those runtime hooks. Their usage hints will
-         *       not appear in the Tool Guidelines section.
+         *       safely construct those runtime hooks.
          *     * If a user's ``BOOTSTRAP.md`` cannot be created on disk by the
          *       runtime (rare, requires an OS-level error), the runtime drops
          *       out of onboarding mode while this preview still reports
@@ -1383,14 +1382,15 @@ export interface paths {
         put?: never;
         /**
          * Hygiene Compact Memory Endpoint
-         * @description Re-audit a user's MEMORY.md against the Do-Not-Include list.
+         * @description Re-audit and consolidate a user's MEMORY.md.
          *
-         *     Runs the compaction LLM in hygiene-only mode: the model reads the
-         *     user's current MEMORY.md and removes every line that violates the
-         *     exclusion list (customer IDs, phone numbers, stale bug notes, etc.),
-         *     even if no new conversation triggered the compaction. This is the
-         *     "clean my memory now" operation that scrubs pre-existing violations
-         *     that were written before the compliance rule existed.
+         *     Runs the compaction LLM in hygiene-only mode: the model applies the
+         *     compaction MEMORY.md rules to the user's current file with no new
+         *     conversation. It removes exclusion-list lines (customer IDs, phone
+         *     numbers, stale bug notes, resolved dated notes, general integration
+         *     behavior), merges duplicates, keeps the newer of conflicting entries,
+         *     and shrinks toward the soft ``COMPACTION_MEMORY_BUDGET_CHARS`` target.
+         *     This is the "clean my memory now" operation for a bloated or stale file.
          *
          *     Unlike ``POST /admin/users/{user_id}/compact-now``, this endpoint
          *     does not require untrimmed conversation messages and does not
@@ -4307,8 +4307,8 @@ export interface components {
          * HygieneCompactMemoryResponse
          * @description Outcome of an admin-triggered hygiene-only memory re-audit.
          *
-         *     ``memory_updated`` indicates whether at least one exclusion-list
-         *     violation was removed from MEMORY.md. ``memory_text`` carries the
+         *     ``memory_updated`` indicates whether the consolidated MEMORY.md was
+         *     persisted. ``memory_text`` carries the
          *     new full MEMORY.md content (empty string if nothing changed) so
          *     the admin can preview the diff without re-reading the user's
          *     memory file.

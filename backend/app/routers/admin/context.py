@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 
 from backend.app.agent.context import admin_compact_visible_messages, hygiene_compact_memory
+from backend.app.agent.memory_db import get_memory_store
 from backend.app.agent.user_db import get_user_store
 from backend.app.auth.admin_dep import get_current_admin
 from backend.app.models import (
@@ -102,14 +103,15 @@ async def hygiene_compact_memory_endpoint(
     ctx: AdminAuditContext = Depends(audit_admin(AdminAction.HYGIENE_COMPACT_MEMORY)),
     admin: User = Depends(get_current_admin),
 ) -> HygieneCompactMemoryResponse:
-    """Re-audit a user's MEMORY.md against the Do-Not-Include list.
+    """Re-audit and consolidate a user's MEMORY.md.
 
-    Runs the compaction LLM in hygiene-only mode: the model reads the
-    user's current MEMORY.md and removes every line that violates the
-    exclusion list (customer IDs, phone numbers, stale bug notes, etc.),
-    even if no new conversation triggered the compaction. This is the
-    "clean my memory now" operation that scrubs pre-existing violations
-    that were written before the compliance rule existed.
+    Runs the compaction LLM in hygiene-only mode: the model applies the
+    compaction MEMORY.md rules to the user's current file with no new
+    conversation. It removes exclusion-list lines (customer IDs, phone
+    numbers, stale bug notes, resolved dated notes, general integration
+    behavior), merges duplicates, keeps the newer of conflicting entries,
+    and shrinks toward the soft ``COMPACTION_MEMORY_BUDGET_CHARS`` target.
+    This is the "clean my memory now" operation for a bloated or stale file.
 
     Unlike ``POST /admin/users/{user_id}/compact-now``, this endpoint
     does not require untrimmed conversation messages and does not
@@ -129,10 +131,12 @@ async def hygiene_compact_memory_endpoint(
         )
     ctx.target_user_id = user_id
 
+    memory_bytes_before = len((await get_memory_store(user_id).read_memory_async()).encode("utf-8"))
     memory_text, changed = await hygiene_compact_memory(user_id)
 
     ctx.detail = {
         "memory_updated": changed,
+        "memory_bytes_before": memory_bytes_before,
         "memory_bytes": len(memory_text.encode("utf-8")) if memory_text else 0,
     }
 

@@ -4,7 +4,7 @@ Clawbolt keeps durable business knowledge across conversations: rates, preferenc
 
 ## How it works
 
-Memory is exposed to the agent as a per-user `MEMORY.md` workspace document and stored in PostgreSQL. The agent manages it with workspace tools. When conversations get long, automatic compaction updates `MEMORY.md` and appends timestamped breadcrumbs to `HISTORY.md`.
+Memory is exposed to the agent as a per-user `MEMORY.md` workspace document and stored in PostgreSQL. The agent manages it with workspace tools. When conversations get long, automatic compaction updates `MEMORY.md` and appends timestamped breadcrumbs to `HISTORY.md`. Compaction folds new facts into existing sections, replaces outdated ones (a changed rate, a finished job), and aims to keep `MEMORY.md` under a size target (`COMPACTION_MEMORY_BUDGET_CHARS`, 8000 characters by default), since the whole file is read on every message.
 
 ## Saving facts
 

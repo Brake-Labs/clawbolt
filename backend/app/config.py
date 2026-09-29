@@ -208,6 +208,10 @@ class Settings(BaseSettings):
     compaction_endpoint: str = ""
     compaction_provider: str = ""
     compaction_max_tokens: int = Field(default=16_000, ge=1)
+    # Soft MEMORY.md size target, in characters, that compaction is asked to
+    # stay within. Exceeding it is logged, never truncated: the hard cap is
+    # the markdown registry's byte budget.
+    compaction_memory_budget_chars: int = Field(default=8_000, ge=500)
 
     # Rate limiting
     webhook_rate_limit_max_requests: int = Field(default=30, ge=1)

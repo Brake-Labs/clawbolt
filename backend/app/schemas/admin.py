@@ -339,8 +339,8 @@ class AdminApiKeyMintResponse(BaseModel):
 class HygieneCompactMemoryResponse(BaseModel):
     """Outcome of an admin-triggered hygiene-only memory re-audit.
 
-    ``memory_updated`` indicates whether at least one exclusion-list
-    violation was removed from MEMORY.md. ``memory_text`` carries the
+    ``memory_updated`` indicates whether the consolidated MEMORY.md was
+    persisted. ``memory_text`` carries the
     new full MEMORY.md content (empty string if nothing changed) so
     the admin can preview the diff without re-reading the user's
     memory file.
