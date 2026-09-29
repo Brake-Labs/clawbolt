@@ -182,13 +182,10 @@ class TestTrim:
         assert "title: 1/2 in. Copper Type L Pipe" in out
         assert "url: https://supplier.example.com/p/copper-type-l" in out
         assert "description: Type L is $1.40-$2.20 per foot." in out
-        assert "page_age: 2026-08-12T00:00:00" in out
         assert "age: August 12, 2026" in out
         assert "product_cluster[0].price: 30.98" in out
         assert "product_cluster[0].offers[0].price: 30.09" in out
         assert "product_cluster[0].offers[0].url: https://supplier.example.com/0/0" in out
-        assert "product_cluster[0].rating.ratingValue: 4.6" in out
-        assert "product_cluster[0].rating.bestRating: 5" in out
         assert "product_cluster[0].offers[2].price: 30.29" in out
         assert "extra_snippets[0]: Snippet 0: copper moved 4%." in out
         assert "faq.items[0].answer: A0." in out
@@ -203,14 +200,14 @@ class TestTrim:
         assert trimmed["product_cluster_not_shown"] == 2
         assert len(trimmed["product_cluster"][0]["offers"]) == 3
         assert trimmed["product_cluster"][0]["offers_not_shown"] == 2
-        assert trimmed["extra_snippets"] == [f"Snippet {s}: copper moved 4%." for s in range(5)]
-        assert trimmed["extra_snippets_not_shown"] == 2
+        assert trimmed["extra_snippets"] == ["Snippet 0: copper moved 4%."]
+        assert trimmed["extra_snippets_not_shown"] == 6
         assert len(trimmed["faq"]["items"]) == 2
         assert trimmed["faq"]["items_not_shown"] == 2
 
     def test_short_lists_are_untouched_and_carry_no_count(self) -> None:
-        trimmed = _trim({"extra_snippets": ["a", "b"], "offers": [{"price": "1"}]})
-        assert trimmed == {"extra_snippets": ["a", "b"], "offers": [{"price": "1"}]}
+        trimmed = _trim({"extra_snippets": ["a"], "offers": [{"price": "1"}, {"price": "2"}]})
+        assert trimmed == {"extra_snippets": ["a"], "offers": [{"price": "1"}, {"price": "2"}]}
 
     def test_items_is_capped_only_under_faq(self) -> None:
         trimmed = _trim({"other": {"items": [1, 2, 3, 4]}})
@@ -223,6 +220,122 @@ class TestTrim:
         before = len(render_records([_clean(_bulky_brave_result())]))
         after = len(render_records([self._trimmed()]))
         assert after < before / 2
+
+
+_SITE_MENU = (
+    "Specials & Offers Appliances Bath Blinds & Window Treatments Building Materials "
+    "Decor & Furniture Doors & Windows Electrical Flooring & Area Rugs Hardware "
+    "Heating, Venting & Cooling Kitchen Lawn & Garden Lighting & Ceiling Fans "
+    "Outdoor Living Paint Plumbing Storage & Organization Tools Site Map"
+)
+
+
+def _retail_product_result() -> dict:
+    """A single-product retailer page, shaped like a live Brave record."""
+    url = "https://store.example.com/p/joint-compound-4-5-gal/100123456"
+    description = "USG 4.5 gal. lightweight joint compound, pre-mixed, <strong>$24.98</strong>."
+    return {
+        "title": "4.5 Gal. Lightweight Joint Compound",
+        "url": url,
+        "description": description,
+        "page_age": "2026-08-12T00:00:00",
+        "age": "August 12, 2026",
+        "product": {
+            "name": "4.5 Gal. Lightweight Joint Compound",
+            "price": "24.98",
+            "offers": [{"url": url, "priceCurrency": "USD", "price": "24.98"}],
+            "gtin13": "0731291234567",
+            "rating": {"ratingValue": 4.7, "bestRating": 5, "reviewCount": 1843},
+        },
+        "extra_snippets": [
+            description,
+            _SITE_MENU,
+            "Sands easily and shrinks less than conventional compound.",
+            "Sands easily and shrinks less than conventional compound. Pickup today.",
+            "Covers about 450 sq. ft. per pail on a typical taping job.",
+        ],
+    }
+
+
+class TestSlimming:
+    """Duplicates and filler go; every quotable fact stays."""
+
+    def _trimmed(self) -> dict:
+        return _trim(_clean(_retail_product_result()))
+
+    def test_keeps_price_name_url_title_and_description(self) -> None:
+        trimmed = self._trimmed()
+        assert trimmed["title"] == "4.5 Gal. Lightweight Joint Compound"
+        assert trimmed["url"] == "https://store.example.com/p/joint-compound-4-5-gal/100123456"
+        assert trimmed["description"] == (
+            "USG 4.5 gal. lightweight joint compound, pre-mixed, $24.98."
+        )
+        assert trimmed["age"] == "August 12, 2026"
+        assert trimmed["product"] == {
+            "name": "4.5 Gal. Lightweight Joint Compound",
+            "price": "24.98",
+        }
+
+    def test_drops_filler_fields(self) -> None:
+        out = render_records([self._trimmed()])
+        for gone in ("gtin13", "priceCurrency", "rating", "reviewCount", "page_age", "offers"):
+            assert gone not in out, gone
+        assert out.count("https://store.example.com/p/") == 1
+
+    def test_keeps_one_new_snippet_and_skips_repeats_and_the_menu(self) -> None:
+        trimmed = self._trimmed()
+        # The description copy and the menu are gone; the shorter snippet is
+        # contained in the longer one, so the longer one takes the one slot.
+        assert trimmed["extra_snippets"] == [
+            "Sands easily and shrinks less than conventional compound. Pickup today."
+        ]
+        assert trimmed["extra_snippets_not_shown"] == 1
+
+    def test_an_offer_with_its_own_price_or_seller_is_kept(self) -> None:
+        record = _retail_product_result()
+        record["product"]["offers"] = [
+            {"url": record["url"], "price": "24.98"},
+            {"url": record["url"], "price": "22.47"},
+            {"url": "https://other.example.com/p/1", "price": "24.98"},
+        ]
+        offers = _trim(_clean(record))["product"]["offers"]
+        assert offers == [
+            {"price": "22.47"},
+            {"url": "https://other.example.com/p/1", "price": "24.98"},
+        ]
+
+    def test_the_result_url_itself_is_never_dropped(self) -> None:
+        assert (
+            _trim({"url": "https://a.example.com", "title": "t"})["url"] == "https://a.example.com"
+        )
+
+    def test_page_age_is_kept_when_it_is_the_only_date(self) -> None:
+        assert _trim({"page_age": "2026-01-15", "age": None})["page_age"] == "2026-01-15"
+
+    def test_all_duplicate_snippets_leave_no_empty_list(self) -> None:
+        trimmed = _trim({"description": "Same text.", "extra_snippets": ["same  TEXT."]})
+        assert "extra_snippets" not in trimmed
+
+    @pytest.mark.parametrize(
+        "snippet",
+        [
+            "4.5 Gal. Lightweight Joint Compound Pail Ready Mixed All Purpose White Bucket",
+            "USG Sheetrock Brand Plus Lightweight All Purpose Ready Mixed Joint Compound Pail $24",
+            "Short Menu Of Words",
+            "Joint compound is sold in pails and boxes at most home centers and supply yards",
+        ],
+    )
+    def test_menu_heuristic_spares_product_names_and_prose(self, snippet: str) -> None:
+        assert _trim({"extra_snippets": [snippet]})["extra_snippets"] == [snippet]
+
+    def test_menu_heuristic_catches_a_navigation_menu(self) -> None:
+        assert "extra_snippets" not in _trim({"extra_snippets": [_SITE_MENU]})
+
+    def test_a_ten_result_product_search_shrinks_by_more_than_half(self) -> None:
+        records = [_clean(_retail_product_result()) for _ in range(10)]
+        untrimmed = len(render_records(records))
+        slim = len(render_records([_trim(r) for r in records]))
+        assert slim < untrimmed / 2
 
 
 class TestBraveSearchProvider:
