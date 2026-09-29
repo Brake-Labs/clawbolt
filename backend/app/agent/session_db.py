@@ -70,6 +70,7 @@ def _session_to_state(
         channel=cs.channel,
         initial_system_prompt=cs.initial_system_prompt,
         last_trim_seq=cs.last_trim_seq,
+        history_stub_seq=cs.history_stub_seq,
     )
 
 
@@ -229,11 +230,16 @@ async def _reset_trim_watermark_if_orphaned(db: AsyncSession, cs: ChatSession) -
     Resetting here drops the watermark only when there is nothing left for it
     to protect; trimmed facts already live in MEMORY.md / USER.md / SOUL.md.
     """
-    if cs.last_trim_seq is None:
+    if cs.last_trim_seq is None and cs.history_stub_seq is None:
         return
     max_seq = (await db.execute(_select_max_seq(cs.id))).scalar()
-    if max_seq is None or max_seq <= cs.last_trim_seq:
+    if cs.last_trim_seq is not None and (max_seq is None or max_seq <= cs.last_trim_seq):
         cs.last_trim_seq = None
+    # The stub seq names a row that keeps its results verbatim. With every
+    # row from it on deleted, new rows would reuse seqs below it and render
+    # their results as stubs.
+    if cs.history_stub_seq is not None and (max_seq is None or max_seq < cs.history_stub_seq):
+        cs.history_stub_seq = None
 
 
 # ---------------------------------------------------------------------------
@@ -741,6 +747,9 @@ class SessionStore:
             count: int = cast("CursorResult[object]", result).rowcount
             cs.initial_system_prompt = ""
             cs.last_trim_seq = None
+            # Stale for the same reason: new rows restart at seq 1, below it,
+            # and would render their tool results as stubs.
+            cs.history_stub_seq = None
             await db.commit()
             return count
 

@@ -77,6 +77,11 @@ class ChatSession(Base):
     # the original rows remain in the DB for audit. ``NULL`` means nothing
     # has been trimmed yet (default for fresh sessions and pre-feature rows).
     last_trim_seq: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # First ``messages.seq`` whose tool results a mid-session trim left
+    # verbatim. Read results in rows below it render as stubs, so the turns
+    # after the trim send the same bytes the trim turn cached
+    # (``prompt_epoch.build_history_view``). ``NULL`` means nothing stubbed.
+    history_stub_seq: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     user: Mapped[User] = relationship("User", back_populates="sessions", lazy="raise")
     messages: Mapped[list[Message]] = relationship(

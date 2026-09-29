@@ -182,7 +182,7 @@ When you need realistic-looking data, use clearly synthetic values: `jane.doe@ex
 - **Message bus**: async inbound/outbound queues in `bus.py`. Channels publish inbound messages; the agent publishes outbound replies. The ``ChannelManager`` dispatches outbound messages to the correct channel.
 - **Agent loop**: channel webhook -> media pipeline -> tool-calling loop (any-llm `amessages`) -> tool execution -> reply
 - **Memory**: Freeform per-user MEMORY.md managed via workspace tools, backed by `memory_documents` table with automatic compaction
-- **Prompt-cache epochs**: `backend/app/agent/prompt_epoch.py` owns the one definition of a cold start (the first message after the cache idled out, read from message timestamps) and what keys off it: the per-epoch workspace snapshot in the system block, and the cold-start history rebuild. Anything that renders history or the system block for the agent goes through it, so the cached prefix stays byte-identical inside an epoch. The rebuild stubs only the results of calls that read (`tools.base.is_mutating_call`, against the turn's own tools); a write's result stays verbatim at any age, because it may be the only place the ID of what it made is written down. SKILL.md guidance delivered on any old result is stripped, since it re-delivers on the category's next use
+- **Prompt-cache epochs**: `backend/app/agent/prompt_epoch.py` owns the one definition of a cold start (the first message after the cache idled out, read from message timestamps) and what keys off it: the per-epoch workspace snapshot in the system block, and the cold-start history rebuild. Anything that renders history or the system block for the agent goes through it, so the cached prefix stays byte-identical inside an epoch. The rebuild stubs only the results of calls that read (`tools.base.is_mutating_call`, against the turn's own tools); a write's result stays verbatim at any age, because it may be the only place the ID of what it made is written down. SKILL.md guidance delivered on any old result is stripped, since it re-delivers on the category's next use. The mid-session trim (`ClawboltAgent._trim_history`, the one place a turn's final history is decided) sheds the same way before dropping whole turns (`prompt_epoch.shed_history_view`): it stubs reads outside the verbatim window, shrinks that window to nothing, drops the oldest turns only if still over target, and stores where the stubbing stops as `sessions.history_stub_seq`, which every later render applies, so the turns after a trim send the bytes it cached
 - **Services**: External services abstracted behind service classes in `backend/app/services/`
 
 ## Multi-user mode
@@ -249,7 +249,14 @@ Invariants, each of which the feature is worthless without:
   follows automatically; keep it that way.
 - **History is rendered by `prompt_epoch.build_history_view`,** the function
   the live loop's history renderer calls, with the cold-start rebuild on or
-  off per the run's `history_mode` (`types.HistoryMode`). To read what the
+  off per the run's `history_mode` (`types.HistoryMode`). With it on, the
+  replay also sheds over the trim trigger as live does, through an
+  `EpochHistoryRenderer(persist=False)` that writes nothing to the session.
+  It does not reconstruct `sessions.history_stub_seq` left by a trim on an
+  earlier turn (the stored value is today's, not the one the sample ran
+  with), so turns after a live trim replay with those old reads verbatim, or
+  shed afresh from their own window; only the trim turn itself matches
+  production. To read what the
   rebuild changes before enabling `COLD_START_COMPACTION_ENABLED`, start two
   runs over the same turns with the *incumbent* model as the candidate, one
   with `full` and one with `cold_start_compaction`. The `full` run is the

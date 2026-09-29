@@ -830,6 +830,19 @@ async def _advance_trim_watermark_only(user_id: str, max_seq: int) -> None:
         await db.commit()
 
 
+async def _set_history_stub_seq(user_id: str, seq: int) -> None:
+    """Record where a mid-session trim stubbed old read results.
+
+    ``sessions.history_stub_seq`` only moves forward: once a result renders
+    as a stub, every later turn must render it the same way.
+    """
+    async with db_session_async() as db:
+        cs = (await db.execute(select(ChatSession).filter_by(user_id=user_id))).scalar_one_or_none()
+        if cs is not None and seq > (cs.history_stub_seq or 0):
+            cs.history_stub_seq = seq
+        await db.commit()
+
+
 async def hygiene_compact_memory(user_id: str) -> tuple[str, bool]:
     """Re-audit and consolidate the user's MEMORY.md with no new conversation.
 

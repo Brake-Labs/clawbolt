@@ -173,8 +173,9 @@ class Settings(BaseSettings):
     # as a delta on the current turn.
     prompt_stable_prefix_enabled: bool = True
     # Rebuild the history to a budget at each cold start, eliding old tool
-    # results, and keep it append-only in between. The existing trim still
-    # applies above ``context_trim_trigger_tokens`` as a ceiling.
+    # results, and keep it append-only in between. The trim still applies
+    # above ``context_trim_trigger_tokens`` as a ceiling, and with this on it
+    # stubs old read results before it drops whole turns.
     cold_start_compaction_enabled: bool = False
     cold_start_history_budget_tokens: int = Field(default=30_000, ge=1_000)
     # Turns before the cold start whose tool results stay verbatim.

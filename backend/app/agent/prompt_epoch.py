@@ -24,10 +24,17 @@ Two things are keyed to epochs, each behind its own setting:
   turn's tool schema, so every later turn in the epoch renders the same bytes
   and the history only grows by appending. See :func:`build_history_view`.
 
+The mid-session trim (``core.assemble_prompt``) sheds history the same way
+before it drops whole turns: old read results become stubs, and the row the
+stubbing stops at is stored as ``sessions.history_stub_seq``, which every
+later render applies. See :func:`shed_history_view`.
+
 The definition of a cold start lives in one place, :func:`is_cold_gap`, and
 is computed from message timestamps rather than from process state. That is
-what lets the model-comparison replay rebuild the exact history a live turn
-would have seen, from the transcript alone.
+what lets the model-comparison replay rebuild the cold-start history a live
+turn would have seen from the transcript alone. The trim's stub seq is the
+exception: it is session state written by an earlier turn, and the replay
+does not reconstruct it (see ``model_comparison.sampling``).
 """
 
 from __future__ import annotations
@@ -36,12 +43,13 @@ import datetime
 import json
 import logging
 from collections import OrderedDict
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 from backend.app.agent.context import (
     _advance_trim_watermark_only,
+    _set_history_stub_seq,
     _stored_messages_to_agent_messages,
     trigger_compaction_for_dropped,
 )
@@ -249,8 +257,13 @@ def _render(
     verbatim_from: int,
     preceding: Sequence[StoredMessage],
     tools_by_name: Mapping[str, Tool],
+    stub_before: int | None = None,
 ) -> tuple[list[AgentMessage], int, int]:
     """Render the rows, eliding read results in turns before *verbatim_from*.
+
+    Rows with a seq below *stub_before* are treated the same way wherever
+    they sit, inherited or appended during the epoch: that is where a
+    mid-session trim left its stubs (see :func:`shed_history_view`).
 
     Only results of calls that just read are elided. A write's result stays
     verbatim at any age and size, error or not (see :func:`_is_write`), and
@@ -283,14 +296,21 @@ def _render(
     pre_part: list[AgentMessage] = []
     calls: dict[str, tuple[str, dict[str, Any]]] = {}
     group: int | None = None
+    # The row a result belongs to: results carry no seq of their own and
+    # follow the assistant message of the row that stored them.
+    row_seq: int | None = None
     elided = 0
     for m in rendered:
         if isinstance(m, UserMessage | AssistantMessage) and m.seq is not None:
             group = group_of.get(m.seq)
+            row_seq = m.seq
         if isinstance(m, AssistantMessage):
             for tc in m.tool_calls:
                 calls[tc.id] = (tc.name, tc.arguments)
-        if isinstance(m, ToolResultMessage) and group is not None and group < verbatim_from:
+        old = (group is not None and group < verbatim_from) or (
+            stub_before is not None and row_seq is not None and row_seq < stub_before
+        )
+        if isinstance(m, ToolResultMessage) and old:
             # Guidance is not the result, and re-delivers on the category's
             # next use, so it goes from reads and writes alike.
             content = strip_skill_guidance(m.content)
@@ -324,6 +344,7 @@ def build_history_view(
     compact: bool,
     tools_by_name: Mapping[str, Tool],
     preceding: Sequence[StoredMessage] = (),
+    stub_before: int | None = None,
 ) -> HistoryView:
     """Render the history for the turn answering *current*.
 
@@ -357,6 +378,12 @@ def build_history_view(
     nothing but the rows, so it renders the same bytes on every turn of the
     epoch. After a drop the next turn loads fewer rows, finds them within
     budget and drops nothing more.
+
+    *stub_before* is ``sessions.history_stub_seq``, where a mid-session trim
+    stubbed (:func:`shed_history_view`). With *compact* True, results in rows
+    below it lose their guidance and read results become stubs, as in step 1,
+    whether or not an epoch opened since. It is persisted, so every turn
+    after the trim applies it the same way.
     """
     if current is None:
         return HistoryView(
@@ -364,11 +391,22 @@ def build_history_view(
             epoch=PromptEpoch(key=0, cold_start=True),
         )
     epoch, boundary = find_epoch(rows, current)
-    if not compact or boundary == 0:
+    if not compact or (boundary == 0 and stub_before is None):
         return HistoryView(
             messages=_stored_messages_to_agent_messages(rows, tz_name=tz_name, preceding=preceding),
             epoch=epoch,
         )
+    if boundary == 0:
+        messages, _, elided = _render(
+            [],
+            rows,
+            tz_name,
+            verbatim_from=0,
+            preceding=preceding,
+            tools_by_name=tools_by_name,
+            stub_before=stub_before,
+        )
+        return HistoryView(messages=messages, epoch=epoch, elided_results=elided)
 
     groups = _group_turns(rows[:boundary])
     post = rows[boundary:]
@@ -391,6 +429,7 @@ def build_history_view(
                 verbatim_from=len(kept) - verbatim,
                 preceding=before(first),
                 tools_by_name=tools_by_name,
+                stub_before=stub_before,
             )
             if tokens <= budget or verbatim == 0:
                 return messages, tokens, elided
@@ -413,6 +452,7 @@ def build_history_view(
                 verbatim_from=len(groups),
                 preceding=before(start),
                 tools_by_name=tools_by_name,
+                stub_before=stub_before,
             )
         # Then widen the verbatim window again as far as the budget allows.
         # This is the same computation the next turn runs on the rows that
@@ -424,16 +464,145 @@ def build_history_view(
     return HistoryView(messages=messages, epoch=epoch, dropped_rows=dropped, elided_results=elided)
 
 
+@dataclass
+class ShedView:
+    """What a mid-session trim sends in place of the history it was given."""
+
+    view: HistoryView
+    # The new ``sessions.history_stub_seq``: read results below it are stubs.
+    stub_before: int
+
+
+def shed_history_view(
+    rows: list[StoredMessage],
+    current: StoredMessage,
+    tz_name: str,
+    *,
+    tools_by_name: Mapping[str, Tool],
+    fits: Callable[[list[AgentMessage]], bool],
+    preceding: Sequence[StoredMessage] = (),
+    stub_before: int | None = None,
+) -> ShedView:
+    """Shrink the history for a mid-session trim, lookups before prose.
+
+    The trim in ``core.assemble_prompt`` calls this when the prompt crosses
+    ``context_trim_trigger_tokens``, instead of dropping whole turns first.
+    *fits* is the trimmer's test of whether a rendered history brings the
+    prompt within its target. The steps mirror the cold-start rebuild's
+    (:func:`build_history_view`), with *fits* as the budget:
+
+    1. Read results in turns older than the last ``cold_start_verbatim_turns``
+       become stubs and lose their SKILL.md guidance. Write results stay
+       verbatim.
+    2. While that does not fit, the verbatim window shrinks, one turn at a
+       time, to nothing. Read results can be fetched again; prose and write
+       results cannot.
+    3. Only if every read result is a stub and it still does not fit are the
+       oldest turns dropped, as few as fit (the newest is always kept), and
+       the verbatim window then widens again as far as *fits* allows. The
+       caller compacts the dropped turns into memory and advances the trim
+       watermark past them.
+
+    The first row of the verbatim window (or *current*, with no window) is
+    the returned ``stub_before``, which the caller persists. It never moves
+    back past the *stub_before* given.
+
+    Every candidate is rendered by :func:`build_history_view` with its
+    ``stub_before`` and the rows that would remain, which is the call every
+    later turn makes once the stub seq and the watermark are stored. So the
+    history this returns is the one the next turns render, byte for byte,
+    and they grow it only by appending.
+    """
+    groups = _group_turns(rows)
+
+    def stub_line(start: int, verbatim: int) -> int:
+        """The stub seq that leaves the last *verbatim* of ``groups[start:]`` whole."""
+        line = groups[len(groups) - verbatim][0].seq if verbatim else current.seq
+        return line if stub_before is None else max(line, stub_before)
+
+    def render(start: int, verbatim: int) -> HistoryView:
+        dropped = [row for group in groups[:start] for row in group]
+        view = build_history_view(
+            [row for group in groups[start:] for row in group],
+            current,
+            tz_name,
+            compact=True,
+            tools_by_name=tools_by_name,
+            preceding=[*preceding, *dropped],
+            stub_before=stub_line(start, verbatim),
+        )
+        # A cold-start rebuild inside the render may drop more from the front.
+        view.dropped_rows = [*dropped, *view.dropped_rows]
+        return view
+
+    def widest(start: int) -> tuple[HistoryView, int] | None:
+        """Steps 1 and 2 over ``groups[start:]``: the widest window that fits."""
+        for verbatim in range(min(settings.cold_start_verbatim_turns, len(groups) - start), -1, -1):
+            view = render(start, verbatim)
+            if fits(view.messages):
+                return view, stub_line(start, verbatim)
+        return None
+
+    found = widest(0)
+    last = len(groups) - 1
+    if found is None and last >= 1:
+        # Step 3. Fewer turns never render longer, so search for the fewest
+        # drops that fit with every read stubbed, rather than re-rendering
+        # the whole window once per turn.
+        low, high = 1, last
+        while low < high:
+            middle = (low + high) // 2
+            if fits(render(middle, 0).messages):
+                high = middle
+            else:
+                low = middle + 1
+        found = widest(low)
+        if found is None:
+            # Even the newest turn alone does not fit: it is what is kept.
+            found = render(low, 0), stub_line(low, 0)
+    if found is None:
+        # A single turn that does not fit even with its reads stubbed.
+        found = render(0, 0), stub_line(0, 0)
+    view, new_stub = found
+    return ShedView(view=view, stub_before=new_stub)
+
+
+@dataclass
+class ShedHistory:
+    """A trim's replacement history, and the turns it dropped (rendered)."""
+
+    messages: list[AgentMessage]
+    dropped: list[AgentMessage]
+
+
+# The hook ``core.assemble_prompt`` calls to shed history when the prompt is
+# over the trim trigger. It takes the trimmer's fit test and returns the new
+# history, or None when there is nothing it can shed.
+HistoryShedder = Callable[[Callable[[list[AgentMessage]], bool]], Awaitable[ShedHistory | None]]
+
+
 class EpochHistoryRenderer:
     """The live loop's history renderer. Records the epoch it found.
 
     Passed to ``load_conversation_history`` as its ``render`` hook, so row
     selection (the trim watermark, the window limit, overflow compaction)
-    stays where it is and only the rendering changes.
+    stays where it is and only the rendering changes. A compacting renderer
+    also serves the turn's trim: see :meth:`shed`.
+
+    With *persist* False it renders and sheds exactly as the live loop does
+    but writes nothing: no compaction, no watermark, no stub seq. That is the
+    model-comparison replay's renderer, which must not change the session it
+    reads.
     """
 
     def __init__(
-        self, user_id: str, *, compact: bool, tools_by_name: Mapping[str, Tool] | None = None
+        self,
+        user_id: str,
+        *,
+        compact: bool,
+        tools_by_name: Mapping[str, Tool] | None = None,
+        stub_before: int | None = None,
+        persist: bool = True,
     ) -> None:
         # The rebuild needs the turn's tools to tell reads from writes. Without
         # them every call would count as a write and nothing would be elided,
@@ -443,7 +612,15 @@ class EpochHistoryRenderer:
         self._user_id = user_id
         self._compact = compact
         self._tools_by_name: Mapping[str, Tool] = tools_by_name or {}
+        # ``sessions.history_stub_seq`` as the turn loaded it.
+        self._stub_before = stub_before
+        self._persist = persist
         self.epoch: PromptEpoch | None = None
+        # What the last render kept: rows, current row, timezone, and the
+        # rows ahead of them (dropped ones included). :meth:`shed` starts here.
+        self._rendered: (
+            tuple[list[StoredMessage], StoredMessage, str, list[StoredMessage]] | None
+        ) = None
 
     async def __call__(
         self,
@@ -459,6 +636,7 @@ class EpochHistoryRenderer:
             compact=self._compact,
             tools_by_name=self._tools_by_name,
             preceding=preceding,
+            stub_before=self._stub_before,
         )
         self.epoch = view.epoch
         if self._compact and view.epoch.cold_start:
@@ -469,19 +647,79 @@ class EpochHistoryRenderer:
                 view.elided_results,
                 len(view.dropped_rows),
             )
-        if view.dropped_rows and settings.compaction_enabled:
-            dropped = _stored_messages_to_agent_messages(
-                view.dropped_rows, tz_name=tz_name, preceding=preceding
-            )
-            await trigger_compaction_for_dropped(self._user_id, dropped)
-            # The compaction event's range ends at the last row that renders
-            # a message. Rows after it that render nothing (an approval
-            # prompt) must go too, or the next turn would load them and
-            # render its first turn differently from this one.
-            await _advance_trim_watermark_only(self._user_id, view.dropped_rows[-1].seq)
-        # With compaction off the watermark stays put. The next turn loads the
-        # same rows, drops the same ones, and renders the same bytes.
+        await self._compact_dropped(view.dropped_rows, tz_name, preceding)
+        if current is not None:
+            kept = rows[len(view.dropped_rows) :]
+            self._rendered = (kept, current, tz_name, [*preceding, *view.dropped_rows])
         return view.messages
+
+    async def shed(self, fits: Callable[[list[AgentMessage]], bool]) -> ShedHistory | None:
+        """Shed the rendered history for a trim (:func:`shed_history_view`).
+
+        Stores the new stub seq and compacts the dropped turns before
+        returning (unless the renderer does not persist), so the next turn
+        loads what this one sends. None when the renderer does not compact or
+        has nothing to shed; the caller falls back to the plain trim.
+        """
+        if not self._compact or self._rendered is None or not self._rendered[0]:
+            return None
+        rows, current, tz_name, preceding = self._rendered
+        shed = shed_history_view(
+            rows,
+            current,
+            tz_name,
+            tools_by_name=self._tools_by_name,
+            fits=fits,
+            preceding=preceding,
+            stub_before=self._stub_before,
+        )
+        if self._persist:
+            await _set_history_stub_seq(self._user_id, shed.stub_before)
+        self._stub_before = shed.stub_before
+        dropped_rows = shed.view.dropped_rows
+        dropped = await self._compact_dropped(dropped_rows, tz_name, preceding)
+        self._rendered = (rows[len(dropped_rows) :], current, tz_name, [*preceding, *dropped_rows])
+        logger.info(
+            "Trim for user %s shed history: read results stubbed below seq %d"
+            " (%d elided), %d row(s) dropped",
+            self._user_id,
+            shed.stub_before,
+            shed.view.elided_results,
+            len(dropped_rows),
+        )
+        return ShedHistory(messages=shed.view.messages, dropped=dropped)
+
+    async def _compact_dropped(
+        self, dropped_rows: list[StoredMessage], tz_name: str, preceding: Sequence[StoredMessage]
+    ) -> list[AgentMessage]:
+        """Compact *dropped_rows* into memory and move the watermark past them.
+
+        Returns them rendered in full, results unstubbed, which is what the
+        compaction reads.
+
+        With compaction off the watermark stays put, as it does for the plain
+        trim (``context.trigger_compaction_for_dropped`` is a no-op then).
+        After a cold-start drop the next turn loads the same rows, drops the
+        same ones, and renders the same bytes. After a trim's drop it is not
+        a fixed point: the next turn loads the dropped rows again, rendered
+        with the stored stub seq, so their read results are stubs. If that
+        history is under the trigger it is sent whole, dropped turns
+        included, and the prefix the trim turn cached is not read; if it is
+        over, the trim sheds again. The plain trim with compaction off does
+        the same: it reloads the dropped rows and trims afresh every turn.
+        """
+        dropped = _stored_messages_to_agent_messages(
+            dropped_rows, tz_name=tz_name, preceding=preceding
+        )
+        if not dropped_rows or not self._persist or not settings.compaction_enabled:
+            return dropped
+        await trigger_compaction_for_dropped(self._user_id, dropped)
+        # The compaction event's range ends at the last row that renders
+        # a message. Rows after it that render nothing (an approval
+        # prompt) must go too, or the next turn would load them and
+        # render its first turn differently from this one.
+        await _advance_trim_watermark_only(self._user_id, dropped_rows[-1].seq)
+        return dropped
 
 
 # Snapshot of the workspace documents per user, keyed by epoch. Process-local
