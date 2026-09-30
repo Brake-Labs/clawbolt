@@ -30,6 +30,16 @@ tell the user a work order does not exist until
 or text they gave. A work order ID you already resolved this session can be
 reused without re-searching.
 
+Work orders have two identifiers: the ID the tools take (from search
+results) and the work order number the user sees, like `113497-1`. Pass the
+ID to tools; quote the number to the user.
+
+## Invoices
+
+An invoice goes to the property manager the moment it is created and cannot
+be edited afterwards; a mistake is voided in AppFolio and rebuilt. Show the
+user the lines and totals before `appfolio_create_invoice`.
+
 ## Photos and documents
 
 See the ``analyze_photo`` tool description for the ``media_XXXXXX`` handle
