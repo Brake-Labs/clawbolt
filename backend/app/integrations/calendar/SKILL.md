@@ -13,6 +13,10 @@ Google Calendar stores calendars, events, and availability. This integration rea
 | `calendar_delete_event` | Delete an event | Asks user |
 | `calendar_check_availability` | Check free/busy status | Auto |
 
+Event colors, new calendars, and calendar-level notification settings are
+not available. A reminder fires before the event starts; for a nudge after
+it, create a separate event.
+
 ## Date Format
 
 All dates use ISO 8601 format: `2026-03-25T09:00:00`
