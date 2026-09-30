@@ -15,6 +15,7 @@ from any_llm import (
     InvalidRequestError,
     RateLimitError,
 )
+from any_llm.exceptions import GatewayTimeoutError, ProviderError, UpstreamProviderError
 from any_llm.types.messages import MessageResponse
 from pydantic import ValidationError
 
@@ -773,6 +774,22 @@ class ClawboltAgent:
                 delay = (2**attempt) + random.uniform(0, 1)
                 logger.warning(
                     "Rate limited, retrying in %.1fs (attempt %d/%d)",
+                    delay,
+                    attempt + 1,
+                    LLM_MAX_RETRIES,
+                )
+                await asyncio.sleep(delay)
+            except (ProviderError, UpstreamProviderError, GatewayTimeoutError) as exc:
+                # A provider fault, such as a stream that errors partway or a
+                # gateway timeout, is usually gone on the next attempt. The call
+                # has no side effects until a complete response is returned, so
+                # retrying is safe; giving up left the user without a reply.
+                if attempt == LLM_MAX_RETRIES - 1:
+                    raise
+                delay = (2**attempt) + random.uniform(0, 1)
+                logger.warning(
+                    "Provider error (%s), retrying in %.1fs (attempt %d/%d)",
+                    type(exc).__name__,
                     delay,
                     attempt + 1,
                     LLM_MAX_RETRIES,

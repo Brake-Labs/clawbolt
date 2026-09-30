@@ -11,6 +11,7 @@ from any_llm import (
     InvalidRequestError,
     RateLimitError,
 )
+from any_llm.exceptions import GatewayTimeoutError, ProviderError, UpstreamProviderError
 from pydantic import BaseModel
 
 from backend.app.agent import core as core_module
@@ -835,6 +836,55 @@ async def test_agent_passes_dict_arguments_to_tool(mock_amessages: object, test_
 # ---------------------------------------------------------------------------
 # Typed LLM exception handling tests (issue #173)
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ProviderError("An error occurred during streaming"),
+        UpstreamProviderError("upstream unavailable"),
+        GatewayTimeoutError("gateway timeout"),
+    ],
+)
+@patch("backend.app.agent.core.random.uniform", return_value=0.5)
+@patch("backend.app.agent.core.asyncio.sleep", new_callable=AsyncMock)
+@patch("backend.app.agent.core.amessages_streamed")
+async def test_agent_retries_a_transient_provider_error(
+    mock_amessages: AsyncMock,
+    mock_sleep: AsyncMock,
+    _mock_uniform: AsyncMock,
+    error: Exception,
+    test_user: User,
+) -> None:
+    """Regression: a stream that errored partway failed the turn with no reply."""
+    mock_amessages.side_effect = [error, make_text_response("Recovered")]
+
+    agent = ClawboltAgent(user=test_user)
+    response = await agent.process_message("Hello")
+
+    assert response.reply_text == "Recovered"
+    assert mock_amessages.call_count == 2
+    mock_sleep.assert_called_once_with(1.5)
+
+
+@patch("backend.app.agent.core.random.uniform", return_value=0.5)
+@patch("backend.app.agent.core.asyncio.sleep", new_callable=AsyncMock)
+@patch("backend.app.agent.core.LLM_MAX_RETRIES", 3)
+@patch("backend.app.agent.core.amessages_streamed")
+async def test_agent_provider_error_propagates_after_the_last_retry(
+    mock_amessages: AsyncMock,
+    mock_sleep: AsyncMock,
+    _mock_uniform: AsyncMock,
+    test_user: User,
+) -> None:
+    mock_amessages.side_effect = [ProviderError("down")] * 3
+
+    agent = ClawboltAgent(user=test_user)
+    with pytest.raises(ProviderError):
+        await agent.process_message("Hello")
+
+    assert mock_amessages.call_count == 3
+    assert mock_sleep.call_count == 2
 
 
 @patch("backend.app.agent.core.random.uniform", return_value=0.5)
